@@ -71,10 +71,15 @@ async def fetch_live_sports(
 
 
 def is_within_horizon(market: KalshiMarket, hours: int) -> bool:
-    if market.close_time is None:
+    """True when the market's expected settlement is within `hours` from now.
+
+    Uses `expected_expiration_time` (shortly after game end), not `close_time` (which
+    is the outer market expiry, often weeks out even for tonight's games).
+    """
+    if market.expected_expiration_time is None:
         return False
     horizon = datetime.now(tz=UTC) + timedelta(hours=hours)
-    return market.close_time <= horizon
+    return market.expected_expiration_time <= horizon
 
 
 async def _run_specialists(
@@ -148,7 +153,7 @@ async def run_pipeline(
     *,
     series_filter: str | None = None,
     dry_run: bool = False,
-    horizon_hours: int = cfg.MAX_HOURS_UNTIL_CLOSE,
+    horizon_hours: int = cfg.MAX_HOURS_UNTIL_EXPIRATION,
 ) -> RunResult:
     """End-to-end: fetch live sports, fan out 4 specialists per market, synthesize with Opus."""
     config = cfg.Config.from_env()

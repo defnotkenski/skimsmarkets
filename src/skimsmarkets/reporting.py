@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from skimsmarkets.kalshi.models import KalshiEvent
+from skimsmarkets.kalshi.models import KalshiEvent, KalshiMarket
 from skimsmarkets.pipeline import RunResult
 
 
@@ -37,12 +37,35 @@ def _confidence_style(c: str) -> str:
     return {"high": "green", "medium": "yellow", "low": "red"}.get(c, "")
 
 
-def print_events_table(events: list[KalshiEvent], series_filter: str | None) -> None:
+def _within_horizon(market: KalshiMarket, hours: int) -> bool:
+    if market.expected_expiration_time is None:
+        return True  # keep unknowns visible rather than silently dropping
+    return market.expected_expiration_time <= datetime.now(tz=UTC) + timedelta(hours=hours)
+
+
+def print_events_table(
+    events: list[KalshiEvent],
+    series_filter: str | None,
+    horizon_hours: int | None = None,
+) -> None:
+    # One row per event: keep the favorite side (implied probability >= 0.5).
+    # Markets with unknown implied probability are kept so they stay visible.
+    pairs = [
+        (e, m)
+        for e in events
+        for m in e.markets
+        if (m.yes_implied_probability is None or m.yes_implied_probability >= 0.5)
+        and (horizon_hours is None or _within_horizon(m, horizon_hours))
+    ]
+    pairs.sort(key=lambda pair: pair[1].volume_24h_fp or 0.0, reverse=True)
+
     console = Console()
+    horizon_note = f", within {horizon_hours}h" if horizon_hours is not None else ""
     title = (
         "Live Kalshi sports events"
         + (f" — series={series_filter}" if series_filter else "")
-        + f" ({len(events)} events)"
+        + horizon_note
+        + f" ({len(pairs)} shown / {len(events)} total)"
     )
     table = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=False)
     table.add_column("Series", style="cyan")
@@ -51,27 +74,25 @@ def print_events_table(events: list[KalshiEvent], series_filter: str | None) -> 
     table.add_column("Yes bid/ask", justify="right")
     table.add_column("Implied", justify="right")
     table.add_column("24h vol", justify="right")
-    table.add_column("Closes in", justify="right")
+    table.add_column("Settles in", justify="right")
 
-    rows = 0
-    for e in events:
-        for m in e.markets:
-            implied = m.yes_implied_probability
-            bidask = (
-                f"{m.yes_bid_dollars:.2f}/{m.yes_ask_dollars:.2f}"
-                if m.yes_bid_dollars is not None and m.yes_ask_dollars is not None
-                else "—"
-            )
-            table.add_row(
-                e.series_ticker or "—",
-                (e.title or e.event_ticker)[:40],
-                (m.yes_sub_title or m.title or "—")[:30],
-                bidask,
-                f"{implied:.2f}" if implied is not None else "—",
-                f"{m.volume_24h_fp:,.0f}" if m.volume_24h_fp is not None else "—",
-                _rel_time(m.close_time),
-            )
-            rows += 1
+    for e, m in pairs:
+        implied = m.yes_implied_probability
+        bidask = (
+            f"{m.yes_bid_dollars:.2f}/{m.yes_ask_dollars:.2f}"
+            if m.yes_bid_dollars is not None and m.yes_ask_dollars is not None
+            else "—"
+        )
+        table.add_row(
+            e.series_ticker or "—",
+            (e.title or e.event_ticker)[:40],
+            (m.yes_sub_title or m.title or "—")[:30],
+            bidask,
+            f"{implied:.2f}" if implied is not None else "—",
+            f"{m.volume_24h_fp:,.0f}" if m.volume_24h_fp is not None else "—",
+            _rel_time(m.expected_expiration_time),
+        )
+    rows = len(pairs)
 
     if rows == 0:
         console.print(

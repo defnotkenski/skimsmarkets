@@ -17,8 +17,9 @@ SPORTS_SERIES_SEED: tuple[str, ...] = (
     "KXWTAMATCH",
 )
 
-# Markets closing more than this many hours out are skipped (information still accruing).
-MAX_HOURS_UNTIL_CLOSE = 48
+# Markets whose expected_expiration_time is more than this many hours out are skipped.
+# (expected_expiration_time sits ~shortly after game end, so 24h catches "today's slate".)
+MAX_HOURS_UNTIL_EXPIRATION = 24
 
 # Concurrency caps. See plan for rationale.
 EVENT_SEM = 4
