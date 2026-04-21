@@ -11,6 +11,9 @@ dependencies = [
     "xai-sdk>=1.0",
 ]
 
+[project.scripts]
+skims = "skimsmarkets.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
