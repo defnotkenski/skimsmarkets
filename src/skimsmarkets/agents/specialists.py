@@ -71,7 +71,7 @@ async def _run_specialist(
 ) -> _ReportT:
     chat = xai.chat.create(
         model=GROK_MODEL,
-        agent_count=16,
+        agent_count=4,
         messages=[system(system_prompt)],
         tools=_tools(),
     )

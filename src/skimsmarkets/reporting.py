@@ -130,7 +130,6 @@ def print_run_summary(result: RunResult) -> None:
         table.add_column("Entry", justify="right")
         table.add_column("Full K", justify="right")
         table.add_column("Capped ½K", justify="right")
-        table.add_column("Flags")
 
         ranked = sorted(
             result.predictions,
@@ -141,15 +140,6 @@ def print_run_summary(result: RunResult) -> None:
             p, z = s.prediction, s.sizing
             edge_color = (
                 "green" if p.edge_bps > 0 else ("red" if p.edge_bps < 0 else "")
-            )
-            flags = (
-                "; ".join(z.notes)
-                if z.notes
-                else (
-                    "; ".join(p.disagreements_flagged)
-                    if p.disagreements_flagged
-                    else ""
-                )
             )
             table.add_row(
                 p.market_ticker,
@@ -166,9 +156,26 @@ def print_run_summary(result: RunResult) -> None:
                 else "—",
                 f"{z.full_kelly_fraction:.1%}",
                 f"[bold]{z.capped_half_kelly_fraction:.1%}[/]",
-                flags[:60] + ("…" if len(flags) > 60 else ""),
             )
         console.print(table)
+
+        # Flags get their own table so long notes don't break the main-table rows.
+        flag_rows: list[tuple[str, str, str]] = []
+        for s in ranked:
+            for note in s.sizing.notes:
+                flag_rows.append((s.prediction.market_ticker, "sizing", note))
+            for disagreement in s.prediction.disagreements_flagged:
+                flag_rows.append(
+                    (s.prediction.market_ticker, "director", disagreement)
+                )
+        if flag_rows:
+            flag_table = Table(title="Flags", box=box.SIMPLE, show_lines=False)
+            flag_table.add_column("Market", style="cyan")
+            flag_table.add_column("Source", style="yellow")
+            flag_table.add_column("Note")
+            for ticker, source, note in flag_rows:
+                flag_table.add_row(ticker, source, note)
+            console.print(flag_table)
 
     if result.errors:
         err_table = Table(title="Errors", box=box.SIMPLE, show_lines=False)

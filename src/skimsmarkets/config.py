@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
+
 # Seed list of sports-series ticker prefixes. The Kalshi client ALSO dynamically discovers
 # series via /series?category=Sports, so this list is a hint, not a hard filter. It's
 # deliberately broad and includes tickers that may return zero live events off-season.
@@ -34,6 +36,9 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # Reads .env from the current directory (and parents) if present. Does not
+        # override vars that are already set in the shell, so explicit exports win.
+        load_dotenv()
         xai = os.environ.get("XAI_API_KEY", "").strip()
         anth = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         missing: list[str] = []
@@ -44,6 +49,6 @@ class Config:
         if missing:
             raise RuntimeError(
                 f"Missing required env var(s): {', '.join(missing)}. "
-                "Export them or use `uv run --env-file .env`."
+                "Add them to a .env file at the project root or export them in your shell."
             )
         return cls(xai_api_key=xai, anthropic_api_key=anth)
