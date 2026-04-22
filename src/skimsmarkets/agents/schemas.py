@@ -14,10 +14,12 @@ KELLY_BANKROLL_CAP = 0.25
 class StatisticsReport(BaseModel):
     """Quantitative lens: form, head-to-head, splits, base rates."""
 
-    win_probability_team_a: float = Field(
+    team_a_name: str = Field(description="Exact yes_sub_title of the team you call 'team_a'.")
+    team_b_name: str = Field(description="Exact yes_sub_title of the team you call 'team_b'.")
+    team_a_win_probability: float = Field(
         ge=0.0,
         le=1.0,
-        description="Probability the first-named / 'yes' team wins, 0-1.",
+        description="Probability team_a wins the event, 0-1.",
     )
     confidence: Confidence = Field(description="low if data was thin or stale.")
     key_stats: list[str] = Field(
@@ -41,10 +43,12 @@ class PlayerStatus(BaseModel):
 class InjuryReport(BaseModel):
     """Availability lens: injuries, suspensions, rest, lineup uncertainty."""
 
+    team_a_name: str
+    team_b_name: str
     team_a_availability_impact: float = Field(
         ge=-0.2,
         le=0.2,
-        description="Signed probability shift for team A from availability, -0.2 to +0.2.",
+        description="Signed probability shift for team_a from availability, -0.2 to +0.2.",
     )
     team_b_availability_impact: float = Field(ge=-0.2, le=0.2)
     key_absences: list[PlayerStatus] = Field(default_factory=list)
@@ -64,6 +68,8 @@ class NarrativeFactor(BaseModel):
 class NarrativeReport(BaseModel):
     """Storyline lens: motivation, coaching, locker-room, weather for outdoor sports."""
 
+    team_a_name: str
+    team_b_name: str
     dominant_storyline: str
     motivation_edge: Literal["team_a", "team_b", "neutral"]
     narrative_factors: list[NarrativeFactor] = Field(default_factory=list)
@@ -76,17 +82,22 @@ class NarrativeReport(BaseModel):
 class MarketReport(BaseModel):
     """Pricing lens: compare Kalshi to consensus, spot line movement and sharp signals."""
 
-    kalshi_implied_probability: float = Field(ge=0.0, le=1.0)
-    consensus_market_probability: float = Field(
+    team_a_name: str
+    team_b_name: str
+    kalshi_implied_team_a_probability: float = Field(
+        ge=0.0, le=1.0,
+        description="Kalshi's implied probability for team_a winning (midpoint of yes bid/ask on team_a's market).",
+    )
+    consensus_team_a_probability: float = Field(
         ge=0.0,
         le=1.0,
-        description="Fair probability implied by consensus sportsbooks / betting exchanges.",
+        description="Fair probability team_a wins, implied by consensus sportsbooks / betting exchanges.",
     )
     edge_bps: int = Field(
-        description="Signed basis points: (fair - kalshi) * 10000. Positive = yes undervalued.",
+        description="Signed basis points for team_a: (consensus - kalshi) * 10000. Positive = team_a undervalued on Kalshi.",
     )
     line_movement_note: str
-    sharp_money_signal: Literal["on_a", "on_b", "unclear", "no_data"]
+    sharp_money_signal: Literal["on_team_a", "on_team_b", "unclear", "no_data"]
     comparable_markets: list[str] = Field(
         default_factory=list,
         description="URLs or identifiers of the comparable markets consulted.",
@@ -96,11 +107,40 @@ class MarketReport(BaseModel):
 SpecialistReport = StatisticsReport | InjuryReport | NarrativeReport | MarketReport
 
 
+class EventPrediction(BaseModel):
+    """Event-level synthesis emitted by the director (LLM output)."""
+
+    event_ticker: str
+    predicted_winner: str = Field(
+        description="Exact yes_sub_title of the team expected to win. Must match one of the event's markets.",
+    )
+    predicted_winner_probability: float = Field(
+        ge=0.0, le=1.0,
+        description="Probability the predicted winner actually wins, 0-1.",
+    )
+    recommendation: Literal["buy_winner", "pass"] = Field(
+        description="buy_winner = back the predicted winner on their market. pass = no edge worth trading.",
+    )
+    confidence: Confidence
+    reasoning: str = Field(
+        description="3-6 sentences explaining the synthesis and how specialists were weighted.",
+    )
+    specialist_weights: dict[str, float] = Field(
+        description="Per-specialist weight in [0,1]; should roughly sum to 1.",
+    )
+    disagreements_flagged: list[str] = Field(
+        default_factory=list,
+        description="Empty when specialists aligned.",
+    )
+
+
 class MarketPrediction(BaseModel):
-    """Final synthesized prediction from the director model."""
+    """Per-market projection of an EventPrediction (built deterministically)."""
 
     market_ticker: str
     event_ticker: str
+    event_title: str | None = None
+    predicted_winner: str
     predicted_yes_probability: float = Field(ge=0.0, le=1.0)
     kalshi_implied_probability: float = Field(ge=0.0, le=1.0)
     edge_bps: int

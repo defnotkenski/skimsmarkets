@@ -22,7 +22,6 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ErrorRecord:
-    market_ticker: str
     event_ticker: str
     stage: str  # "specialist:<name>" or "director"
     error: str
@@ -34,13 +33,13 @@ class RunResult:
     predictions: list[SizedMarketPrediction] = field(default_factory=list)
     errors: list[ErrorRecord] = field(default_factory=list)
     fetched_events: int = 0
-    considered_markets: int = 0
+    considered_events: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "fetched_events": self.fetched_events,
-            "considered_markets": self.considered_markets,
+            "considered_events": self.considered_events,
             "predictions": [p.model_dump() for p in self.predictions],
             "errors": [vars(e) for e in self.errors],
         }
@@ -82,20 +81,24 @@ def is_within_horizon(market: KalshiMarket, hours: int) -> bool:
     return market.expected_expiration_time <= horizon
 
 
+def event_within_horizon(event: KalshiEvent, hours: int) -> bool:
+    """An event is in-horizon if ANY of its markets is."""
+    return any(is_within_horizon(m, hours) for m in event.markets)
+
+
 async def _run_specialists(
     xai: XAIAsyncClient,
     event: KalshiEvent,
-    market: KalshiMarket,
     sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
 ) -> dict[str, SpecialistReport] | None:
-    """Run all specialists for one market. Return None if any specialist failed
-    (the market then skips director)."""
+    """Run all specialists for one event. Return None if any specialist failed
+    (the event then skips director)."""
 
     async def _one(specialist: str) -> tuple[str, "SpecialistReport | Exception"]:
         async with sem:
             try:
-                return specialist, await SPECIALISTS[specialist](xai, event, market)
+                return specialist, await SPECIALISTS[specialist](xai, event)
             except Exception as e:  # noqa: BLE001
                 return specialist, e
 
@@ -106,7 +109,6 @@ async def _run_specialists(
         if isinstance(result, Exception):
             errors.append(
                 ErrorRecord(
-                    market_ticker=market.ticker,
                     event_ticker=event.event_ticker,
                     stage=f"specialist:{name}",
                     error=f"{type(result).__name__}: {result}",
@@ -120,27 +122,25 @@ async def _run_specialists(
     return reports
 
 
-async def process_market(
+async def process_event(
     xai: XAIAsyncClient,
     anthropic: AsyncAnthropic,
     event: KalshiEvent,
-    market: KalshiMarket,
     specialist_sem: asyncio.Semaphore,
     director_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
 ) -> SizedMarketPrediction | None:
-    log.info("processing market %s (%s)", market.ticker, market.title)
-    reports = await _run_specialists(xai, event, market, specialist_sem, errors)
+    log.info("processing event %s (%s)", event.event_ticker, event.title)
+    reports = await _run_specialists(xai, event, specialist_sem, errors)
     if reports is None:
         return None
 
     async with director_sem:
         try:
-            return await synthesize_prediction(anthropic, event, market, reports)
+            return await synthesize_prediction(anthropic, event, reports)
         except Exception as e:  # noqa: BLE001
             errors.append(
                 ErrorRecord(
-                    market_ticker=market.ticker,
                     event_ticker=event.event_ticker,
                     stage="director",
                     error=f"{type(e).__name__}: {e}",
@@ -155,7 +155,7 @@ async def run_pipeline(
     dry_run: bool = False,
     horizon_hours: int = cfg.MAX_HOURS_UNTIL_EXPIRATION,
 ) -> RunResult:
-    """End-to-end: fetch live sports, fan out 4 specialists per market, synthesize with Opus."""
+    """End-to-end: fetch live sports, run 4 specialists + director per event."""
     config = cfg.Config.from_env()
     run_id = uuid.uuid4().hex[:8]
     result = RunResult(run_id=run_id)
@@ -168,24 +168,18 @@ async def run_pipeline(
         result.fetched_events = len(events)
         log.info("fetched %d live events", len(events))
 
-        # Flatten into (event, market) pairs filtered by close_time horizon.
-        pairs: list[tuple[KalshiEvent, KalshiMarket]] = []
-        for e in events:
-            for m in e.markets:
-                if not is_within_horizon(m, horizon_hours):
-                    continue
-                pairs.append((e, m))
+        in_horizon = [e for e in events if event_within_horizon(e, horizon_hours)]
         if dry_run:
-            pairs = pairs[:1]
-        result.considered_markets = len(pairs)
+            in_horizon = in_horizon[:1]
+        result.considered_events = len(in_horizon)
         log.info(
-            "considering %d markets (horizon=%sh, dry_run=%s)",
-            len(pairs),
+            "considering %d events (horizon=%sh, dry_run=%s)",
+            len(in_horizon),
             horizon_hours,
             dry_run,
         )
 
-        if not pairs:
+        if not in_horizon:
             return result
 
         xai = XAIAsyncClient(api_key=config.xai_api_key)
@@ -193,16 +187,15 @@ async def run_pipeline(
         try:
             predictions = await asyncio.gather(
                 *(
-                    process_market(
+                    process_event(
                         xai,
                         anthropic,
                         e,
-                        m,
                         specialist_sem,
                         director_sem,
                         result.errors,
                     )
-                    for e, m in pairs
+                    for e in in_horizon
                 )
             )
         finally:

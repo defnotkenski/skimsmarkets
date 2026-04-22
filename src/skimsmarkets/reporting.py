@@ -11,6 +11,15 @@ from rich.table import Table
 from skimsmarkets.kalshi.models import KalshiEvent, KalshiMarket
 from skimsmarkets.pipeline import RunResult
 
+# Pastel palette — used everywhere instead of bright ANSI colors.
+_MINT = "#a8e6cf"       # positive / buy / high confidence
+_ROSE = "#ffaaa5"       # negative / buy_no / low confidence / errors
+_PEACH = "#ffd3b6"      # medium / warnings (replaces yellow)
+_SKY = "#a8dadc"        # cyan-equivalent for identifiers
+_LAVENDER = "#d4a5e8"   # winner / headline accents
+_DIM = "#b0b0b0"        # pass / muted
+_CREAM = "#fff3b0"      # table title headings
+
 
 def _rel_time(ts: datetime | None) -> str:
     if ts is None:
@@ -30,11 +39,15 @@ def _rel_time(ts: datetime | None) -> str:
 
 
 def _rec_style(rec: str) -> str:
-    return {"buy_yes": "bold green", "buy_no": "bold red", "pass": "dim"}.get(rec, "")
+    return {
+        "buy_yes": f"bold {_MINT}",
+        "buy_no": f"bold {_ROSE}",
+        "pass": _DIM,
+    }.get(rec, "")
 
 
 def _confidence_style(c: str) -> str:
-    return {"high": "green", "medium": "yellow", "low": "red"}.get(c, "")
+    return {"high": _MINT, "medium": _PEACH, "low": _ROSE}.get(c, "")
 
 
 def _within_horizon(market: KalshiMarket, hours: int) -> bool:
@@ -67,8 +80,14 @@ def print_events_table(
         + horizon_note
         + f" ({len(pairs)} shown / {len(events)} total)"
     )
-    table = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=False)
-    table.add_column("Series", style="cyan")
+    table = Table(
+        title=f"[{_CREAM}]{title}[/]",
+        title_justify="left",
+        box=box.SIMPLE_HEAVY,
+        show_lines=False,
+        header_style=_LAVENDER,
+    )
+    table.add_column("Series", style=_SKY)
     table.add_column("Event")
     table.add_column("Market (yes side)")
     table.add_column("Yes bid/ask", justify="right")
@@ -96,9 +115,9 @@ def print_events_table(
 
     if rows == 0:
         console.print(
-            "[yellow]No live markets found"
+            f"[{_PEACH}]No live markets found"
             + (f" for {series_filter}" if series_filter else "")
-            + ".[/yellow]"
+            + ".[/]"
         )
         return
     console.print(table)
@@ -106,43 +125,45 @@ def print_events_table(
 
 def print_run_summary(result: RunResult) -> None:
     console = Console()
-    console.rule(f"[bold]Run {result.run_id}[/bold]")
+    console.rule(f"[bold {_LAVENDER}]Run {result.run_id}[/]", style=_LAVENDER)
     console.print(
-        f"Fetched events: [cyan]{result.fetched_events}[/cyan]  "
-        f"Considered markets: [cyan]{result.considered_markets}[/cyan]  "
-        f"Predictions: [green]{len(result.predictions)}[/green]  "
-        f"Errors: [red]{len(result.errors)}[/red]"
+        f"Fetched events: [{_SKY}]{result.fetched_events}[/]  "
+        f"Considered events: [{_SKY}]{result.considered_events}[/]  "
+        f"Predictions: [{_MINT}]{len(result.predictions)}[/]  "
+        f"Errors: [{_ROSE}]{len(result.errors)}[/]"
     )
 
     if result.predictions:
-        table = Table(
-            title="Predictions (sorted by capped-Kelly stake)",
-            box=box.SIMPLE_HEAVY,
-            show_lines=False,
-        )
-        table.add_column("Market", style="cyan", no_wrap=False)
-        table.add_column("Rec", justify="center")
-        table.add_column("Pred", justify="right")
-        table.add_column("Kalshi", justify="right")
-        table.add_column("Edge (bps)", justify="right")
-        table.add_column("Conf", justify="center")
-        table.add_column("Side", justify="center")
-        table.add_column("Entry", justify="right")
-        table.add_column("Full K", justify="right")
-        table.add_column("Capped ½K", justify="right")
-
         ranked = sorted(
             result.predictions,
             key=lambda s: s.sizing.capped_half_kelly_fraction,
             reverse=True,
         )
+
+        pred_table = Table(
+            title=f"[{_CREAM}]Predictions (sorted by capped-Kelly stake)[/]",
+            title_justify="left",
+            box=box.SIMPLE_HEAVY,
+            show_lines=False,
+            header_style=_LAVENDER,
+        )
+        pred_table.add_column("Event", style=_SKY, overflow="fold", min_width=24)
+        pred_table.add_column("Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14)
+        pred_table.add_column("Rec", justify="center")
+        pred_table.add_column("Pred", justify="right")
+        pred_table.add_column("Kalshi", justify="right")
+        pred_table.add_column("Edge (bps)", justify="right")
+        pred_table.add_column("Conf", justify="center")
+
         for s in ranked:
-            p, z = s.prediction, s.sizing
+            p = s.prediction
             edge_color = (
-                "green" if p.edge_bps > 0 else ("red" if p.edge_bps < 0 else "")
+                _MINT if p.edge_bps > 0 else (_ROSE if p.edge_bps < 0 else "")
             )
-            table.add_row(
-                p.market_ticker,
+            event_display = p.event_title or p.event_ticker
+            pred_table.add_row(
+                event_display,
+                p.predicted_winner,
                 f"[{_rec_style(p.recommendation)}]{p.recommendation}[/]",
                 f"{p.predicted_yes_probability:.3f}",
                 f"{p.kalshi_implied_probability:.3f}",
@@ -150,41 +171,73 @@ def print_run_summary(result: RunResult) -> None:
                 if edge_color
                 else f"{p.edge_bps:+d}",
                 f"[{_confidence_style(p.confidence)}]{p.confidence}[/]",
-                z.side,
+            )
+        console.print(pred_table)
+
+        sizing_table = Table(
+            title=f"[{_CREAM}]Kelly sizing (same order)[/]",
+            title_justify="left",
+            box=box.SIMPLE_HEAVY,
+            show_lines=False,
+            header_style=_LAVENDER,
+        )
+        sizing_table.add_column("Event", style=_SKY, overflow="fold", min_width=24)
+        sizing_table.add_column("Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14)
+        sizing_table.add_column("Entry", justify="right")
+        sizing_table.add_column("Full K", justify="right")
+        sizing_table.add_column("Capped ½K", justify="right")
+
+        for s in ranked:
+            p, z = s.prediction, s.sizing
+            event_display = p.event_title or p.event_ticker
+            sizing_table.add_row(
+                event_display,
+                p.predicted_winner,
                 f"${z.entry_price_dollars:.2f}"
                 if z.entry_price_dollars is not None
                 else "—",
                 f"{z.full_kelly_fraction:.1%}",
-                f"[bold]{z.capped_half_kelly_fraction:.1%}[/]",
+                f"[bold {_MINT}]{z.capped_half_kelly_fraction:.1%}[/]",
             )
-        console.print(table)
+        console.print(sizing_table)
 
         # Flags get their own table so long notes don't break the main-table rows.
         flag_rows: list[tuple[str, str, str]] = []
         for s in ranked:
+            label = s.prediction.event_title or s.prediction.event_ticker
             for note in s.sizing.notes:
-                flag_rows.append((s.prediction.market_ticker, "sizing", note))
+                flag_rows.append((label, "sizing", note))
             for disagreement in s.prediction.disagreements_flagged:
-                flag_rows.append(
-                    (s.prediction.market_ticker, "director", disagreement)
-                )
+                flag_rows.append((label, "director", disagreement))
         if flag_rows:
-            flag_table = Table(title="Flags", box=box.SIMPLE, show_lines=False)
-            flag_table.add_column("Market", style="cyan")
-            flag_table.add_column("Source", style="yellow")
+            flag_table = Table(
+                title=f"[{_CREAM}]Flags[/]",
+                title_justify="left",
+                box=box.SIMPLE,
+                show_lines=False,
+                header_style=_LAVENDER,
+            )
+            flag_table.add_column("Event", style=_SKY)
+            flag_table.add_column("Source", style=_PEACH)
             flag_table.add_column("Note")
-            for ticker, source, note in flag_rows:
-                flag_table.add_row(ticker, source, note)
+            for label, source, note in flag_rows:
+                flag_table.add_row(label, source, note)
             console.print(flag_table)
 
     if result.errors:
-        err_table = Table(title="Errors", box=box.SIMPLE, show_lines=False)
-        err_table.add_column("Market", style="cyan")
-        err_table.add_column("Stage", style="yellow")
+        err_table = Table(
+            title=f"[{_CREAM}]Errors[/]",
+            title_justify="left",
+            box=box.SIMPLE,
+            show_lines=False,
+            header_style=_LAVENDER,
+        )
+        err_table.add_column("Event", style=_SKY)
+        err_table.add_column("Stage", style=_ROSE)
         err_table.add_column("Error")
         for e in result.errors:
-            err_table.add_row(e.market_ticker, e.stage, e.error[:120])
+            err_table.add_row(e.event_ticker, e.stage, e.error)
         console.print(err_table)
 
     if not result.predictions and not result.errors:
-        console.print("[yellow]No predictions generated.[/yellow]")
+        console.print(f"[{_PEACH}]No predictions generated.[/]")
