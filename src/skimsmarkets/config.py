@@ -24,7 +24,6 @@ SPORTS_SERIES_SEED: tuple[str, ...] = (
 MAX_HOURS_UNTIL_EXPIRATION = 24
 
 # Concurrency caps. See plan for rationale.
-EVENT_SEM = 4
 SPECIALIST_SEM = 16
 DIRECTOR_SEM = 2
 

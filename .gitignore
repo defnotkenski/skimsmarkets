@@ -26,5 +26,9 @@ htmlcov/
 .idea/
 .vscode/
 
+# Claude Code
+CLAUDE.md
+.claude/
+
 # OS
 .DS_Store

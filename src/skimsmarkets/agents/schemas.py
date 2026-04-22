@@ -144,7 +144,7 @@ class MarketPrediction(BaseModel):
     predicted_yes_probability: float = Field(ge=0.0, le=1.0)
     kalshi_implied_probability: float = Field(ge=0.0, le=1.0)
     edge_bps: int
-    recommendation: Literal["buy_yes", "buy_no", "pass"]
+    recommendation: Literal["buy_yes", "pass"]
     confidence: Confidence
     reasoning: str = Field(
         description="3-6 sentences explaining the synthesis and how specialists were weighted.",
@@ -167,7 +167,7 @@ class PositionSizing(BaseModel):
     KELLY_BANKROLL_CAP (0.25) for safety.
     """
 
-    side: Literal["yes", "no", "none"] = Field(
+    side: Literal["yes", "none"] = Field(
         description="Which contract to buy. 'none' = do not size a position.",
     )
     entry_price_dollars: float | None = Field(

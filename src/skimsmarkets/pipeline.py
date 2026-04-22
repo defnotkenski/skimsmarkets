@@ -5,7 +5,6 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from anthropic import AsyncAnthropic
 from xai_sdk import AsyncClient as XAIAsyncClient
@@ -34,15 +33,6 @@ class RunResult:
     errors: list[ErrorRecord] = field(default_factory=list)
     fetched_events: int = 0
     considered_events: int = 0
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "fetched_events": self.fetched_events,
-            "considered_events": self.considered_events,
-            "predictions": [p.model_dump() for p in self.predictions],
-            "errors": [vars(e) for e in self.errors],
-        }
 
 
 async def fetch_live_sports(

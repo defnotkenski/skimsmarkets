@@ -30,7 +30,6 @@ def compute_sizing(prediction: MarketPrediction, market: KalshiMarket) -> Positi
     Respects the director's recommendation (does not flip sides), but clamps to zero and
     adds a note when the recommended side is -EV against the current ask price.
     """
-    q = prediction.predicted_yes_probability
     notes: list[str] = []
 
     if prediction.recommendation == "pass":
@@ -45,22 +44,17 @@ def compute_sizing(prediction: MarketPrediction, market: KalshiMarket) -> Positi
             notes=notes,
         )
 
-    if prediction.recommendation == "buy_yes":
-        side: str = "yes"
-        entry = market.yes_ask_dollars
-        win_prob = q
-    else:  # buy_no
-        side = "no"
-        entry = market.no_ask_dollars
-        win_prob = 1.0 - q
+    # Only remaining recommendation is buy_yes — the director never produces buy_no.
+    win_prob = prediction.predicted_yes_probability
+    entry = market.yes_ask_dollars
 
     if entry is None:
         notes.append(
-            f"Director recommended {prediction.recommendation} but {side}_ask is unavailable "
+            "Director recommended buy_yes but yes_ask is unavailable "
             "(illiquid market); cannot size a position."
         )
         return PositionSizing(
-            side=side,  # type: ignore[arg-type]
+            side="yes",
             entry_price_dollars=None,
             win_probability=win_prob,
             edge=0.0,
@@ -74,7 +68,7 @@ def compute_sizing(prediction: MarketPrediction, market: KalshiMarket) -> Positi
     full = _kelly_fraction(win_prob, entry)
     if full == 0.0 and edge <= 0:
         notes.append(
-            f"Director recommended {prediction.recommendation} but {side}_ask={entry:.4f} "
+            f"Director recommended buy_yes but yes_ask={entry:.4f} "
             f"makes this -EV against predicted win probability {win_prob:.4f}; clamped to 0."
         )
 
@@ -82,7 +76,7 @@ def compute_sizing(prediction: MarketPrediction, market: KalshiMarket) -> Positi
     capped = min(half, KELLY_BANKROLL_CAP)
 
     return PositionSizing(
-        side=side,  # type: ignore[arg-type]
+        side="yes",
         entry_price_dollars=entry,
         win_probability=win_prob,
         edge=edge,

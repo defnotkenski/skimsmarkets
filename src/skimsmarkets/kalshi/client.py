@@ -6,7 +6,7 @@ from typing import Any, Self
 
 import httpx
 
-from skimsmarkets.kalshi.models import KalshiEvent, KalshiMarket, KalshiSeries
+from skimsmarkets.kalshi.models import KalshiEvent, KalshiSeries
 
 log = logging.getLogger(__name__)
 
@@ -36,9 +36,6 @@ class KalshiClient:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        await self._client.aclose()
-
-    async def aclose(self) -> None:
         await self._client.aclose()
 
     async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -95,23 +92,3 @@ class KalshiClient:
             if not cursor:
                 break
         return events
-
-    async def list_markets_for_event(self, event_ticker: str) -> list[KalshiMarket]:
-        """Fallback when an event response doesn't include nested markets."""
-        markets: list[KalshiMarket] = []
-        cursor = ""
-        while True:
-            params: dict[str, Any] = {
-                "event_ticker": event_ticker,
-                "limit": PAGE_LIMIT,
-                "status": "open",
-            }
-            if cursor:
-                params["cursor"] = cursor
-            data = await self._get("/markets", params)
-            for raw in data.get("markets", []):
-                markets.append(KalshiMarket.model_validate(raw))
-            cursor = data.get("cursor") or ""
-            if not cursor:
-                break
-        return markets

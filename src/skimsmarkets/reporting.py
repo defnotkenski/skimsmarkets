@@ -13,7 +13,7 @@ from skimsmarkets.pipeline import RunResult
 
 # Pastel palette — used everywhere instead of bright ANSI colors.
 _MINT = "#a8e6cf"       # positive / buy / high confidence
-_ROSE = "#ffaaa5"       # negative / buy_no / low confidence / errors
+_ROSE = "#ffaaa5"       # negative / low confidence / errors
 _PEACH = "#ffd3b6"      # medium / warnings (replaces yellow)
 _SKY = "#a8dadc"        # cyan-equivalent for identifiers
 _LAVENDER = "#d4a5e8"   # winner / headline accents
@@ -41,7 +41,6 @@ def _rel_time(ts: datetime | None) -> str:
 def _rec_style(rec: str) -> str:
     return {
         "buy_yes": f"bold {_MINT}",
-        "buy_no": f"bold {_ROSE}",
         "pass": _DIM,
     }.get(rec, "")
 
@@ -200,6 +199,25 @@ def print_run_summary(result: RunResult) -> None:
                 f"[bold {_MINT}]{z.capped_half_kelly_fraction:.1%}[/]",
             )
         console.print(sizing_table)
+
+        reasoning_table = Table(
+            title=f"[{_CREAM}]Director reasoning (same order)[/]",
+            title_justify="left",
+            box=box.SIMPLE_HEAVY,
+            show_lines=True,
+            header_style=_LAVENDER,
+        )
+        reasoning_table.add_column("Event", style=_SKY, overflow="fold", min_width=20)
+        reasoning_table.add_column("Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14)
+        reasoning_table.add_column("Reasoning", overflow="fold")
+        for s in ranked:
+            p = s.prediction
+            reasoning_table.add_row(
+                p.event_title or p.event_ticker,
+                p.predicted_winner,
+                p.reasoning,
+            )
+        console.print(reasoning_table)
 
         # Flags get their own table so long notes don't break the main-table rows.
         flag_rows: list[tuple[str, str, str]] = []
