@@ -13,14 +13,6 @@ back in their `team_a_name` / `team_b_name` output fields.
 from __future__ import annotations
 
 _COMMON_TAIL = """
-Live-game protocol (IMPORTANT):
-- The user message includes a 'Game state hint'. If it says LIKELY LIVE or RECENTLY ENDED,
-  the game is already in progress or just ended. Your FIRST step is to web_search / x_search
-  for the current score, time remaining, and any in-game events (injuries, ejections).
-- When live, the scoreboard dominates pre-game factors. A pre-game 75% favorite trailing by
-  15 with 4 minutes left is no longer a 75% favorite. Weight live state accordingly.
-- If the hint says PRE-GAME, standard pre-game analysis applies.
-
 Output rules:
 - Return ONLY valid JSON matching the schema you've been given. No prose, no code fences.
 - Copy team_a_name and team_b_name exactly as they appear in the user message.
@@ -110,11 +102,6 @@ Rules for synthesis:
   load-bearing their lens is for THIS event. Example: for a UFC fight, availability and recent
   form dominate; narrative is often noise. For a playoff game, narrative and motivation matter
   more than regular-season base rates.
-- Live games: the event context includes a 'Game state hint'. If the game is LIKELY LIVE or
-  RECENTLY ENDED, and specialists appear to be reasoning from pre-game odds while the Kalshi
-  implied probability has moved significantly, that is a strong signal the specialists missed
-  the live state. Flag this in `disagreements_flagged` and lean toward `pass` unless specialists
-  explicitly incorporated the current score.
 - When specialists disagree, resolve the disagreement explicitly in your reasoning — never
   paper over it.
 - `predicted_winner` MUST exactly match one of the yes_sub_titles listed in the event context

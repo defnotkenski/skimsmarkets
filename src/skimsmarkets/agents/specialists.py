@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
 from typing import Awaitable, Callable, TypeVar
 
 from pydantic import BaseModel
@@ -56,30 +55,6 @@ def pick_team_a_market(event: KalshiEvent) -> KalshiMarket | None:
     return top_market
 
 
-def _game_state_hint(event: KalshiEvent) -> str:
-    """Heuristic label for the event's timing relative to now.
-
-    Uses expected_expiration_time (~shortly after game end). Windows are intentionally
-    generous since sport durations vary (NBA ~2.5h, NFL ~3.5h, MLB ~3h, tennis up to ~5h).
-    Specialists are told to VERIFY via live search when the hint says live.
-    """
-    m = next((mk for mk in event.markets if mk.expected_expiration_time), None)
-    if m is None or m.expected_expiration_time is None:
-        return "UNKNOWN (no expected_expiration_time on any market)"
-    hours = (m.expected_expiration_time - datetime.now(tz=UTC)).total_seconds() / 3600
-    if hours > 5:
-        return f"PRE-GAME (settles in {hours:.1f}h; game has not started yet)"
-    if hours > -0.5:
-        return (
-            f"LIKELY LIVE (settles in {hours:.1f}h — game is probably in progress OR "
-            "recently tipped off; current score and time remaining dominate pre-game factors)"
-        )
-    return (
-        f"RECENTLY ENDED (settled {-hours:.1f}h ago — market may be resolving or in OT; "
-        "verify via live search)"
-    )
-
-
 def render_context(event: KalshiEvent) -> str:
     """Event-level user message handed to every specialist.
 
@@ -116,10 +91,8 @@ def render_context(event: KalshiEvent) -> str:
         f"Event: {event.event_ticker} — {event.title or '(no title)'}\n"
         f"Series: {event.series_ticker or '(unknown)'}\n"
         f"Sub-title: {event.sub_title or '(none)'}\n"
-        f"Settles: {settles}\n"
-        f"Game state hint: {_game_state_hint(event)}\n\n"
-        f"team_a_name = {team_a_name}   (Kalshi's current favorite — if game is live "
-        "this may reflect the scoreboard, not pre-game odds)\n"
+        f"Settles: {settles}\n\n"
+        f"team_a_name = {team_a_name}   (the Kalshi favorite going into this event)\n"
         f"team_b_name = {team_b_name}\n\n"
         f"Markets in this event ({len(event.markets)}):\n"
         + "\n".join(market_lines)
