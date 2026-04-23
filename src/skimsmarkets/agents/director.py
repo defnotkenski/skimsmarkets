@@ -68,7 +68,11 @@ def _polymarket_sub_line(enriched: EnrichedEvent, yes_sub_title: str | None) -> 
     bid = f"${pm.yes_bid_dollars:.3f}" if pm.yes_bid_dollars is not None else "?"
     ask = f"${pm.yes_ask_dollars:.3f}" if pm.yes_ask_dollars is not None else "?"
     implied_str = f"{implied:.3f}" if implied is not None else "unknown"
-    return f"      polymarket: slug={pm.slug} yes bid/ask={bid}/{ask} implied={implied_str}"
+    side_tag = " [NO side, inverted]" if pm.is_no_side else ""
+    return (
+        f"      polymarket: slug={pm.slug}{side_tag} "
+        f"bid/ask={bid}/{ask} implied={implied_str}"
+    )
 
 
 def _render_user_message(

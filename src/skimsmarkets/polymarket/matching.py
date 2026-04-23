@@ -74,10 +74,17 @@ def _overlap(a: str, b: str) -> float:
 
 @dataclass(frozen=True)
 class SideMatch:
-    """A single Kalshi side paired with its Polymarket counterpart slug."""
+    """A single Kalshi side paired with its Polymarket counterpart slug.
+
+    `is_no_side` distinguishes the two halves of a head-to-head Polymarket
+    market that share a slug: one Kalshi side maps to the YES direction, the
+    other to NO (with prices inverted). Without this flag, BBO fan-out can't
+    tell which direction to use when two Kalshi sides resolve to the same slug.
+    """
 
     kalshi_yes_sub_title: str
     polymarket_market_slug: str
+    is_no_side: bool
     # Raw score that produced this pairing; exposed for debug logging only.
     score: float
 
@@ -89,16 +96,22 @@ class EventMatch:
 
 
 def _candidate_yes_labels(pm: PolymarketMarket) -> list[str]:
-    """Produce a list of label strings for the YES side of a Polymarket market.
+    """Produce the label pool for matching against a Kalshi yes_sub_title.
 
-    We don't yet know which field reliably holds the YES-outcome team name, so
-    try the common suspects and return whatever's non-empty. The matcher then
-    scores the Kalshi label against the best-scoring candidate.
+    Combines the primary display label (`yes_sub_title`, typically the mascot)
+    with every known alias (`team_aliases`: name/safeName/abbreviation/alias)
+    so Kalshi's city-style side labels ('Cleveland') can hit a Polymarket
+    market that lists the mascot ('Cavaliers'). Falls back to the market's
+    raw title when no team data is present (e.g. series-winner futures).
     """
     labels: list[str] = []
-    for source in (pm.yes_sub_title, pm.title):
-        if source:
-            labels.append(source)
+    if pm.yes_sub_title:
+        labels.append(pm.yes_sub_title)
+    for alias in pm.team_aliases:
+        if alias not in labels:
+            labels.append(alias)
+    if pm.title and pm.title not in labels:
+        labels.append(pm.title)
     return labels
 
 
@@ -148,24 +161,53 @@ def _time_bonus(
     return 0.0
 
 
+# Polymarket `sportsMarketType` values that represent a direct "who wins"
+# binary comparable to a Kalshi head-to-head side. Spreads / totals / futures
+# are excluded: they share team labels with the moneyline market inside the
+# same Polymarket event, and without this filter the matcher happily paired a
+# Kalshi moneyline side to a "Team A covers +8.5" spread (same team_aliases,
+# wildly different implied probability). Unknown / missing type is allowed
+# through — keeps older records that predate this field still-matchable.
+_HEAD_TO_HEAD_MARKET_TYPES: frozenset[str] = frozenset({
+    "moneyline",
+    "drawable_outcome",
+})
+
+
 def _build_side_map(
     kalshi_event: KalshiEvent,
     pm: PolymarketEvent,
     *,
     min_side_overlap: float,
 ) -> dict[str, SideMatch]:
-    """Pair each Kalshi yes_sub_title with its best Polymarket market by label overlap."""
+    """Pair each Kalshi yes_sub_title with its best Polymarket side by label overlap.
+
+    A Polymarket head-to-head market appears twice in `pm.markets`: once as
+    the YES direction and once as the NO direction (same slug, is_no_side
+    toggled). The used-key is `(slug, is_no_side)` so one slug can pair
+    against two Kalshi sides — YES to one team, NO to the other — which is
+    the normal case for NBA/NHL/MLB moneylines.
+
+    Candidates are filtered to moneyline / drawable_outcome market types so a
+    Kalshi moneyline can't accidentally pair with a spread market that shares
+    the same team names. Unknown/missing types are allowed as a back-compat
+    fallback.
+    """
     side_map: dict[str, SideMatch] = {}
-    used_slugs: set[str] = set()  # one-to-one pairing
+    used: set[tuple[str, bool]] = set()
     for k_market in kalshi_event.markets:
         if not k_market.yes_sub_title:
             continue
         best: tuple[float, PolymarketMarket | None] = (0.0, None)
         for pm_market in pm.markets:
-            if pm_market.slug in used_slugs:
+            if (
+                pm_market.sports_market_type is not None
+                and pm_market.sports_market_type not in _HEAD_TO_HEAD_MARKET_TYPES
+            ):
                 continue
-            # Score = best overlap of the Kalshi label against any of the
-            # Polymarket market's candidate labels.
+            key = (pm_market.slug, pm_market.is_no_side)
+            if key in used:
+                continue
             candidates = _candidate_yes_labels(pm_market)
             if not candidates:
                 continue
@@ -176,9 +218,10 @@ def _build_side_map(
             side_map[k_market.yes_sub_title] = SideMatch(
                 kalshi_yes_sub_title=k_market.yes_sub_title,
                 polymarket_market_slug=best[1].slug,
+                is_no_side=best[1].is_no_side,
                 score=best[0],
             )
-            used_slugs.add(best[1].slug)
+            used.add((best[1].slug, best[1].is_no_side))
     return side_map
 
 

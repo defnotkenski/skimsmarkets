@@ -107,36 +107,60 @@ async def _resolve_polymarket_prices(
 
     BBO is preferred because it's the live quote; when BBO is unavailable or
     returns an empty shape we fall back to the snapshot prices the events.list
-    response already embedded (parsed from `outcomePrices` in the model
-    validator). Mutates `enriched` in place.
+    response already embedded. Head-to-head markets can map two Kalshi sides
+    to a single slug (YES direction + NO direction), so BBO is deduped by slug
+    and the NO-side result is derived by inverting the YES bid/ask. Mutates
+    `enriched` in place.
     """
-    snapshot_by_slug: dict[str, PolymarketMarket] = {
-        m.slug: m for m in (enriched.polymarket.markets if enriched.polymarket else [])
+    # Index snapshots by (slug, is_no_side) so we can retrieve the right
+    # direction's pre-parsed fallback when BBO is empty.
+    snapshot_by_key: dict[tuple[str, bool], PolymarketMarket] = {
+        (m.slug, m.is_no_side): m
+        for m in (enriched.polymarket.markets if enriched.polymarket else [])
     }
 
-    async def _one(side_label: str, slug: str) -> tuple[str, PolymarketMarket | None]:
+    # Dedupe BBO calls: two Kalshi sides pairing to YES+NO of the same slug
+    # should only trigger one network call.
+    unique_slugs = {m.polymarket_market_slug for m in enriched.side_map.values()}
+
+    async def _fetch_bbo(slug: str) -> tuple[str, PolymarketMarket | None]:
         async with sem:
-            bbo = await polymarket.get_bbo(slug)
-        snap = snapshot_by_slug.get(slug)
+            return slug, await polymarket.get_bbo(slug)
+
+    bbo_results = await asyncio.gather(*(_fetch_bbo(s) for s in unique_slugs))
+    bbo_by_slug: dict[str, PolymarketMarket | None] = dict(bbo_results)
+
+    for kalshi_side, match in enriched.side_map.items():
+        slug = match.polymarket_market_slug
+        snap = snapshot_by_key.get((slug, match.is_no_side))
+        bbo = bbo_by_slug.get(slug)
         if bbo is not None and (
             bbo.yes_bid_dollars is not None or bbo.yes_ask_dollars is not None
         ):
-            # Carry the snapshot's yes_sub_title forward — BBO doesn't echo
-            # team names back.
-            if snap and snap.yes_sub_title and bbo.yes_sub_title is None:
-                bbo = bbo.model_copy(update={"yes_sub_title": snap.yes_sub_title})
-            return side_label, bbo
-        return side_label, snap
-
-    results = await asyncio.gather(
-        *(
-            _one(side, match.polymarket_market_slug)
-            for side, match in enriched.side_map.items()
-        )
-    )
-    for kalshi_side, pm in results:
-        if pm is not None:
-            enriched.polymarket_price_by_kalshi_side[kalshi_side] = pm
+            if match.is_no_side:
+                # BBO returns YES-direction bid/ask; invert for the NO side.
+                yes_bid = bbo.yes_bid_dollars
+                yes_ask = bbo.yes_ask_dollars
+                inv_bid = 1.0 - yes_ask if yes_ask is not None else None
+                inv_ask = 1.0 - yes_bid if yes_bid is not None else None
+                resolved = bbo.model_copy(update={
+                    "is_no_side": True,
+                    "yes_sub_title": (snap.yes_sub_title if snap else None)
+                    or match.kalshi_yes_sub_title,
+                    "team_aliases": snap.team_aliases if snap else [],
+                    "yes_bid_dollars": inv_bid,
+                    "yes_ask_dollars": inv_ask,
+                    "last_trade_price_dollars": None,
+                })
+            else:
+                # Carry the snapshot's display metadata forward — BBO doesn't
+                # echo team names back on its own.
+                if snap and snap.yes_sub_title and bbo.yes_sub_title is None:
+                    bbo = bbo.model_copy(update={"yes_sub_title": snap.yes_sub_title})
+                resolved = bbo
+            enriched.polymarket_price_by_kalshi_side[kalshi_side] = resolved
+        elif snap is not None:
+            enriched.polymarket_price_by_kalshi_side[kalshi_side] = snap
 
 
 async def enrich_with_polymarket(

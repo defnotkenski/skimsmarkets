@@ -68,31 +68,76 @@ _SETTLEMENT_TIME_CANDIDATES: tuple[str, ...] = (
 )
 
 
-def _extract_yes_team_name(market_sides: Any) -> str | None:
-    """Polymarket's events.list payload encodes the YES-side team name inside
-    `marketSides`: each side has `description` ('Yes'/'No'), `long` (bool), and
-    `team: {name: ...}`. We want the team attached to the Yes/long side — that
-    string is what we compare against Kalshi's `yes_sub_title`.
+def _invert_price(outcome_prices: Any, *, want: str) -> float | None:
+    """Derive NO-side bid/ask from the YES-side `outcomePrices` snapshot.
+
+    `outcomePrices` is a 2-element list where the smaller value is YES bid and
+    the larger is YES ask, regardless of the order-within-list that matches
+    `outcomes`. `no_bid = 1 - yes_ask`, `no_ask = 1 - yes_bid`. Returns None
+    when the shape is unexpected so the caller can leave the price unset.
+    """
+    if not isinstance(outcome_prices, list) or len(outcome_prices) != 2:
+        return None
+    try:
+        p0, p1 = float(outcome_prices[0]), float(outcome_prices[1])
+    except (TypeError, ValueError):
+        return None
+    yes_bid, yes_ask = (p0, p1) if p0 <= p1 else (p1, p0)
+    if want == "no_bid":
+        return 1.0 - yes_ask
+    if want == "no_ask":
+        return 1.0 - yes_bid
+    return None
+
+
+def _team_aliases(team: dict[str, Any] | None) -> list[str]:
+    """Collect every label variant Polymarket gives us for a team.
+
+    The team record carries `name` (mascot, e.g. 'Cavaliers'), `safeName`
+    (city, e.g. 'Cleveland'), `abbreviation` ('cle'), and `alias` (often
+    mascot again). Kalshi uses cities on NBA/NHL/MLB and the raw name elsewhere,
+    so the matcher needs all forms to find a hit. De-duplicated, lowercased.
+    """
+    if not isinstance(team, dict):
+        return []
+    seen: list[str] = []
+    for key in ("name", "safeName", "alias", "abbreviation"):
+        v = team.get(key)
+        if isinstance(v, str) and v and v not in seen:
+            seen.append(v)
+    return seen
+
+
+def _extract_team_side(
+    market_sides: Any, *, want_long: bool,
+) -> tuple[str | None, list[str]]:
+    """Pull the team label + alias list for one side (long=True → YES, False → NO).
+
+    Returns (display_label, aliases). Display label is the `name` field (mascot
+    for team sports, person for individual sports); aliases carry every form
+    we know for matching. Both default to ``(None, [])`` when the requested
+    side isn't represented or the team record is missing.
     """
     if not isinstance(market_sides, list):
-        return None
+        return None, []
+    # Prefer explicit long=True/False flag; fall back to description=Yes/No.
     for side in market_sides:
         if not isinstance(side, dict):
             continue
-        if side.get("description") == "Yes" and side.get("long") is True:
-            team = side.get("team") or {}
-            name = team.get("name") if isinstance(team, dict) else None
-            if name:
-                return name
-    # Fallback: first side with a team name (rare — some markets don't label
-    # description explicitly).
+        if side.get("long") is want_long:
+            team = side.get("team")
+            aliases = _team_aliases(team)
+            display = aliases[0] if aliases else None
+            return display, aliases
     for side in market_sides:
-        if isinstance(side, dict):
-            team = side.get("team") or {}
-            name = team.get("name") if isinstance(team, dict) else None
-            if name:
-                return name
-    return None
+        if not isinstance(side, dict):
+            continue
+        if side.get("description") == ("Yes" if want_long else "No"):
+            team = side.get("team")
+            aliases = _team_aliases(team)
+            display = aliases[0] if aliases else None
+            return display, aliases
+    return None, []
 
 
 # Candidate field names for Polymarket's "when does the game START" timestamp.
@@ -111,7 +156,20 @@ _GAME_START_CANDIDATES: tuple[str, ...] = (
 
 
 class PolymarketMarket(BaseModel):
-    """A single Polymarket binary yes/no market.
+    """A single Polymarket binary side.
+
+    Head-to-head games produce ONE underlying market on Polymarket but carry
+    two `marketSides` (e.g. YES=Cavaliers, NO=Raptors). To keep the rest of
+    the pipeline "one record per tradable side" — matching Kalshi's shape —
+    the event's `model_validator` expands such markets into two
+    PolymarketMarket instances: one for YES, one for NO (prices inverted).
+    Both share the same `slug`; `is_no_side` flags the inverted one so BBO
+    fetching can dedupe by slug and consumers can render the distinction.
+
+    `team_aliases` carries every label Polymarket gives for this side's team
+    (name/safeName/abbreviation/alias). Kalshi uses cities on NBA/NHL/MLB
+    moneylines ('Cleveland') while Polymarket uses mascots ('Cavaliers'), so
+    single-label matching fails — the aliases bridge that gap.
 
     Initial prices are parsed from the events.list snapshot (`outcomePrices` +
     `marketSides`) when present; the pipeline refreshes authoritative bid/ask
@@ -134,7 +192,24 @@ class PolymarketMarket(BaseModel):
     title: str | None = None
     yes_sub_title: str | None = Field(
         default=None,
-        description="Label of the YES outcome (team/player name from marketSides[0].team.name).",
+        description="Display label for this side (team mascot or player name).",
+    )
+    team_aliases: list[str] = Field(
+        default_factory=list,
+        description="All labels (name, safeName, abbreviation, alias) for matching.",
+    )
+    sports_market_type: str | None = Field(
+        default=None,
+        description=(
+            "Polymarket's sportsMarketType ('moneyline', 'drawable_outcome', "
+            "'spreads', 'totals', 'futures'). Used by the matcher to filter out "
+            "spread/total/futures markets when pairing a Kalshi head-to-head game."
+        ),
+    )
+    is_no_side: bool = Field(
+        default=False,
+        description="True when this record represents the NO direction of the "
+                    "underlying slug — prices are inverted vs Polymarket's YES book.",
     )
     yes_bid_dollars: float | None = None
     yes_ask_dollars: float | None = None
@@ -166,20 +241,29 @@ class PolymarketMarket(BaseModel):
     def _extract_from_raw_shape(cls, data: Any) -> Any:
         """Normalize Polymarket's raw event-listing shape into our flat fields.
 
-        - yes_sub_title <- marketSides[0].team.name where description=Yes, long=True
+        - yes_sub_title <- marketSides long=True team.name (or 'Yes' description)
+        - team_aliases <- name / safeName / abbreviation / alias for that team
         - yes_bid_dollars / yes_ask_dollars <- outcomePrices[0]/[1] if not already set
           (snapshot only; BBO is the source of truth post-match).
         - expected_expiration_time <- first non-null of settlement-time candidates.
         - game_start_time <- first non-null of game-start candidates.
+
+        NO-side expansion (for head-to-head markets) happens at the event
+        level — see `PolymarketEvent._expand_head_to_head_markets`.
         """
         if not isinstance(data, dict):
             return data
         data = dict(data)  # shallow copy; don't mutate caller's dict
 
-        if data.get("yes_sub_title") is None:
-            yes_name = _extract_yes_team_name(data.get("marketSides"))
-            if yes_name:
-                data["yes_sub_title"] = yes_name
+        if data.get("yes_sub_title") is None or not data.get("team_aliases"):
+            display, aliases = _extract_team_side(data.get("marketSides"), want_long=True)
+            if data.get("yes_sub_title") is None and display:
+                data["yes_sub_title"] = display
+            if not data.get("team_aliases") and aliases:
+                data["team_aliases"] = aliases
+
+        if data.get("sports_market_type") is None and data.get("sportsMarketType"):
+            data["sports_market_type"] = data["sportsMarketType"]
 
         # Snapshot bid/ask from outcomePrices when the model wasn't handed
         # explicit values. Heuristic: outcomePrices is a 2-element list of
@@ -209,6 +293,30 @@ class PolymarketMarket(BaseModel):
                     data["game_start_time"] = data[candidate]
                     break
         return data
+
+    def inverted_no_side(self, no_display: str, no_aliases: list[str]) -> "PolymarketMarket":
+        """Return a sibling market record representing the NO direction.
+
+        Same slug, team aliases swapped to the NO-side team, bid/ask inverted
+        so the consumer sees "price to buy this team" directly. Kept as a
+        method so the PolymarketEvent validator can derive NO-side records
+        without rebuilding the full model state by hand.
+        """
+        inv_bid = (
+            1.0 - self.yes_ask_dollars if self.yes_ask_dollars is not None else None
+        )
+        inv_ask = (
+            1.0 - self.yes_bid_dollars if self.yes_bid_dollars is not None else None
+        )
+        return self.model_copy(update={
+            "is_no_side": True,
+            "yes_sub_title": no_display,
+            "team_aliases": no_aliases,
+            "yes_bid_dollars": inv_bid,
+            "yes_ask_dollars": inv_ask,
+            # last_trade is directional — drop it on the NO clone to avoid misleading display.
+            "last_trade_price_dollars": None,
+        })
 
     @property
     def yes_implied_probability(self) -> float | None:
@@ -303,7 +411,52 @@ class PolymarketEvent(BaseModel):
                 continue
             if state_key and state_d.get(state_key) is not None:
                 data[flat] = state_d[state_key]
+
+        # Head-to-head expansion: for each raw market with two distinct team
+        # sides in `marketSides`, append a synthesized NO-side dict so the
+        # markets list contains one record per tradable side. The NO record
+        # carries the opposing team's aliases and pre-inverted bid/ask. This
+        # runs on the raw data (before PolymarketMarket strips marketSides),
+        # which is why it lives here rather than on the market validator.
+        raw_markets = data.get("markets")
+        if isinstance(raw_markets, list):
+            expanded: list[Any] = []
+            for raw in raw_markets:
+                expanded.append(raw)
+                if not isinstance(raw, dict):
+                    continue
+                sides = raw.get("marketSides")
+                yes_display, yes_aliases = _extract_team_side(sides, want_long=True)
+                no_display, no_aliases = _extract_team_side(sides, want_long=False)
+                # Only expand when both sides carry a DIFFERENT team (head-to-
+                # head). MVP-style futures have the same team on both sides —
+                # those stay as a single record.
+                if not yes_display or not no_display:
+                    continue
+                if yes_display == no_display:
+                    continue
+                no_side_raw: dict[str, Any] = {
+                    "slug": raw.get("slug"),
+                    "id": raw.get("id"),
+                    "title": raw.get("title"),
+                    "yes_sub_title": no_display,
+                    "team_aliases": no_aliases,
+                    "sports_market_type": raw.get("sportsMarketType"),
+                    "is_no_side": True,
+                    # Invert prices when we have both halves; otherwise leave None.
+                    "yes_bid_dollars": _invert_price(raw.get("outcomePrices"), want="no_bid"),
+                    "yes_ask_dollars": _invert_price(raw.get("outcomePrices"), want="no_ask"),
+                    # Carry forward time + volume signals; last_trade is YES-directional so skip.
+                    "volume_dollars": raw.get("volume"),
+                    "liquidity_dollars": raw.get("liquidity"),
+                    "gameStartTime": raw.get("gameStartTime") or raw.get("startTime")
+                    or raw.get("startDate"),
+                    "endDate": raw.get("endDate"),
+                }
+                expanded.append(no_side_raw)
+            data["markets"] = expanded
         return data
+
 
     @property
     def is_live(self) -> bool:
