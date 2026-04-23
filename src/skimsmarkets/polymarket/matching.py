@@ -11,8 +11,10 @@ sizing picks an entry price for a different game. A false negative just drops
 to Kalshi-only for that event, which is today's behavior. So the matcher
 returns `None` whenever the signal is ambiguous, and the pipeline carries on.
 
-The alias map is seeded sparsely on purpose: grow it from real unmatched-event
-logs rather than guessing in advance.
+City/nickname aliasing is delegated to Polymarket: each PolymarketMarket
+carries `team_aliases` built from the upstream team record (name, safeName,
+abbreviation, alias), which covers every Kalshi label form we've observed
+across NBA/NHL/MLB/NFL/MLS/UFC/ATP/WTA. No local alias map.
 """
 
 from __future__ import annotations
@@ -20,7 +22,6 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Sequence
 
 from skimsmarkets.kalshi.models import KalshiEvent
@@ -28,45 +29,24 @@ from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
 log = logging.getLogger(__name__)
 
-# Seed city/nickname aliases. Canonical key → set of forms (all lowercase,
-# punctuation-stripped) that should collapse to the same token set. This list
-# is intentionally small — extend from real run logs, not from guesses.
-_CITY_NICKNAME_MAP: dict[str, set[str]] = {
-    "los angeles lakers": {"la lakers", "lakers"},
-    "los angeles clippers": {"la clippers", "clippers"},
-    "new york yankees": {"ny yankees", "yankees"},
-    "new york mets": {"ny mets", "mets"},
-    "new york knicks": {"ny knicks", "knicks"},
-    "new york giants": {"ny giants", "giants"},
-    "new york jets": {"ny jets", "jets"},
-}
-
 _PUNCT_RX = re.compile(r"[^\w\s]")
 
 
-def _normalize(name: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace."""
-    return " ".join(_PUNCT_RX.sub(" ", name.lower()).split())
-
-
-def _canonical_tokens(name: str) -> frozenset[str]:
-    """Collapse aliases to their canonical form's token set.
-
-    If `name` (normalized) matches any alias in `_CITY_NICKNAME_MAP`, return
-    the tokens of the canonical key. Otherwise return the normalized tokens.
-    """
-    n = _normalize(name)
-    if not n:
-        return frozenset()
-    for canonical, aliases in _CITY_NICKNAME_MAP.items():
-        if n == canonical or n in aliases:
-            return frozenset(canonical.split())
-    return frozenset(n.split())
+def _tokens(name: str) -> frozenset[str]:
+    """Lowercase, strip punctuation, return the token set."""
+    return frozenset(_PUNCT_RX.sub(" ", name.lower()).split())
 
 
 def _overlap(a: str, b: str) -> float:
-    """Jaccard-ish overlap between two side-label token sets in [0, 1]."""
-    ta, tb = _canonical_tokens(a), _canonical_tokens(b)
+    """Jaccard-ish overlap between two side-label token sets in [0, 1].
+
+    Denominator is max(|a|, |b|) rather than the classic |a ∪ b| so a short
+    label fully contained in a longer one ('Atlanta' ⊂ 'Atlanta Braves') still
+    scores 0.5 — enough to clear the default threshold. This is load-bearing
+    for MLB where Kalshi uses the city alone and Polymarket's canonical alias
+    carries both city and mascot tokens.
+    """
+    ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / max(len(ta), len(tb))
@@ -142,25 +122,6 @@ def _time_delta_hours(
     return abs((k - p).total_seconds()) / 3600.0
 
 
-def _time_bonus(
-    kalshi_event: KalshiEvent,
-    pm: PolymarketEvent,
-    tolerance: timedelta,
-) -> float:
-    """Small additive bonus when settlement times look close. Zero if missing.
-
-    Capped at 0.1 so name overlap remains the dominant signal; the ambiguity
-    tiebreaker in `match_event` uses the raw delta for finer-grained ranking.
-    """
-    delta_hours = _time_delta_hours(kalshi_event, pm)
-    if delta_hours is None:
-        return 0.0
-    tolerance_hours = tolerance.total_seconds() / 3600.0
-    if delta_hours <= tolerance_hours:
-        return 0.1 * (1.0 - delta_hours / tolerance_hours)
-    return 0.0
-
-
 # Polymarket `sportsMarketType` values that represent a direct "who wins"
 # binary comparable to a Kalshi head-to-head side. Spreads / totals / futures
 # are excluded: they share team labels with the moneyline market inside the
@@ -229,7 +190,6 @@ def match_event(
     kalshi_event: KalshiEvent,
     candidates: Sequence[PolymarketEvent],
     *,
-    settlement_tolerance_hours: float = 24.0,
     min_side_overlap: float = 0.5,
 ) -> EventMatch | None:
     """Pick the best Polymarket event for a KalshiEvent, then map sides.
@@ -242,7 +202,6 @@ def match_event(
     if not candidates:
         return None
 
-    tolerance = timedelta(hours=settlement_tolerance_hours)
     # Hard time-proximity filter. A Polymarket event whose game-start is more
     # than a week off the Kalshi event is almost certainly a different thing
     # (season futures, wrong game, etc.). When time data is missing on either
@@ -263,9 +222,9 @@ def match_event(
         # Coverage-weighted: sum side scores (not mean) so a candidate that
         # matches more sides beats one that matches a single side exactly.
         # Without this, a wrong game that shares one team name outranks the
-        # right game that partially matches both teams.
-        sum_side_score = sum(m.score for m in side_map.values())
-        score = sum_side_score + _time_bonus(kalshi_event, pm, tolerance)
+        # right game that partially matches both teams. Time proximity is a
+        # tiebreaker below, not an additive to this score.
+        score = sum(m.score for m in side_map.values())
         scored.append((score, pm, side_map))
 
     if not scored:

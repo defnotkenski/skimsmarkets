@@ -69,16 +69,28 @@ async def fetch_live_sports(
 async def _fetch_polymarket_series(
     polymarket: PolymarketClient,
     series_prefixes: set[str],
+    *,
+    start_time_min: datetime | None = None,
+    start_time_max: datetime | None = None,
 ) -> dict[str, list[PolymarketEvent]]:
     """Fetch polymarket events for each mapped series prefix concurrently.
 
     One failure per prefix is isolated (warning log + empty list) so a single
     flaky league doesn't block cross-venue enrichment for the others.
+
+    `start_time_min`/`start_time_max` narrow the Polymarket pool to the window
+    we actually care about — typically derived from the in-horizon Kalshi slate
+    so the PM candidate pool tracks the same prediction horizon (same-day /
+    next-day games) instead of pulling in season-long futures markets.
     """
 
     async def _one(prefix: str) -> tuple[str, list[PolymarketEvent]]:
         try:
-            return prefix, await polymarket.list_sports_events(series_prefix=prefix)
+            return prefix, await polymarket.list_sports_events(
+                series_prefix=prefix,
+                start_time_min=start_time_min,
+                start_time_max=start_time_max,
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("polymarket series=%s fetch failed: %s", prefix, e)
             return prefix, []
@@ -172,7 +184,14 @@ async def enrich_with_polymarket(
     """Attach Polymarket overlay to each Kalshi event. Returns (enriched_list,
     matched_count, unmatched_count). When `polymarket` is None, every Kalshi
     event becomes a bare EnrichedEvent with no overlay — the pipeline then
-    behaves identically to the Kalshi-only flow."""
+    behaves identically to the Kalshi-only flow.
+
+    Callers should pass the horizon-filtered Kalshi slate (today/tomorrow), not
+    all open events. This function derives the Polymarket game-start window
+    from those events' settlement times so the PM candidate pool stays aligned
+    with the prediction horizon — no season-winner futures, no playoff games a
+    week out that get filtered downstream anyway.
+    """
     if polymarket is None:
         return [EnrichedEvent(kalshi=e) for e in kalshi_events], 0, len(kalshi_events)
 
@@ -194,7 +213,25 @@ async def enrich_with_polymarket(
         )
         return [EnrichedEvent(kalshi=e) for e in kalshi_events], 0, len(kalshi_events)
 
-    pm_by_prefix = await _fetch_polymarket_series(polymarket, set(events_by_prefix))
+    # Bound the PM game-start window to what the Kalshi slate actually needs.
+    # Kalshi `expected_expiration_time` lands shortly after game end; PM
+    # `game_start_time` is tipoff (typically 2-6h earlier). A 6h pad on both
+    # ends covers clock skew and long-tail games (OT, rain delays, 3h+ MLB).
+    k_expirations = [
+        m.expected_expiration_time
+        for ev in kalshi_events
+        for m in ev.markets
+        if m.expected_expiration_time is not None
+    ]
+    start_time_min = datetime.now(tz=UTC) - timedelta(hours=6)
+    start_time_max = (max(k_expirations) + timedelta(hours=6)) if k_expirations else None
+
+    pm_by_prefix = await _fetch_polymarket_series(
+        polymarket,
+        set(events_by_prefix),
+        start_time_min=start_time_min,
+        start_time_max=start_time_max,
+    )
 
     enriched_list: list[EnrichedEvent] = []
     matched = 0
@@ -370,24 +407,36 @@ async def run_pipeline(
             result.fetched_events = len(kalshi_events)
             log.info("fetched %d live kalshi events", len(kalshi_events))
 
+            # Horizon-filter BEFORE Polymarket enrichment: there's no point
+            # matching/BBO-fetching for events we're going to drop. This also
+            # lets enrich_with_polymarket derive its PM game-start window from
+            # the in-horizon slate, so the PM candidate pool tracks the same
+            # prediction horizon instead of hauling in season-winner futures.
+            in_horizon_kalshi = [
+                e for e in kalshi_events if event_within_horizon(e, horizon_hours)
+            ]
+            log.info(
+                "in-horizon kalshi events: %d / %d (horizon=%sh)",
+                len(in_horizon_kalshi),
+                len(kalshi_events),
+                horizon_hours,
+            )
+
             enriched_all, matched, unmatched = await enrich_with_polymarket(
                 pm_client,
-                kalshi_events,
+                in_horizon_kalshi,
                 poly_sem=poly_sem,
             )
             result.polymarket_matched = matched
             result.polymarket_unmatched = unmatched
 
-            in_horizon = [
-                e for e in enriched_all if event_within_horizon(e.kalshi, horizon_hours)
-            ]
+            in_horizon = enriched_all
             if dry_run:
                 in_horizon = in_horizon[:1]
             result.considered_events = len(in_horizon)
             log.info(
-                "considering %d events (horizon=%sh, dry_run=%s)",
+                "considering %d events (dry_run=%s)",
                 len(in_horizon),
-                horizon_hours,
                 dry_run,
             )
 

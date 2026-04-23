@@ -13,6 +13,7 @@ All calls here are read-only (public market data). No credentials are needed.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from types import TracebackType
 from typing import Any, Self
 
@@ -75,15 +76,23 @@ class PolymarketClient:
         *,
         series_prefix: str | None = None,
         limit: int = 500,
+        start_time_min: datetime | None = None,
+        start_time_max: datetime | None = None,
     ) -> list[PolymarketEvent]:
         """Fetch open sports events, optionally filtered to a series-slug prefix.
 
         The SDK's `events.list` accepts `categories`, `active`, `closed`,
-        `archived`, `limit`, `offset`, `seriesId` — but NOT a league filter. We
-        pass `active=True, closed=False` to get live-tradable events and then
-        filter client-side by `seriesSlug` prefix (e.g. 'nba' matches
-        'nba-2025'). Response envelope observed as `{"events": [...]}`; we
-        fall back to `{"data": [...]}` defensively.
+        `archived`, `limit`, `offset`, `seriesId`, `startTimeMin`, `startTimeMax` —
+        but NOT a league filter. We pass `active=True, closed=False` to get
+        live-tradable events and then filter client-side by `seriesSlug` prefix
+        (e.g. 'nba' matches 'nba-2025'). Response envelope observed as
+        `{"events": [...]}`; we fall back to `{"data": [...]}` defensively.
+
+        `start_time_min`/`start_time_max` bound the Polymarket event pool by
+        game-start time. Passing them lets the caller drop season-winner futures
+        and far-out playoff games from the matcher's candidate pool, which both
+        cuts network work and removes ambiguous-futures collision cases where
+        the matcher could pair a daily game to a season-winner slug.
         """
         params: dict[str, Any] = {
             "categories": ["sports"],
@@ -91,6 +100,10 @@ class PolymarketClient:
             "closed": False,
             "limit": limit,
         }
+        if start_time_min is not None:
+            params["startTimeMin"] = start_time_min.isoformat().replace("+00:00", "Z")
+        if start_time_max is not None:
+            params["startTimeMax"] = start_time_max.isoformat().replace("+00:00", "Z")
         raw = await self._sdk.events.list(params)
         items = self._unwrap_list(raw, "events")
         events: list[PolymarketEvent] = []
