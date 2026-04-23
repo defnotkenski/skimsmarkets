@@ -63,16 +63,29 @@ def print_events_table(
     series_filter: str | None,
     horizon_hours: int | None = None,
 ) -> None:
-    # One row per event: keep the favorite side (implied probability >= 0.5).
-    # Markets with unknown implied probability are kept so they stay visible.
-    # Walrus binds the implied prob once so static checkers see the None-narrow.
-    pairs = [
-        (enr, m)
-        for enr in events
-        for m in enr.kalshi.markets
-        if ((implied := m.yes_implied_probability) is None or implied >= 0.5)
-        and (horizon_hours is None or _within_horizon(m, horizon_hours))
-    ]
+    # One row per event: the most-probable side. An earlier version filtered
+    # `implied >= 0.5` to pick the favorite, which works for 2-way markets
+    # (YES + NO = 1.0, so one side always clears 0.5) but silently drops every
+    # 3-way event where all sides sit below 0.5 — common in soccer (La Liga,
+    # MLS, Premier League) where home/draw/away splits often peak around
+    # 0.4–0.5. The current rule: keep the single highest-implied side per
+    # event regardless of threshold, with markets lacking an implied prob
+    # ranked last (but still visible so unknowns don't silently disappear).
+    pairs: list[tuple[EnrichedEvent, KalshiMarket]] = []
+    for enr in events:
+        candidates = [
+            m for m in enr.kalshi.markets
+            if horizon_hours is None or _within_horizon(m, horizon_hours)
+        ]
+        if not candidates:
+            continue
+        favorite = max(
+            candidates,
+            key=lambda m: m.yes_implied_probability
+            if m.yes_implied_probability is not None
+            else -1.0,
+        )
+        pairs.append((enr, favorite))
     pairs.sort(key=lambda pair: pair[1].volume_24h_fp or 0.0, reverse=True)
 
     console = Console()

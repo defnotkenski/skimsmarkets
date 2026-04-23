@@ -42,6 +42,7 @@ KALSHI_SERIES_TO_POLYMARKET_LEAGUE: dict[str, str] = {
     "KXUFCFIGHT": "ufc",
     "KXATPMATCH": "atp",
     "KXWTAMATCH": "wta",
+    "KXLALIGAGAME": "lal",
 }
 
 # Emergency kill-switch for the Polymarket overlay. "0" / "false" / "False" disable

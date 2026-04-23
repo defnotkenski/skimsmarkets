@@ -40,16 +40,31 @@ def _tokens(name: str) -> frozenset[str]:
 def _overlap(a: str, b: str) -> float:
     """Jaccard-ish overlap between two side-label token sets in [0, 1].
 
-    Denominator is max(|a|, |b|) rather than the classic |a ∪ b| so a short
-    label fully contained in a longer one ('Atlanta' ⊂ 'Atlanta Braves') still
-    scores 0.5 — enough to clear the default threshold. This is load-bearing
-    for MLB where Kalshi uses the city alone and Polymarket's canonical alias
-    carries both city and mascot tokens.
+    Two rules, both load-bearing:
+
+    1. **Subset short-circuit → 1.0.** If one side's tokens are fully contained
+       in the other's, we treat it as a match regardless of the size delta.
+       This catches the pathological case where Polymarket ships the long
+       formal name (e.g. 'Rayo Vallecano de Madrid' — 4 tokens) while Kalshi
+       uses a single token ('Vallecano'). Pure max-denom Jaccard scores that
+       1/4 = 0.25 and fails the 0.5 threshold, even though the names clearly
+       refer to the same team. Subset matching is safe because the caller has
+       already narrowed candidates to (same league, same day-ish window) —
+       two different teams almost never share a single-token substring within
+       that bucket, and the ≥2-sides-matched gate catches the rare exceptions.
+
+    2. **Max-denominator Jaccard** for the general case. Using max(|a|,|b|)
+       rather than the classic |a ∪ b| keeps short-vs-slightly-longer pairs
+       ('Atlanta' / 'Atlanta Braves') scoring 0.5 — above threshold — without
+       blowing up when sizes mismatch.
     """
     ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
         return 0.0
-    return len(ta & tb) / max(len(ta), len(tb))
+    intersection = len(ta & tb)
+    if intersection == len(ta) or intersection == len(tb):
+        return 1.0
+    return intersection / max(len(ta), len(tb))
 
 
 @dataclass(frozen=True)
