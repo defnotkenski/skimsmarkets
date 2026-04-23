@@ -501,12 +501,19 @@ class PolymarketEvent(BaseModel):
             return f"{prefix} LIVE — {body}"
 
         # Pre-match: anchor with the game's scheduled start time (from one of
-        # the event's markets) so the LLM knows how far out tipoff is, rather
-        # than having to infer from absence.
+        # the event's markets) and surface Polymarket's consensus spread/total
+        # when present — those lines carry sharp-money positioning from the
+        # opening bell and are useful to market_pricing even before tipoff.
+        parts: list[str] = []
         start_times = [m.game_start_time for m in self.markets if m.game_start_time]
         if start_times:
-            start_iso = min(start_times).isoformat()
-            return f"{prefix} PRE-MATCH (starts {start_iso})"
+            parts.append(f"starts {min(start_times).isoformat()}")
+        if self.main_spread_line is not None:
+            parts.append(f"spread={self.main_spread_line}")
+        if self.main_total_line is not None:
+            parts.append(f"total={self.main_total_line}")
+        if parts:
+            return f"{prefix} PRE-MATCH — {' | '.join(parts)}"
         return f"{prefix} PRE-MATCH"
 
     def _format_score(self) -> str:

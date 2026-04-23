@@ -83,7 +83,7 @@ def render_context(enriched: EnrichedEvent) -> str:
             f"implied={f'{implied:.3f}' if implied is not None else 'unknown'} "
             f"vol24h={m.volume_24h_fp}"
         )
-        market_lines.append(_polymarket_sub_line(enriched, m.yes_sub_title))
+        market_lines.append(_polymarket_sub_line(enriched, m))
 
     settles = (
         team_a_market.expected_expiration_time.isoformat()
@@ -117,28 +117,56 @@ def render_context(enriched: EnrichedEvent) -> str:
     )
 
 
-def _polymarket_sub_line(enriched: EnrichedEvent, yes_sub_title: str | None) -> str:
+def _polymarket_sub_line(enriched: EnrichedEvent, k_market: KalshiMarket) -> str:
     """Render the `polymarket:` sub-line beneath a Kalshi market line.
 
     Explicit absence beats silent omission — when no counterpart matched, print
     "(not matched)" so the LLM sees why Polymarket data isn't there rather than
     wondering whether it's a render bug.
+
+    When a counterpart exists, also surface derived signals the specialists
+    would otherwise compute themselves:
+      - spread width in bps (tight = trustworthy; wide = thin/stale quote)
+      - cross-venue delta in bps vs the Kalshi side implied probability
+      - volume / liquidity when BBO populated them (per-venue depth)
+    All of these are defensive — if the underlying field is None they're
+    simply omitted, no placeholder clutter.
     """
-    if not yes_sub_title:
+    if not k_market.yes_sub_title:
         return "      polymarket: (no kalshi side label)"
-    pm = enriched.poly_market_for(yes_sub_title)
+    pm = enriched.poly_market_for(k_market.yes_sub_title)
     if pm is None:
         return "      polymarket: (not matched)"
     implied = pm.yes_implied_probability
     bid = f"${pm.yes_bid_dollars:.3f}" if pm.yes_bid_dollars is not None else "?"
     ask = f"${pm.yes_ask_dollars:.3f}" if pm.yes_ask_dollars is not None else "?"
     implied_str = f"{implied:.3f}" if implied is not None else "unknown"
+
+    extras: list[str] = []
+    # Spread width in bps. Kept integer-rounded; decimal precision isn't useful
+    # at this granularity and noise in the display hurts scanability.
+    if pm.yes_bid_dollars is not None and pm.yes_ask_dollars is not None:
+        spread_bps = int(round((pm.yes_ask_dollars - pm.yes_bid_dollars) * 10000))
+        extras.append(f"spread={spread_bps}bps")
+    # Cross-venue delta: +N bps means PM is pricing this side HIGHER than
+    # Kalshi. Only rendered when both venues have a live mid — otherwise the
+    # subtraction is meaningless.
+    k_implied = k_market.yes_implied_probability
+    if implied is not None and k_implied is not None:
+        delta_bps = int(round((implied - k_implied) * 10000))
+        extras.append(f"Δ_vs_kalshi={delta_bps:+d}bps")
+    if pm.volume_dollars is not None:
+        extras.append(f"vol=${pm.volume_dollars:,.0f}")
+    if pm.liquidity_dollars is not None:
+        extras.append(f"liq=${pm.liquidity_dollars:,.0f}")
+
+    extras_str = f" {' '.join(extras)}" if extras else ""
     # [NO side] flags head-to-head markets where this Kalshi side pairs to the
     # inverted direction of the same PM slug (common for NBA/NHL moneylines).
     side_tag = " [NO side, inverted]" if pm.is_no_side else ""
     return (
         f"      polymarket: slug={pm.slug}{side_tag} "
-        f"bid/ask={bid}/{ask} implied={implied_str}"
+        f"bid/ask={bid}/{ask} implied={implied_str}{extras_str}"
     )
 
 
