@@ -8,17 +8,18 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
-from skimsmarkets.kalshi.models import KalshiEvent, KalshiMarket
+from skimsmarkets.enriched import EnrichedEvent
+from skimsmarkets.kalshi.models import KalshiMarket
 from skimsmarkets.pipeline import RunResult
 
 # Pastel palette — used everywhere instead of bright ANSI colors.
-_MINT = "#a8e6cf"       # positive / buy / high confidence
-_ROSE = "#ffaaa5"       # negative / low confidence / errors
-_PEACH = "#ffd3b6"      # medium / warnings (replaces yellow)
-_SKY = "#a8dadc"        # cyan-equivalent for identifiers
-_LAVENDER = "#d4a5e8"   # winner / headline accents
-_DIM = "#b0b0b0"        # pass / muted
-_CREAM = "#fff3b0"      # table title headings
+_MINT = "#a8e6cf"  # positive / buy / high confidence
+_ROSE = "#ffaaa5"  # negative / low confidence / errors
+_PEACH = "#ffd3b6"  # medium / warnings (replaces yellow)
+_SKY = "#a8dadc"  # cyan-equivalent for identifiers
+_LAVENDER = "#d4a5e8"  # winner / headline accents
+_DIM = "#b0b0b0"  # pass / muted
+_CREAM = "#fff3b0"  # table title headings
 
 
 def _rel_time(ts: datetime | None) -> str:
@@ -52,21 +53,24 @@ def _confidence_style(c: str) -> str:
 def _within_horizon(market: KalshiMarket, hours: int) -> bool:
     if market.expected_expiration_time is None:
         return True  # keep unknowns visible rather than silently dropping
-    return market.expected_expiration_time <= datetime.now(tz=UTC) + timedelta(hours=hours)
+    return market.expected_expiration_time <= datetime.now(tz=UTC) + timedelta(
+        hours=hours
+    )
 
 
 def print_events_table(
-    events: list[KalshiEvent],
+    events: list[EnrichedEvent],
     series_filter: str | None,
     horizon_hours: int | None = None,
 ) -> None:
     # One row per event: keep the favorite side (implied probability >= 0.5).
     # Markets with unknown implied probability are kept so they stay visible.
+    # Walrus binds the implied prob once so static checkers see the None-narrow.
     pairs = [
-        (e, m)
-        for e in events
-        for m in e.markets
-        if (m.yes_implied_probability is None or m.yes_implied_probability >= 0.5)
+        (enr, m)
+        for enr in events
+        for m in enr.kalshi.markets
+        if ((implied := m.yes_implied_probability) is None or implied >= 0.5)
         and (horizon_hours is None or _within_horizon(m, horizon_hours))
     ]
     pairs.sort(key=lambda pair: pair[1].volume_24h_fp or 0.0, reverse=True)
@@ -74,7 +78,7 @@ def print_events_table(
     console = Console()
     horizon_note = f", within {horizon_hours}h" if horizon_hours is not None else ""
     title = (
-        "Live Kalshi sports events"
+        "Live sports events (Kalshi + Polymarket)"
         + (f" — series={series_filter}" if series_filter else "")
         + horizon_note
         + f" ({len(pairs)} shown / {len(events)} total)"
@@ -89,24 +93,35 @@ def print_events_table(
     table.add_column("Series", style=_SKY)
     table.add_column("Event")
     table.add_column("Market (yes side)")
-    table.add_column("Yes bid/ask", justify="right")
-    table.add_column("Implied", justify="right")
+    table.add_column("Kalshi bid/ask", justify="right")
+    table.add_column("Kalshi impl", justify="right")
+    table.add_column("Poly bid/ask", justify="right")
+    table.add_column("Poly impl", justify="right")
     table.add_column("24h vol", justify="right")
     table.add_column("Settles in", justify="right")
 
-    for e, m in pairs:
+    for enr, m in pairs:
         implied = m.yes_implied_probability
         bidask = (
             f"{m.yes_bid_dollars:.2f}/{m.yes_ask_dollars:.2f}"
             if m.yes_bid_dollars is not None and m.yes_ask_dollars is not None
             else "—"
         )
+        pm = enr.poly_market_for(m.yes_sub_title) if m.yes_sub_title else None
+        poly_bidask = (
+            f"{pm.yes_bid_dollars:.2f}/{pm.yes_ask_dollars:.2f}"
+            if pm and pm.yes_bid_dollars is not None and pm.yes_ask_dollars is not None
+            else "—"
+        )
+        poly_implied = pm.yes_implied_probability if pm else None
         table.add_row(
-            e.series_ticker or "—",
-            (e.title or e.event_ticker)[:40],
+            enr.kalshi.series_ticker or "—",
+            (enr.kalshi.title or enr.kalshi.event_ticker)[:40],
             (m.yes_sub_title or m.title or "—")[:30],
             bidask,
             f"{implied:.2f}" if implied is not None else "—",
+            poly_bidask,
+            f"{poly_implied:.2f}" if poly_implied is not None else "—",
             f"{m.volume_24h_fp:,.0f}" if m.volume_24h_fp is not None else "—",
             _rel_time(m.expected_expiration_time),
         )
@@ -131,11 +146,15 @@ def print_run_summary(result: RunResult) -> None:
         f"Predictions: [{_MINT}]{len(result.predictions)}[/]  "
         f"Errors: [{_ROSE}]{len(result.errors)}[/]"
     )
+    console.print(
+        f"Polymarket overlay: [{_MINT}]{result.polymarket_matched}[/] matched, "
+        f"[{_DIM}]{result.polymarket_unmatched}[/] unmatched"
+    )
 
     if result.predictions:
         ranked = sorted(
             result.predictions,
-            key=lambda s: s.sizing.capped_half_kelly_fraction,
+            key=lambda sm: sm.sizing.capped_half_kelly_fraction,
             reverse=True,
         )
 
@@ -147,25 +166,32 @@ def print_run_summary(result: RunResult) -> None:
             header_style=_LAVENDER,
         )
         pred_table.add_column("Event", style=_SKY, overflow="fold", min_width=24)
-        pred_table.add_column("Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14)
+        pred_table.add_column(
+            "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
+        )
         pred_table.add_column("Rec", justify="center")
         pred_table.add_column("Pred", justify="right")
-        pred_table.add_column("Kalshi", justify="right")
+        pred_table.add_column("Kalshi impl", justify="right")
+        pred_table.add_column("Poly impl", justify="right")
         pred_table.add_column("Edge (bps)", justify="right")
         pred_table.add_column("Conf", justify="center")
 
         for s in ranked:
             p = s.prediction
-            edge_color = (
-                _MINT if p.edge_bps > 0 else (_ROSE if p.edge_bps < 0 else "")
-            )
+            edge_color = _MINT if p.edge_bps > 0 else (_ROSE if p.edge_bps < 0 else "")
             event_display = p.event_title or p.event_ticker
+            poly_impl_str = (
+                f"{p.polymarket_implied_probability:.3f}"
+                if p.polymarket_implied_probability is not None
+                else "—"
+            )
             pred_table.add_row(
                 event_display,
                 p.predicted_winner,
                 f"[{_rec_style(p.recommendation)}]{p.recommendation}[/]",
                 f"{p.predicted_yes_probability:.3f}",
                 f"{p.kalshi_implied_probability:.3f}",
+                poly_impl_str,
                 f"[{edge_color}]{p.edge_bps:+d}[/]"
                 if edge_color
                 else f"{p.edge_bps:+d}",
@@ -181,7 +207,10 @@ def print_run_summary(result: RunResult) -> None:
             header_style=_LAVENDER,
         )
         sizing_table.add_column("Event", style=_SKY, overflow="fold", min_width=24)
-        sizing_table.add_column("Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14)
+        sizing_table.add_column(
+            "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
+        )
+        sizing_table.add_column("Venue", justify="center")
         sizing_table.add_column("Entry", justify="right")
         sizing_table.add_column("Full K", justify="right")
         sizing_table.add_column("Capped ½K", justify="right")
@@ -189,9 +218,15 @@ def print_run_summary(result: RunResult) -> None:
         for s in ranked:
             p, z = s.prediction, s.sizing
             event_display = p.event_title or p.event_ticker
+            venue_style = (
+                _MINT
+                if z.venue == "polymarket"
+                else (_SKY if z.venue == "kalshi" else _DIM)
+            )
             sizing_table.add_row(
                 event_display,
                 p.predicted_winner,
+                f"[{venue_style}]{z.venue}[/]",
                 f"${z.entry_price_dollars:.2f}"
                 if z.entry_price_dollars is not None
                 else "—",
@@ -208,7 +243,9 @@ def print_run_summary(result: RunResult) -> None:
             header_style=_LAVENDER,
         )
         reasoning_table.add_column("Event", style=_SKY, overflow="fold", min_width=20)
-        reasoning_table.add_column("Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14)
+        reasoning_table.add_column(
+            "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
+        )
         reasoning_table.add_column("Reasoning", overflow="fold")
         for s in ranked:
             p = s.prediction

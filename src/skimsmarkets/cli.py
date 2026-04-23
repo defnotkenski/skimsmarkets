@@ -7,7 +7,12 @@ import sys
 
 from skimsmarkets import config as cfg
 from skimsmarkets.kalshi import KalshiClient
-from skimsmarkets.pipeline import fetch_live_sports, run_pipeline
+from skimsmarkets.pipeline import (
+    enrich_with_polymarket,
+    fetch_live_sports,
+    run_pipeline,
+)
+from skimsmarkets.polymarket import PolymarketClient
 from skimsmarkets.reporting import print_events_table, print_run_summary
 
 
@@ -19,16 +24,43 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-async def _fetch_only(series_ticker: str | None, horizon_hours: int) -> int:
-    async with KalshiClient() as c:
-        events = await fetch_live_sports(c, series_ticker)
-    print_events_table(events, series_ticker, horizon_hours=horizon_hours)
+async def _fetch_only(
+    series_ticker: str | None,
+    horizon_hours: int,
+    *,
+    polymarket_enabled: bool,
+) -> int:
+    poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
+    async with KalshiClient() as kalshi:
+        pm: PolymarketClient | None = PolymarketClient() if polymarket_enabled else None
+        if pm is not None:
+            await pm.__aenter__()
+        try:
+            kalshi_events = await fetch_live_sports(kalshi, series_ticker)
+            enriched, _matched, _unmatched = await enrich_with_polymarket(
+                pm,
+                kalshi_events,
+                poly_sem=poly_sem,
+            )
+        finally:
+            if pm is not None:
+                await pm.__aexit__(None, None, None)
+    print_events_table(enriched, series_ticker, horizon_hours=horizon_hours)
     return 0
 
 
-async def _full_run(series_ticker: str | None, dry_run: bool, horizon_hours: int) -> int:
+async def _full_run(
+    series_ticker: str | None,
+    dry_run: bool,
+    horizon_hours: int,
+    *,
+    polymarket_enabled: bool,
+) -> int:
     result = await run_pipeline(
-        series_filter=series_ticker, dry_run=dry_run, horizon_hours=horizon_hours,
+        series_filter=series_ticker,
+        dry_run=dry_run,
+        horizon_hours=horizon_hours,
+        polymarket_enabled=polymarket_enabled,
     )
     print_run_summary(result)
     return 0
@@ -37,7 +69,10 @@ async def _full_run(series_ticker: str | None, dry_run: bool, horizon_hours: int
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="skims",
-        description="Fetch live Kalshi sports markets and run the multi-agent prediction pipeline.",
+        description=(
+            "Fetch live Kalshi sports markets (with Polymarket US cross-venue overlay) "
+            "and run the multi-agent prediction pipeline."
+        ),
     )
     parser.add_argument(
         "--series-ticker",
@@ -64,15 +99,39 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--no-polymarket",
+        action="store_true",
+        help=(
+            "Disable Polymarket cross-venue overlay for this run. Useful for debugging "
+            "whether Polymarket is the source of a failure. Overrides POLYMARKET_ENABLED."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
     args = parser.parse_args()
 
     _setup_logging(args.verbose)
 
+    # --no-polymarket is a one-shot override; otherwise the env-var default wins.
+    polymarket_enabled = cfg.polymarket_enabled() and not args.no_polymarket
+
     if args.fetch_only:
-        return asyncio.run(_fetch_only(args.series_ticker, args.horizon_hours))
-    return asyncio.run(_full_run(args.series_ticker, args.dry_run, args.horizon_hours))
+        return asyncio.run(
+            _fetch_only(
+                args.series_ticker,
+                args.horizon_hours,
+                polymarket_enabled=polymarket_enabled,
+            )
+        )
+    return asyncio.run(
+        _full_run(
+            args.series_ticker,
+            args.dry_run,
+            args.horizon_hours,
+            polymarket_enabled=polymarket_enabled,
+        )
+    )
 
 
 if __name__ == "__main__":

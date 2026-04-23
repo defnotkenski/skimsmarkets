@@ -26,6 +26,32 @@ MAX_HOURS_UNTIL_EXPIRATION = 24
 # Concurrency caps. See plan for rationale.
 SPECIALIST_SEM = 16
 DIRECTOR_SEM = 2
+# Per-event BBO fan-out against Polymarket. Each matched Kalshi event can trigger
+# N parallel BBO lookups (one per matched side); this caps aggregate concurrency.
+POLYMARKET_FETCH_SEM = 8
+
+# Kalshi series prefix → Polymarket league slug. Unmapped series skip Polymarket
+# enrichment (logged at info level, not an error). Slugs are best-guesses based
+# on the Polymarket US sports API; verify and correct on first live run.
+KALSHI_SERIES_TO_POLYMARKET_LEAGUE: dict[str, str] = {
+    "KXNBAGAME": "nba",
+    "KXMLBGAME": "mlb",
+    "KXNHLGAME": "nhl",
+    "KXNFLGAME": "nfl",
+    "KXMLSGAME": "mls",
+    "KXUFCFIGHT": "ufc",
+    "KXATPMATCH": "atp",
+    "KXWTAMATCH": "wta",
+}
+
+# Emergency kill-switch for the Polymarket overlay. "0" / "false" / "False" disable
+# it for the run; anything else (including unset) leaves it on. The CLI also exposes
+# --no-polymarket which forces this to False for a single invocation.
+_POLY_DISABLED = {"0", "false", "False", "no", "NO"}
+
+
+def polymarket_enabled() -> bool:
+    return os.environ.get("POLYMARKET_ENABLED", "1").strip() not in _POLY_DISABLED
 
 
 @dataclass(frozen=True)

@@ -80,13 +80,22 @@ class NarrativeReport(BaseModel):
 
 
 class MarketReport(BaseModel):
-    """Pricing lens: compare Kalshi to consensus, spot line movement and sharp signals."""
+    """Pricing lens: compare the prediction-market venues (Kalshi + Polymarket US
+    when available) to sportsbook consensus, spot line movement and sharp signals."""
 
     team_a_name: str
     team_b_name: str
     kalshi_implied_team_a_probability: float = Field(
         ge=0.0, le=1.0,
         description="Kalshi's implied probability for team_a winning (midpoint of yes bid/ask on team_a's market).",
+    )
+    polymarket_implied_team_a_probability: float | None = Field(
+        default=None,
+        ge=0.0, le=1.0,
+        description=(
+            "Polymarket's implied probability for team_a winning (midpoint on the "
+            "matched Polymarket market). Null when no Polymarket counterpart was matched."
+        ),
     )
     consensus_team_a_probability: float = Field(
         ge=0.0,
@@ -135,7 +144,12 @@ class EventPrediction(BaseModel):
 
 
 class MarketPrediction(BaseModel):
-    """Per-market projection of an EventPrediction (built deterministically)."""
+    """Per-market projection of an EventPrediction (built deterministically).
+
+    `edge_bps` semantics intentionally stay `(predicted - kalshi_implied) * 10000`
+    for backward compatibility with telemetry and prompts. The per-venue edge
+    used for sizing lives on `PositionSizing.edge` against the chosen venue's ask.
+    """
 
     market_ticker: str
     event_ticker: str
@@ -143,6 +157,14 @@ class MarketPrediction(BaseModel):
     predicted_winner: str
     predicted_yes_probability: float = Field(ge=0.0, le=1.0)
     kalshi_implied_probability: float = Field(ge=0.0, le=1.0)
+    polymarket_implied_probability: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Polymarket's implied probability for the predicted winner side, if matched.",
+    )
+    polymarket_market_slug: str | None = Field(
+        default=None,
+        description="Slug of the matched Polymarket market for the predicted winner side.",
+    )
     edge_bps: int
     recommendation: Literal["buy_yes", "pass"]
     confidence: Confidence
@@ -169,6 +191,14 @@ class PositionSizing(BaseModel):
 
     side: Literal["yes", "none"] = Field(
         description="Which contract to buy. 'none' = do not size a position.",
+    )
+    venue: Literal["kalshi", "polymarket", "none"] = Field(
+        default="none",
+        description="Exchange where the sized contract should be bought. 'none' when no position.",
+    )
+    venue_market_id: str | None = Field(
+        default=None,
+        description="Kalshi ticker or Polymarket slug identifying the specific market to trade.",
     )
     entry_price_dollars: float | None = Field(
         description="Ask price used for the sizing calc (yes_ask or no_ask). None if unavailable.",

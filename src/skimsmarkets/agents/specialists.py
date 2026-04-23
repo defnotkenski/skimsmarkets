@@ -21,6 +21,7 @@ from skimsmarkets.agents.schemas import (
     SpecialistReport,
     StatisticsReport,
 )
+from skimsmarkets.enriched import EnrichedEvent
 from skimsmarkets.kalshi.models import KalshiEvent, KalshiMarket
 
 log = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ GROK_MODEL = "grok-4.20-multi-agent-0309"
 _ReportT = TypeVar("_ReportT", bound=BaseModel)
 
 SpecialistFn = Callable[
-    [XAIAsyncClient, KalshiEvent],
+    [XAIAsyncClient, EnrichedEvent],
     Awaitable[SpecialistReport],
 ]
 
@@ -42,9 +43,7 @@ def pick_team_a_market(event: KalshiEvent) -> KalshiMarket | None:
     market has a valid implied probability (all illiquid).
     """
     scored = [
-        (m.yes_implied_probability or -1.0, m)
-        for m in event.markets
-        if m.yes_sub_title
+        (m.yes_implied_probability or -1.0, m) for m in event.markets if m.yes_sub_title
     ]
     if not scored:
         return None
@@ -55,12 +54,16 @@ def pick_team_a_market(event: KalshiEvent) -> KalshiMarket | None:
     return top_market
 
 
-def render_context(event: KalshiEvent) -> str:
+def render_context(enriched: EnrichedEvent) -> str:
     """Event-level user message handed to every specialist.
 
     Names team_a (Kalshi favorite) and team_b (the first non-team_a side) using the exact
-    yes_sub_title strings so specialists echo them back verbatim.
+    yes_sub_title strings so specialists echo them back verbatim. When a Polymarket
+    counterpart is matched for a side, its bid/ask is printed as a sub-line beneath the
+    Kalshi market so the market-pricing specialist (and any other specialist that looks)
+    sees both venues' prices.
     """
+    event = enriched.kalshi
     team_a_market = pick_team_a_market(event)
     team_b_market = next(
         (m for m in event.markets if m is not team_a_market and m.yes_sub_title),
@@ -80,6 +83,7 @@ def render_context(event: KalshiEvent) -> str:
             f"implied={f'{implied:.3f}' if implied is not None else 'unknown'} "
             f"vol24h={m.volume_24h_fp}"
         )
+        market_lines.append(_polymarket_sub_line(enriched, m.yes_sub_title))
 
     settles = (
         team_a_market.expected_expiration_time.isoformat()
@@ -102,6 +106,25 @@ def render_context(event: KalshiEvent) -> str:
     )
 
 
+def _polymarket_sub_line(enriched: EnrichedEvent, yes_sub_title: str | None) -> str:
+    """Render the `polymarket:` sub-line beneath a Kalshi market line.
+
+    Explicit absence beats silent omission — when no counterpart matched, print
+    "(not matched)" so the LLM sees why Polymarket data isn't there rather than
+    wondering whether it's a render bug.
+    """
+    if not yes_sub_title:
+        return "      polymarket: (no kalshi side label)"
+    pm = enriched.poly_market_for(yes_sub_title)
+    if pm is None:
+        return "      polymarket: (not matched)"
+    implied = pm.yes_implied_probability
+    bid = f"${pm.yes_bid_dollars:.3f}" if pm.yes_bid_dollars is not None else "?"
+    ask = f"${pm.yes_ask_dollars:.3f}" if pm.yes_ask_dollars is not None else "?"
+    implied_str = f"{implied:.3f}" if implied is not None else "unknown"
+    return f"      polymarket: slug={pm.slug} yes bid/ask={bid}/{ask} implied={implied_str}"
+
+
 def _tools() -> list:
     """Fresh per-call list of server-side tools. Every specialist gets the full loadout."""
     return [web_search(), x_search(), code_execution()]
@@ -109,7 +132,7 @@ def _tools() -> list:
 
 async def _run_specialist(
     xai: XAIAsyncClient,
-    event: KalshiEvent,
+    enriched: EnrichedEvent,
     system_prompt: str,
     shape: type[_ReportT],
 ) -> _ReportT:
@@ -119,32 +142,38 @@ async def _run_specialist(
         messages=[system(system_prompt)],
         tools=_tools(),
     )
-    chat.append(user(render_context(event)))
+    chat.append(user(render_context(enriched)))
     response, parsed = await chat.parse(shape)
     log.debug(
         "specialist=%s event=%s tokens in/out=%s/%s",
         shape.__name__,
-        event.event_ticker,
+        enriched.kalshi.event_ticker,
         getattr(response.usage, "prompt_tokens", None),
         getattr(response.usage, "completion_tokens", None),
     )
     return parsed
 
 
-async def run_statistics(xai: XAIAsyncClient, event: KalshiEvent) -> StatisticsReport:
-    return await _run_specialist(xai, event, STATISTICS_SYSTEM, StatisticsReport)
+async def run_statistics(
+    xai: XAIAsyncClient, enriched: EnrichedEvent
+) -> StatisticsReport:
+    return await _run_specialist(xai, enriched, STATISTICS_SYSTEM, StatisticsReport)
 
 
-async def run_injury(xai: XAIAsyncClient, event: KalshiEvent) -> InjuryReport:
-    return await _run_specialist(xai, event, INJURY_SYSTEM, InjuryReport)
+async def run_injury(xai: XAIAsyncClient, enriched: EnrichedEvent) -> InjuryReport:
+    return await _run_specialist(xai, enriched, INJURY_SYSTEM, InjuryReport)
 
 
-async def run_narrative(xai: XAIAsyncClient, event: KalshiEvent) -> NarrativeReport:
-    return await _run_specialist(xai, event, NARRATIVE_SYSTEM, NarrativeReport)
+async def run_narrative(
+    xai: XAIAsyncClient, enriched: EnrichedEvent
+) -> NarrativeReport:
+    return await _run_specialist(xai, enriched, NARRATIVE_SYSTEM, NarrativeReport)
 
 
-async def run_market_pricing(xai: XAIAsyncClient, event: KalshiEvent) -> MarketReport:
-    return await _run_specialist(xai, event, MARKET_PRICING_SYSTEM, MarketReport)
+async def run_market_pricing(
+    xai: XAIAsyncClient, enriched: EnrichedEvent
+) -> MarketReport:
+    return await _run_specialist(xai, enriched, MARKET_PRICING_SYSTEM, MarketReport)
 
 
 SPECIALISTS: dict[str, SpecialistFn] = {
