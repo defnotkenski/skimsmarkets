@@ -91,11 +91,22 @@ def render_context(enriched: EnrichedEvent) -> str:
         else "(unknown)"
     )
 
+    # Game-state line is rendered whenever Polymarket is matched, regardless
+    # of phase (PRE-MATCH / LIVE / ENDED) — making the state explicit beats
+    # having the LLM infer "pre-match" from the line's absence. When no
+    # Polymarket counterpart exists, the per-market "polymarket: (not matched)"
+    # sub-lines already tell the LLM there's no cross-venue data.
+    state_line = (
+        enriched.polymarket.game_state_line() if enriched.polymarket else None
+    )
+    live_block = f"{state_line}\n\n" if state_line else ""
+
     return (
         f"Event: {event.event_ticker} — {event.title or '(no title)'}\n"
         f"Series: {event.series_ticker or '(unknown)'}\n"
         f"Sub-title: {event.sub_title or '(none)'}\n"
         f"Settles: {settles}\n\n"
+        f"{live_block}"
         f"team_a_name = {team_a_name}   (the Kalshi favorite going into this event)\n"
         f"team_b_name = {team_b_name}\n\n"
         f"Markets in this event ({len(event.markets)}):\n"

@@ -37,8 +37,14 @@ def _render_event_context_block(enriched: EnrichedEvent) -> str:
         f"Event: {event.event_ticker} — {event.title or '(untitled)'}",
         f"Series: {event.series_ticker or '?'}",
         f"Sub-title: {event.sub_title or '(none)'}",
-        "Markets in this event:",
     ]
+    # Game-state line (PRE-MATCH / LIVE / ENDED) surfaced between header and
+    # markets so the director sees the phase at the top. Always rendered when
+    # a Polymarket counterpart is matched — absence was previously used to
+    # signal "pre-match" but that was too implicit.
+    if enriched.polymarket:
+        lines.append(enriched.polymarket.game_state_line())
+    lines.append("Markets in this event:")
     for m in event.markets:
         implied = m.yes_implied_probability
         lines.append(

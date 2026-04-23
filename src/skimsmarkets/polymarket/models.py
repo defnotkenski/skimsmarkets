@@ -228,6 +228,13 @@ class PolymarketEvent(BaseModel):
     `teams` is kept as a light list of `{name, abbreviation, league}` records —
     useful for matcher debug logging, not for identity (the authoritative side
     label is on PolymarketMarket.yes_sub_title).
+
+    Live-game fields (`live`, `ended`, `score`, `period`, `elapsed`,
+    `main_spread_line`, `main_total_line`, `sport_type`) come from the event's
+    top-level shape when present and fall back to the nested `eventState` dict
+    — Polymarket populates both but the nested copy is the source of truth for
+    mid-game deltas. Score is a bare string like "24-30" (team order matches
+    the event title).
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -239,7 +246,14 @@ class PolymarketEvent(BaseModel):
     series_slug: str | None = None
     active: bool | None = None
     closed: bool | None = None
+    live: bool | None = None
     ended: bool | None = None
+    score: str | None = None
+    period: str | None = None
+    elapsed: str | None = None
+    main_spread_line: float | None = None
+    main_total_line: float | None = None
+    sport_type: str | None = None
     teams: list[dict[str, Any]] = Field(default_factory=list)
     markets: list[PolymarketMarket] = Field(default_factory=list)
 
@@ -252,9 +266,116 @@ class PolymarketEvent(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _pull_series_slug(cls, data: Any) -> Any:
-        """Polymarket uses camelCase (`seriesSlug`) on the wire; alias it to snake_case."""
-        if isinstance(data, dict) and data.get("series_slug") is None:
-            if data.get("seriesSlug") is not None:
-                data = {**data, "series_slug": data["seriesSlug"]}
+    def _pull_event_aliases(cls, data: Any) -> Any:
+        """Flatten camelCase + nested `eventState` into our snake_case fields.
+
+        Precedence: explicit flat field → top-level camelCase → `eventState`
+        nested value. The nested `eventState` is where live-game deltas land
+        first, so it's the authoritative source for score/period/elapsed; the
+        top-level flat fields are convenient but sometimes stale by a tick.
+        """
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+
+        if data.get("series_slug") is None and data.get("seriesSlug") is not None:
+            data["series_slug"] = data["seriesSlug"]
+
+        state = data.get("eventState")
+        state_d = state if isinstance(state, dict) else {}
+
+        # (flat_key, top_level_camel, event_state_key)
+        _aliases: tuple[tuple[str, str | None, str | None], ...] = (
+            ("live", "live", "live"),
+            ("ended", "ended", "ended"),
+            ("score", "score", "score"),
+            ("period", "period", "period"),
+            ("elapsed", "elapsed", "elapsed"),
+            ("sport_type", None, "type"),
+            ("main_spread_line", None, "mainSpreadLine"),
+            ("main_total_line", None, "mainTotalLine"),
+        )
+        for flat, camel, state_key in _aliases:
+            if data.get(flat) is not None:
+                continue
+            if camel and data.get(camel) is not None and flat != camel:
+                data[flat] = data[camel]
+                continue
+            if state_key and state_d.get(state_key) is not None:
+                data[flat] = state_d[state_key]
         return data
+
+    @property
+    def is_live(self) -> bool:
+        """True when the event is currently in progress (not pre-game, not finished)."""
+        return bool(self.live) and not bool(self.ended)
+
+    @property
+    def is_pre_game(self) -> bool:
+        """True when we have live-state plumbing but the game hasn't tipped off yet."""
+        return not bool(self.live) and not bool(self.ended) and self.period == "NS"
+
+    def game_state_line(self) -> str:
+        """Format a single-line game-state context string.
+
+        Always returns one of PRE-MATCH / LIVE / ENDED so the LLM never has to
+        infer game state from absence. Consumed by specialist and director
+        context rendering — kept here so both render sites emit the same
+        format. Score is team-attributed when we have ≥2 teams and a simple
+        `A-B` string; falls back to the raw form (e.g. tennis compound scores)
+        otherwise.
+        """
+        sport = f", {self.sport_type}" if self.sport_type else ""
+        prefix = f"Game state (Polymarket{sport}):"
+
+        if self.ended:
+            score = f" — score={self._format_score()}" if self.score else ""
+            return f"{prefix} ENDED{score}"
+
+        if self.live:
+            parts: list[str] = []
+            if self.period and self.period != "NS":
+                parts.append(self.period)
+            if self.elapsed:
+                parts.append(self.elapsed)
+            if self.score:
+                parts.append(f"score={self._format_score()}")
+            if self.main_spread_line is not None:
+                parts.append(f"spread={self.main_spread_line}")
+            if self.main_total_line is not None:
+                parts.append(f"total={self.main_total_line}")
+            body = " | ".join(parts) if parts else "in progress"
+            return f"{prefix} LIVE — {body}"
+
+        # Pre-match: anchor with the game's scheduled start time (from one of
+        # the event's markets) so the LLM knows how far out tipoff is, rather
+        # than having to infer from absence.
+        start_times = [m.game_start_time for m in self.markets if m.game_start_time]
+        if start_times:
+            start_iso = min(start_times).isoformat()
+            return f"{prefix} PRE-MATCH (starts {start_iso})"
+        return f"{prefix} PRE-MATCH"
+
+    def _format_score(self) -> str:
+        """Attribute the score to each team when we have ≥2 teams AND a simple
+        `A-B` score. For tennis' compound `sets:current-game` format or any
+        score we can't cleanly split, return it verbatim — the LLM will still
+        parse it, just without team labels.
+        """
+        raw = (self.score or "").strip()
+        if not raw:
+            return ""
+        # Compound scores (tennis) use ':' between sets and current game; the
+        # attribution isn't straightforward, so leave them as-is.
+        if ":" in raw:
+            return raw
+        halves = raw.split("-")
+        if len(halves) != 2:
+            return raw
+        if len(self.teams) < 2:
+            return raw
+        a_name = (self.teams[0] or {}).get("name")
+        b_name = (self.teams[1] or {}).get("name")
+        if not a_name or not b_name:
+            return raw
+        return f"{a_name} {halves[0].strip()}, {b_name} {halves[1].strip()}"
