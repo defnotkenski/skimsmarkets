@@ -208,6 +208,13 @@ class PolymarketMarket(BaseModel):
     yes_bid_dollars: float | None = None
     yes_ask_dollars: float | None = None
     last_trade_price_dollars: float | None = None
+    # Dollar volume is derived in `PolymarketClient.get_bbo` as `sharesTraded ×
+    # reference_price` — polymarket-us only exposes cumulative shares, not
+    # dollars. `liquidity_dollars` holds dollar OPEN INTEREST (outstanding shares
+    # × price), NOT order-book depth. The SDK doesn't publish book-depth dollars;
+    # user-facing renderers should label this field as "Open interest" to avoid
+    # implying "how much you can trade right now." Field name kept for backwards
+    # compatibility and to make room for a future real-liquidity feed.
     volume_dollars: float | None = None
     liquidity_dollars: float | None = None
     game_start_time: datetime | None = None

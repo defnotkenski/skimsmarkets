@@ -85,7 +85,10 @@ def render_context(event: PolymarketEvent) -> str:
         if m.volume_dollars is not None:
             extras.append(f"vol=${m.volume_dollars:,.0f}")
         if m.liquidity_dollars is not None:
-            extras.append(f"liq=${m.liquidity_dollars:,.0f}")
+            # Labeled "oi" (open interest) because polymarket-us doesn't
+            # publish order-book liquidity as a dollar figure — what we have
+            # is dollar open interest, not "how much can I trade right now."
+            extras.append(f"oi=${m.liquidity_dollars:,.0f}")
         # [NO side, inverted] flags head-to-head markets where this side's prices
         # were derived by inverting the slug's YES book. Keep readers aware that
         # the numbers came from that flip, not a directly-quoted second market.

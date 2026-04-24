@@ -142,6 +142,18 @@ class EventPrediction(BaseModel):
         default_factory=list,
         description="Empty when specialists aligned.",
     )
+    uw_flow_note: str | None = Field(
+        default=None,
+        description=(
+            "2-4 sentence observation of the Unusual Whales flow signals when "
+            "a 'Flow signals (Unusual Whales...)' block was present in the event "
+            "context. Cover: which tags fired and their magnitude, the direction "
+            "of recent smart-money / contrarian-whale trades (buyers hitting ask "
+            "vs sellers hitting bid), notable insider positions, MCI value/delta "
+            "if meaningful, and whether flow agreed with or diverged from the "
+            "sportsbook consensus. Null when UW had no coverage for this event."
+        ),
+    )
 
 
 class MarketPrediction(BaseModel):
@@ -174,6 +186,7 @@ class MarketPrediction(BaseModel):
         default_factory=list,
         description="Empty when specialists aligned.",
     )
+    uw_flow_note: str | None = None
 
 
 class PositionSizing(BaseModel):

@@ -93,7 +93,10 @@ def print_events_table(
     table.add_column("Bid/ask", justify="right")
     table.add_column("Implied", justify="right")
     table.add_column("Volume", justify="right")
-    table.add_column("Liquidity", justify="right")
+    # polymarket-us doesn't publish order-book liquidity as a dollar figure;
+    # what we have is dollar open interest (outstanding shares × price), which
+    # is a market-size proxy rather than "how much can I trade right now."
+    table.add_column("Open interest", justify="right")
     table.add_column("Tips in", justify="right")
 
     for ev, m in pairs:
@@ -210,6 +213,34 @@ def print_run_summary(result: RunResult) -> None:
                 p.reasoning,
             )
         console.print(reasoning_table)
+
+        # UW flow notes get their own table (rather than a column on the
+        # reasoning table) — the 2-4 sentence notes are too wide to share a
+        # row with the reasoning text without squishing both. Only events
+        # with a non-null `uw_flow_note` appear here; everything else is
+        # silently omitted, including events with no UW coverage at all.
+        uw_rows = [s for s in ranked if s.prediction.uw_flow_note]
+        if uw_rows:
+            uw_table = Table(
+                title=f"[{_CREAM}]Unusual Whales flow (where UW had coverage)[/]",
+                title_justify="left",
+                box=box.SIMPLE_HEAVY,
+                show_lines=True,
+                header_style=_LAVENDER,
+            )
+            uw_table.add_column("Event", style=_SKY, overflow="fold", min_width=20)
+            uw_table.add_column(
+                "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
+            )
+            uw_table.add_column("UW flow", overflow="fold")
+            for s in uw_rows:
+                p = s.prediction
+                uw_table.add_row(
+                    p.event_title or p.event_id,
+                    p.predicted_winner,
+                    p.uw_flow_note or "",
+                )
+            console.print(uw_table)
 
         # Flags get their own table so long notes don't break the leaderboard rows.
         flag_rows: list[tuple[str, str, str]] = []

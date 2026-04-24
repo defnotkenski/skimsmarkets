@@ -39,6 +39,40 @@ def _extract_value(obj: Any, key: str) -> Any:
     return raw
 
 
+def _coerce_float_safe(v: Any) -> float | None:
+    """Best-effort float coercion that returns None on anything unparseable.
+
+    polymarket-us returns numeric stats as JSON strings (e.g. `"114353.000"`),
+    and occasionally as `None` or absent. Centralize the try/except so callers
+    stay terse.
+    """
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reference_price(
+    bid: Any, ask: Any, last: Any
+) -> float | None:
+    """Pick a single price to multiply share counts by, in preference order:
+    bid/ask midpoint → last trade → whichever of bid/ask is present.
+
+    Used only for deriving dollar figures from `sharesTraded` / `openInterest`;
+    callers that need bid and ask individually should still read those fields.
+    """
+    b = _coerce_float_safe(bid)
+    a = _coerce_float_safe(ask)
+    if b is not None and a is not None:
+        return (b + a) / 2.0
+    lt = _coerce_float_safe(last)
+    if lt is not None:
+        return lt
+    return b if b is not None else a
+
+
 class PolymarketClient:
     """Async context-managed wrapper. `async with PolymarketClient() as c: ...`."""
 
@@ -131,6 +165,14 @@ class PolymarketClient:
         Returns None if the call fails or the response shape isn't recognizable
         — callers should treat None as "no live BBO" and fall back to whatever
         snapshot prices the events.list response already carried.
+
+        Dollar volume / open interest: polymarket-us publishes `sharesTraded`
+        (cumulative shares traded) and `openInterest` (outstanding shares) —
+        neither as dollar figures. We derive dollar values by multiplying by a
+        reference price (mid of bid/ask, falling back to last/bid/ask). The
+        resulting `liquidity_dollars` is dollar OPEN INTEREST, not order-book
+        liquidity; the field name is kept for backwards compatibility but
+        callers that render it to users should label it "Open interest."
         """
         try:
             raw = await self._sdk.markets.bbo(market_slug)
@@ -146,15 +188,28 @@ class PolymarketClient:
         bid = _extract_value(md, "bestBid")
         ask = _extract_value(md, "bestAsk")
         last = _extract_value(md, "lastTradePrice")
-        volume = md.get("volume") if isinstance(md, dict) else None
-        liquidity = md.get("liquidity") if isinstance(md, dict) else None
+
+        shares_traded = _coerce_float_safe(md.get("sharesTraded")) if isinstance(md, dict) else None
+        open_interest = _coerce_float_safe(md.get("openInterest")) if isinstance(md, dict) else None
+        ref_price = _reference_price(bid, ask, last)
+        volume_dollars = (
+            shares_traded * ref_price
+            if shares_traded is not None and ref_price is not None
+            else None
+        )
+        liquidity_dollars = (
+            open_interest * ref_price
+            if open_interest is not None and ref_price is not None
+            else None
+        )
+
         return PolymarketMarket(
             slug=market_slug,
             yes_bid_dollars=bid,
             yes_ask_dollars=ask,
             last_trade_price_dollars=last,
-            volume_dollars=volume,
-            liquidity_dollars=liquidity,
+            volume_dollars=volume_dollars,
+            liquidity_dollars=liquidity_dollars,
         )
 
     @staticmethod

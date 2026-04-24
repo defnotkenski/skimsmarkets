@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # this are left out of the slate. 24h catches "today's slate"; use 48-72 on the
 # CLI to pull in tomorrow. Enforced server-side via Polymarket's startTimeMax,
 # so events outside the window never hit the matcher/LLM path.
-DEFAULT_HORIZON_HOURS = 24
+DEFAULT_HORIZON_HOURS = 12
 
 # Concurrency caps. See plan for rationale.
 SPECIALIST_SEM = 16

@@ -199,14 +199,33 @@ materially with the MarketContextReport's consensus. Do NOT let UW override a sp
 de-vig consensus; it's corroborating flow data, not a price-level truth. Absence of the
 block means UW has no coverage for this game — synthesize as normal without it.
 
+When a UW flow block IS present, populate the `uw_flow_note` field with 2-4 sentences that
+together give the reader a concrete picture of the flow. Cover, roughly in this order:
+  (a) which tags fired and their magnitude (e.g. "smart_money 3.2, contrarian_whales 3.4,
+      insider_trades 0, momentum 2.0");
+  (b) direction of recent smart-money and contrarian-whale trades (taker=buyer means buy
+      pressure on YES; taker=seller means sell pressure on YES) — call it out explicitly;
+  (c) any notable insider positions (how many wallets, rough USD size, direction);
+  (d) MCI value + delta when informative (high value with positive delta = conviction
+      building; negative delta = unwinding);
+  (e) whether the net flow agreed with or diverged from the sportsbook consensus.
+Be detailed but concise — no hedging language, no filler. Leave `uw_flow_note` null when no
+UW block was in the context. Do NOT fabricate one. This field is for the reader's inspection,
+not for replacing reasoning — keep your main synthesis in `reasoning` as usual.
+
+Example of a good note: "Smart_money 3.24 and contrarian_whales 3.00 on YES side, with
+unusual_score 8.24 (material). Recent smart-money trades split: ~3 taker=buyer fills around
+$0.015, ~2 taker=seller fills at $0.014 — net mildly long YES. Contrarian whales are all
+taker=seller at $0.01, consistent with large accounts fading the consensus favorite. MCI
+value 98.3 with delta +58.3 — strong conviction building. Net flow diverges from sportsbook
+consensus (which has Team A at 75%), leaning toward the underdog YES side."
+
 Structure the `reasoning` field (3-6 sentences) in this order:
 1. Which specialists you weighted most heavily and why.
 2. The decisive factor that drove your probability.
 3. Any material disagreement between specialists and how you resolved it (omit if none).
 4. How your probability sits relative to Polymarket's implied and sportsbook consensus, and
    if you've deviated meaningfully, why.
-5. If a UW flow block was present and it moved your probability (or flagged a disagreement
-   with sportsbook consensus), say so briefly; otherwise omit this.
 
 Return ONLY valid JSON matching the EventPrediction schema.
 """.strip()

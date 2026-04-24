@@ -113,6 +113,7 @@ def _project_to_market_prediction(
         reasoning=event_pred.reasoning,
         specialist_weights=event_pred.specialist_weights,
         disagreements_flagged=event_pred.disagreements_flagged,
+        uw_flow_note=event_pred.uw_flow_note,
     )
 
 
