@@ -15,6 +15,7 @@ from skimsmarkets.agents.schemas import SizedMarketPrediction, SpecialistReport
 from skimsmarkets.agents.specialists import SPECIALISTS
 from skimsmarkets.polymarket import PolymarketClient
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
+from skimsmarkets.unusual_whales import GammaTokenResolver, UnusualWhalesClient
 
 log = logging.getLogger(__name__)
 
@@ -152,6 +153,58 @@ async def resolve_market_prices(
             })
 
 
+async def resolve_unusual_whales(
+    uw: UnusualWhalesClient,
+    events: list[PolymarketEvent],
+    sem: asyncio.Semaphore,
+) -> None:
+    """Fetch Unusual Whales flow context per event and attach to `event.uw_context`.
+
+    For each event: resolve `event.slug` → YES-side ERC-1155 `asset_id` via
+    Polymarket's gamma-api (the polymarket-us SDK and gamma-api are two distinct
+    venues, but `PolymarketEvent.slug` is the gamma-api market slug verbatim —
+    polymarket-us `market.slug` adds a category prefix like `aec-`, so the
+    event-level slug is what we need), then GET UW's
+    `/predictions/market/{asset_id}` for the compact flow snapshot. Failures at
+    any step leave `uw_context=None` and don't abort the run — this is an
+    enrichment stage, not a dependency.
+
+    Events with no valid slug or no gamma-api match are silently skipped; UW
+    only indexes the public/gamma Polymarket, so cross-venue matching is
+    best-effort.
+    """
+    if not uw.enabled:
+        return
+
+    slugged = [(ev.slug, ev) for ev in events if ev.slug]
+    if not slugged:
+        return
+
+    # Dedupe by slug — for our data model event.slug is unique per event, but
+    # guard against future multi-event-per-slug shapes regardless.
+    by_slug: dict[str, list[PolymarketEvent]] = {}
+    for slug, ev in slugged:
+        by_slug.setdefault(slug, []).append(ev)
+
+    resolver = GammaTokenResolver(uw.http)
+
+    async def _one(slug: str, evs: list[PolymarketEvent]) -> None:
+        async with sem:
+            token_ids = await resolver.resolve(slug)
+            if token_ids is None:
+                return
+            yes_asset_id, _no_asset_id = token_ids
+            ctx = await uw.get_market_detail(yes_asset_id)
+            if ctx is None:
+                return
+            for e in evs:
+                e.uw_context = ctx
+
+    await asyncio.gather(*(_one(s, evs) for s, evs in by_slug.items()))
+    attached = sum(1 for ev in events if ev.uw_context is not None)
+    log.info("attached unusual-whales context to %d/%d events", attached, len(events))
+
+
 async def _run_specialists(
     xai: XAIAsyncClient,
     event: PolymarketEvent,
@@ -232,8 +285,12 @@ async def run_pipeline(
     specialist_sem = asyncio.Semaphore(cfg.SPECIALIST_SEM)
     director_sem = asyncio.Semaphore(cfg.DIRECTOR_SEM)
     poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
+    uw_sem = asyncio.Semaphore(cfg.UW_FETCH_SEM)
 
-    async with PolymarketClient() as pm:
+    async with (
+        PolymarketClient() as pm,
+        UnusualWhalesClient(config.unusual_whales_api_key) as uw,
+    ):
         events = await fetch_polymarket_slate(pm, league, horizon_hours)
         result.fetched_events = len(events)
 
@@ -246,6 +303,10 @@ async def run_pipeline(
 
         if not events:
             return result
+
+        # UW enrichment runs after the slate is finalized (post dry-run trim)
+        # so we don't waste API budget on events we're going to drop.
+        await resolve_unusual_whales(uw, events, uw_sem)
 
         xai = XAIAsyncClient(api_key=config.xai_api_key)
         anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)

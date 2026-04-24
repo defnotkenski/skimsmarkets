@@ -15,6 +15,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from skimsmarkets.unusual_whales.models import UnusualWhalesContext
+
 
 def _coerce_time(value: Any) -> datetime | None:
     if value is None or value == "":
@@ -362,6 +364,10 @@ class PolymarketEvent(BaseModel):
     sport_type: str | None = None
     teams: list[dict[str, Any]] = Field(default_factory=list)
     markets: list[PolymarketMarket] = Field(default_factory=list)
+    # Attached post-validation by `resolve_unusual_whales()` when UW is enabled
+    # and this event's YES-side asset_id resolved to an UW-tracked market.
+    # Always None when the event comes straight off the SDK response.
+    uw_context: UnusualWhalesContext | None = None
 
     @field_validator("id", mode="before")
     @classmethod

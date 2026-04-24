@@ -15,12 +15,37 @@ from skimsmarkets.polymarket import PolymarketClient
 from skimsmarkets.reporting import print_events_table, print_run_summary
 
 
+class _HttpxMinLevelFilter(logging.Filter):
+    """Hide sub-threshold httpx / httpcore records from the terminal handler.
+
+    Attached to the stream handler (not the logger itself) so the records
+    keep their original INFO severity and any additional handler — e.g. a
+    file log, or pytest's capture — still sees them.
+    """
+
+    def __init__(self, min_level: int) -> None:
+        super().__init__()
+        self.min_level = min_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name.startswith(("httpx", "httpcore")):
+            return record.levelno >= self.min_level
+        return True
+
+
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
+    # httpx / httpcore emit one INFO line per request, which drowns out the
+    # pipeline's own INFO logs during a normal run. In normal mode, hide
+    # anything below WARNING from the terminal; in verbose mode, show everything.
+    if not verbose:
+        handler_filter = _HttpxMinLevelFilter(logging.WARNING)
+        for handler in logging.getLogger().handlers:
+            handler.addFilter(handler_filter)
 
 
 async def _fetch_only(league: str | None) -> int:

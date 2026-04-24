@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # this are left out of the slate. 24h catches "today's slate"; use 48-72 on the
 # CLI to pull in tomorrow. Enforced server-side via Polymarket's startTimeMax,
 # so events outside the window never hit the matcher/LLM path.
-DEFAULT_HORIZON_HOURS = 12
+DEFAULT_HORIZON_HOURS = 24
 
 # Concurrency caps. See plan for rationale.
 SPECIALIST_SEM = 16
@@ -17,12 +17,20 @@ DIRECTOR_SEM = 2
 # Per-event BBO fan-out against Polymarket. Each event can trigger N parallel
 # BBO lookups (one per tradable side); this caps aggregate concurrency.
 POLYMARKET_FETCH_SEM = 8
+# Per-event Unusual Whales detail fan-out. UW doesn't publish rate limits; a
+# conservative cap keeps us safely under whatever they enforce. Each event
+# triggers at most 1 gamma-api call + 1 UW detail call (YES side only).
+UW_FETCH_SEM = 8
 
 
 @dataclass(frozen=True)
 class Config:
     xai_api_key: str
     anthropic_api_key: str
+    # Optional — UW enrichment is a nice-to-have, not a hard dependency. When
+    # unset, `resolve_unusual_whales()` is skipped and the pipeline behaves
+    # exactly as it did pre-integration.
+    unusual_whales_api_key: str | None = None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -31,6 +39,7 @@ class Config:
         load_dotenv()
         xai = os.environ.get("XAI_API_KEY", "").strip()
         anth = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        uw = os.environ.get("UNUSUAL_WHALES_API_KEY", "").strip() or None
         missing: list[str] = []
         if not xai:
             missing.append("XAI_API_KEY")
@@ -41,4 +50,4 @@ class Config:
                 f"Missing required env var(s): {', '.join(missing)}. "
                 "Add them to a .env file at the project root or export them in your shell."
             )
-        return cls(xai_api_key=xai, anthropic_api_key=anth)
+        return cls(xai_api_key=xai, anthropic_api_key=anth, unusual_whales_api_key=uw)
