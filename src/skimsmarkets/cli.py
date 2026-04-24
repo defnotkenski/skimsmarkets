@@ -6,10 +6,9 @@ import logging
 import sys
 
 from skimsmarkets import config as cfg
-from skimsmarkets.kalshi import KalshiClient
 from skimsmarkets.pipeline import (
-    enrich_with_polymarket,
-    fetch_live_sports,
+    fetch_polymarket_slate,
+    resolve_market_prices,
     run_pipeline,
 )
 from skimsmarkets.polymarket import PolymarketClient
@@ -24,44 +23,17 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-async def _fetch_only(
-    series_ticker: str | None,
-    horizon_hours: int,
-    *,
-    polymarket_enabled: bool,
-) -> int:
+async def _fetch_only(league: str | None) -> int:
     poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
-    async with KalshiClient() as kalshi:
-        pm: PolymarketClient | None = PolymarketClient() if polymarket_enabled else None
-        if pm is not None:
-            await pm.__aenter__()
-        try:
-            kalshi_events = await fetch_live_sports(kalshi, series_ticker)
-            enriched, _matched, _unmatched = await enrich_with_polymarket(
-                pm,
-                kalshi_events,
-                poly_sem=poly_sem,
-            )
-        finally:
-            if pm is not None:
-                await pm.__aexit__(None, None, None)
-    print_events_table(enriched, series_ticker, horizon_hours=horizon_hours)
+    async with PolymarketClient() as pm:
+        events = await fetch_polymarket_slate(pm, league, cfg.DEFAULT_HORIZON_HOURS)
+        await resolve_market_prices(pm, events, poly_sem)
+    print_events_table(events, league, horizon_hours=cfg.DEFAULT_HORIZON_HOURS)
     return 0
 
 
-async def _full_run(
-    series_ticker: str | None,
-    dry_run: bool,
-    horizon_hours: int,
-    *,
-    polymarket_enabled: bool,
-) -> int:
-    result = await run_pipeline(
-        series_filter=series_ticker,
-        dry_run=dry_run,
-        horizon_hours=horizon_hours,
-        polymarket_enabled=polymarket_enabled,
-    )
+async def _full_run(league: str | None, dry_run: bool) -> int:
+    result = await run_pipeline(league=league, dry_run=dry_run)
     print_run_summary(result)
     return 0
 
@@ -70,14 +42,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="skims",
         description=(
-            "Fetch live Kalshi sports markets (with Polymarket US cross-venue overlay) "
-            "and run the multi-agent prediction pipeline."
+            "Fetch live Polymarket sports markets and run the multi-agent "
+            f"confidence-ranker pipeline. Horizon fixed at "
+            f"{cfg.DEFAULT_HORIZON_HOURS}h (set DEFAULT_HORIZON_HOURS in config.py to change)."
         ),
     )
     parser.add_argument(
-        "--series-ticker",
+        "--league",
         default=None,
-        help="Restrict to a single Kalshi series (e.g. KXNBAGAME). Default: all live sports.",
+        help=(
+            "Restrict to a single Polymarket league by series-slug prefix "
+            "(e.g. 'nba' matches 'nba-2025'). Default: all live sports."
+        ),
     )
     parser.add_argument(
         "--fetch-only",
@@ -87,24 +63,7 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the full pipeline against a single market only (~$0.30 of LLM spend).",
-    )
-    parser.add_argument(
-        "--horizon-hours",
-        type=int,
-        default=cfg.MAX_HOURS_UNTIL_EXPIRATION,
-        help=(
-            "Only include markets whose expected settlement is within this many hours. "
-            f"Default: {cfg.MAX_HOURS_UNTIL_EXPIRATION} (today's slate). Use 48-72 to include tomorrow."
-        ),
-    )
-    parser.add_argument(
-        "--no-polymarket",
-        action="store_true",
-        help=(
-            "Disable Polymarket cross-venue overlay for this run. Useful for debugging "
-            "whether Polymarket is the source of a failure. Overrides POLYMARKET_ENABLED."
-        ),
+        help="Run the full pipeline against a single event only (~$0.30 of LLM spend).",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
@@ -113,25 +72,9 @@ def main() -> int:
 
     _setup_logging(args.verbose)
 
-    # --no-polymarket is a one-shot override; otherwise the env-var default wins.
-    polymarket_enabled = cfg.polymarket_enabled() and not args.no_polymarket
-
     if args.fetch_only:
-        return asyncio.run(
-            _fetch_only(
-                args.series_ticker,
-                args.horizon_hours,
-                polymarket_enabled=polymarket_enabled,
-            )
-        )
-    return asyncio.run(
-        _full_run(
-            args.series_ticker,
-            args.dry_run,
-            args.horizon_hours,
-            polymarket_enabled=polymarket_enabled,
-        )
-    )
+        return asyncio.run(_fetch_only(args.league))
+    return asyncio.run(_full_run(args.league, args.dry_run))
 
 
 if __name__ == "__main__":

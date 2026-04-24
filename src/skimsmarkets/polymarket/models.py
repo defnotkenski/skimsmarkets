@@ -1,17 +1,11 @@
-"""Polymarket US data shapes, deliberately parallel to the Kalshi models.
-
-Field names are aligned with Kalshi where they carry the same meaning
-(`yes_bid_dollars`, `yes_ask_dollars`, `yes_implied_probability`,
-`expected_expiration_time`) so downstream code can treat the two venues
-symmetrically without branching on vendor.
+"""Polymarket US data shapes.
 
 Polymarket's JSON shapes are not fully nailed down in their public docs yet —
 notably the settlement-time field name — so we parse defensively: a
 `model_validator(mode="before")` tries a prioritized list of candidate field
-names and leaves the value as `None` if none hit. Time filtering continues to
-run on Kalshi's `expected_expiration_time` (see CLAUDE.md rule), so a missing
-Polymarket time is fine; it only affects the optional proximity tiebreaker in
-the matcher.
+names and leaves the value as `None` if none hit. Slate filtering runs on
+`game_start_time` (tipoff); a missing `expected_expiration_time` is fine,
+it's captured for completeness only.
 """
 
 from __future__ import annotations
@@ -50,9 +44,9 @@ def _coerce_float(value: Any) -> float | None:
     return None
 
 
-# Candidate field names, in preference order, for the Polymarket settlement-time
-# equivalent of Kalshi's `expected_expiration_time`. Probed in order during
-# model validation; first non-None wins. Expand as real data reveals more.
+# Candidate field names, in preference order, for the Polymarket settlement
+# timestamp. Probed in order during model validation; first non-None wins.
+# Expand as real data reveals more.
 _SETTLEMENT_TIME_CANDIDATES: tuple[str, ...] = (
     "expected_expiration_time",
     "end_date",
@@ -95,8 +89,8 @@ def _team_aliases(team: dict[str, Any] | None) -> list[str]:
 
     The team record carries `name` (mascot, e.g. 'Cavaliers'), `safeName`
     (city, e.g. 'Cleveland'), `abbreviation` ('cle'), and `alias` (often
-    mascot again). Kalshi uses cities on NBA/NHL/MLB and the raw name elsewhere,
-    so the matcher needs all forms to find a hit. De-duplicated, lowercased.
+    mascot again). We collect all forms so future cross-venue matching or
+    display layers can pick whichever shape fits. De-duplicated, order preserved.
     """
     if not isinstance(team, dict):
         return []
@@ -109,7 +103,9 @@ def _team_aliases(team: dict[str, Any] | None) -> list[str]:
 
 
 def _extract_team_side(
-    market_sides: Any, *, want_long: bool,
+    market_sides: Any,
+    *,
+    want_long: bool,
 ) -> tuple[str | None, list[str]]:
     """Pull the team label + alias list for one side (long=True → YES, False → NO).
 
@@ -141,10 +137,9 @@ def _extract_team_side(
 
 
 # Candidate field names for Polymarket's "when does the game START" timestamp.
-# This is the load-bearing signal for cross-venue matching: Polymarket's
-# endDate is a settlement window (~2 weeks after the game) which produces
-# inverted rankings vs Kalshi's game-end-adjacent expected_expiration_time,
-# while gameStartTime / startTime / startDate all sit right around tipoff.
+# This is the load-bearing signal for slate filtering: gameStartTime / startTime
+# / startDate all sit right around tipoff, while `endDate` is a ~2-week
+# settlement window — don't use `endDate` for "is this game in the horizon".
 _GAME_START_CANDIDATES: tuple[str, ...] = (
     "game_start_time",
     "gameStartTime",
@@ -160,16 +155,15 @@ class PolymarketMarket(BaseModel):
 
     Head-to-head games produce ONE underlying market on Polymarket but carry
     two `marketSides` (e.g. YES=Cavaliers, NO=Raptors). To keep the rest of
-    the pipeline "one record per tradable side" — matching Kalshi's shape —
-    the event's `model_validator` expands such markets into two
-    PolymarketMarket instances: one for YES, one for NO (prices inverted).
-    Both share the same `slug`; `is_no_side` flags the inverted one so BBO
-    fetching can dedupe by slug and consumers can render the distinction.
+    the pipeline "one record per tradable side," the event's `model_validator`
+    expands such markets into two PolymarketMarket instances: one for YES,
+    one for NO (prices inverted). Both share the same `slug`; `is_no_side`
+    flags the inverted one so BBO fetching can dedupe by slug and consumers
+    can render the distinction.
 
     `team_aliases` carries every label Polymarket gives for this side's team
-    (name/safeName/abbreviation/alias). Kalshi uses cities on NBA/NHL/MLB
-    moneylines ('Cleveland') while Polymarket uses mascots ('Cavaliers'), so
-    single-label matching fails — the aliases bridge that gap.
+    (name/safeName/abbreviation/alias) so display and comparison code can
+    pick whichever form fits.
 
     Initial prices are parsed from the events.list snapshot (`outcomePrices` +
     `marketSides`) when present; the pipeline refreshes authoritative bid/ask
@@ -178,11 +172,9 @@ class PolymarketMarket(BaseModel):
     side map before BBO is resolved).
 
     `game_start_time` and `expected_expiration_time` are both captured because
-    they serve different purposes: the former is the actual game time (used by
-    the matcher for time proximity), the latter is the settlement window.
-    Don't conflate them — Polymarket's settlement window sits ~2 weeks past
-    the game, so comparing it to Kalshi's shortly-after-game expiration
-    produces misleading "close in time" scores.
+    they serve different purposes: the former is the actual game time (used
+    for slate filtering — "today's games"), the latter is the settlement
+    window (~2 weeks past the game). Don't conflate them.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -202,14 +194,14 @@ class PolymarketMarket(BaseModel):
         default=None,
         description=(
             "Polymarket's sportsMarketType ('moneyline', 'drawable_outcome', "
-            "'spreads', 'totals', 'futures'). Used by the matcher to filter out "
-            "spread/total/futures markets when pairing a Kalshi head-to-head game."
+            "'spreads', 'totals', 'futures'). The pipeline filters to moneyline "
+            "and drawable_outcome only — futures/spreads/totals are skipped."
         ),
     )
     is_no_side: bool = Field(
         default=False,
         description="True when this record represents the NO direction of the "
-                    "underlying slug — prices are inverted vs Polymarket's YES book.",
+        "underlying slug — prices are inverted vs Polymarket's YES book.",
     )
     yes_bid_dollars: float | None = None
     yes_ask_dollars: float | None = None
@@ -256,7 +248,9 @@ class PolymarketMarket(BaseModel):
         data = dict(data)  # shallow copy; don't mutate caller's dict
 
         if data.get("yes_sub_title") is None or not data.get("team_aliases"):
-            display, aliases = _extract_team_side(data.get("marketSides"), want_long=True)
+            display, aliases = _extract_team_side(
+                data.get("marketSides"), want_long=True
+            )
             if data.get("yes_sub_title") is None and display:
                 data["yes_sub_title"] = display
             if not data.get("team_aliases") and aliases:
@@ -294,7 +288,9 @@ class PolymarketMarket(BaseModel):
                     break
         return data
 
-    def inverted_no_side(self, no_display: str, no_aliases: list[str]) -> "PolymarketMarket":
+    def inverted_no_side(
+        self, no_display: str, no_aliases: list[str]
+    ) -> "PolymarketMarket":
         """Return a sibling market record representing the NO direction.
 
         Same slug, team aliases swapped to the NO-side team, bid/ask inverted
@@ -308,15 +304,17 @@ class PolymarketMarket(BaseModel):
         inv_ask = (
             1.0 - self.yes_bid_dollars if self.yes_bid_dollars is not None else None
         )
-        return self.model_copy(update={
-            "is_no_side": True,
-            "yes_sub_title": no_display,
-            "team_aliases": no_aliases,
-            "yes_bid_dollars": inv_bid,
-            "yes_ask_dollars": inv_ask,
-            # last_trade is directional — drop it on the NO clone to avoid misleading display.
-            "last_trade_price_dollars": None,
-        })
+        return self.model_copy(
+            update={
+                "is_no_side": True,
+                "yes_sub_title": no_display,
+                "team_aliases": no_aliases,
+                "yes_bid_dollars": inv_bid,
+                "yes_ask_dollars": inv_ask,
+                # last_trade is directional — drop it on the NO clone to avoid misleading display.
+                "last_trade_price_dollars": None,
+            }
+        )
 
     @property
     def yes_implied_probability(self) -> float | None:
@@ -329,13 +327,13 @@ class PolymarketMarket(BaseModel):
 class PolymarketEvent(BaseModel):
     """A Polymarket event — container for one or more binary markets.
 
-    Mirrors KalshiEvent in spirit: `id` + `slug` are the identifiers, `markets`
-    are the binary yes/no markets attached to this event. `series_slug` is used
-    for league filtering (e.g. 'nba-2025', 'mlb-2026'); the SDK's events.list
-    doesn't accept a league query param, so we filter client-side by slug prefix.
-    `teams` is kept as a light list of `{name, abbreviation, league}` records —
-    useful for matcher debug logging, not for identity (the authoritative side
-    label is on PolymarketMarket.yes_sub_title).
+    `id` + `slug` are the identifiers, `markets` are the binary yes/no markets
+    attached to this event. `series_slug` is used for league filtering (e.g.
+    'nba-2025', 'mlb-2026'); the SDK's events.list doesn't accept a league
+    query param, so we filter client-side by slug prefix. `teams` is kept as
+    a light list of `{name, abbreviation, league}` records — useful for debug
+    logging, not for identity (the authoritative side label is on
+    PolymarketMarket.yes_sub_title).
 
     Live-game fields (`live`, `ended`, `score`, `period`, `elapsed`,
     `main_spread_line`, `main_total_line`, `sport_type`) come from the event's
@@ -444,19 +442,23 @@ class PolymarketEvent(BaseModel):
                     "sports_market_type": raw.get("sportsMarketType"),
                     "is_no_side": True,
                     # Invert prices when we have both halves; otherwise leave None.
-                    "yes_bid_dollars": _invert_price(raw.get("outcomePrices"), want="no_bid"),
-                    "yes_ask_dollars": _invert_price(raw.get("outcomePrices"), want="no_ask"),
+                    "yes_bid_dollars": _invert_price(
+                        raw.get("outcomePrices"), want="no_bid"
+                    ),
+                    "yes_ask_dollars": _invert_price(
+                        raw.get("outcomePrices"), want="no_ask"
+                    ),
                     # Carry forward time + volume signals; last_trade is YES-directional so skip.
                     "volume_dollars": raw.get("volume"),
                     "liquidity_dollars": raw.get("liquidity"),
-                    "gameStartTime": raw.get("gameStartTime") or raw.get("startTime")
+                    "gameStartTime": raw.get("gameStartTime")
+                    or raw.get("startTime")
                     or raw.get("startDate"),
                     "endDate": raw.get("endDate"),
                 }
                 expanded.append(no_side_raw)
             data["markets"] = expanded
         return data
-
 
     @property
     def is_live(self) -> bool:
@@ -505,7 +507,10 @@ class PolymarketEvent(BaseModel):
         # when present — those lines carry sharp-money positioning from the
         # opening bell and are useful to market_pricing even before tipoff.
         parts: list[str] = []
-        start_times = [m.game_start_time for m in self.markets if m.game_start_time]
+        # Walrus-bind so `is not None` narrows `t` to `datetime` inside the
+        # comprehension; without it static checkers keep the element type as
+        # `datetime | None` and flag `min(...)` / `.isoformat()` downstream.
+        start_times = [t for m in self.markets if (t := m.game_start_time) is not None]
         if start_times:
             parts.append(f"starts {min(start_times).isoformat()}")
         if self.main_spread_line is not None:

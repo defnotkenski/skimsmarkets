@@ -79,33 +79,30 @@ class NarrativeReport(BaseModel):
     sentiment_sources: list[str] = Field(default_factory=list)
 
 
-class MarketReport(BaseModel):
-    """Pricing lens: compare the prediction-market venues (Kalshi + Polymarket US
-    when available) to sportsbook consensus, spot line movement and sharp signals."""
+class MarketContextReport(BaseModel):
+    """Market-context lens: what Polymarket and sportsbook consensus are pricing,
+    plus sharp-money signals. NOT an edge-hunting report — just a read of where
+    the market stands so the director has context alongside the other specialists.
+    """
 
     team_a_name: str
     team_b_name: str
-    kalshi_implied_team_a_probability: float = Field(
+    polymarket_implied_team_a_probability: float = Field(
         ge=0.0, le=1.0,
-        description="Kalshi's implied probability for team_a winning (midpoint of yes bid/ask on team_a's market).",
+        description="Polymarket's implied probability for team_a winning (midpoint of yes bid/ask on team_a's market).",
     )
-    polymarket_implied_team_a_probability: float | None = Field(
+    consensus_team_a_probability: float | None = Field(
         default=None,
-        ge=0.0, le=1.0,
-        description=(
-            "Polymarket's implied probability for team_a winning (midpoint on the "
-            "matched Polymarket market). Null when no Polymarket counterpart was matched."
-        ),
-    )
-    consensus_team_a_probability: float = Field(
         ge=0.0,
         le=1.0,
-        description="Fair probability team_a wins, implied by consensus sportsbooks / betting exchanges.",
+        description=(
+            "Fair probability team_a wins, implied by consensus sportsbooks / betting "
+            "exchanges (de-vigged). Null when no comparable sportsbook market was found."
+        ),
     )
-    edge_bps: int = Field(
-        description="Signed basis points for team_a: (consensus - kalshi) * 10000. Positive = team_a undervalued on Kalshi.",
+    line_movement_note: str = Field(
+        description="Short note on recent line movement, open-vs-current, or notable steam moves.",
     )
-    line_movement_note: str
     sharp_money_signal: Literal["on_team_a", "on_team_b", "unclear", "no_data"]
     comparable_markets: list[str] = Field(
         default_factory=list,
@@ -113,22 +110,26 @@ class MarketReport(BaseModel):
     )
 
 
-SpecialistReport = StatisticsReport | InjuryReport | NarrativeReport | MarketReport
+SpecialistReport = StatisticsReport | InjuryReport | NarrativeReport | MarketContextReport
 
 
 class EventPrediction(BaseModel):
-    """Event-level synthesis emitted by the director (LLM output)."""
+    """Event-level synthesis emitted by the director (LLM output).
 
-    event_ticker: str
+    Confidence-ranker framing: the director names the likely winner and how sure
+    it is. No buy/pass gate — ranking happens downstream by
+    `predicted_winner_probability`.
+    """
+
+    event_id: str = Field(
+        description="Polymarket event id this prediction applies to.",
+    )
     predicted_winner: str = Field(
         description="Exact yes_sub_title of the team expected to win. Must match one of the event's markets.",
     )
     predicted_winner_probability: float = Field(
         ge=0.0, le=1.0,
         description="Probability the predicted winner actually wins, 0-1.",
-    )
-    recommendation: Literal["buy_winner", "pass"] = Field(
-        description="buy_winner = back the predicted winner on their market. pass = no edge worth trading.",
     )
     confidence: Confidence
     reasoning: str = Field(
@@ -146,27 +147,22 @@ class EventPrediction(BaseModel):
 class MarketPrediction(BaseModel):
     """Per-market projection of an EventPrediction (built deterministically).
 
-    `edge_bps` semantics intentionally stay `(predicted - kalshi_implied) * 10000`
-    for backward compatibility with telemetry and prompts. The per-venue edge
-    used for sizing lives on `PositionSizing.edge` against the chosen venue's ask.
+    Attaches the winning side's Polymarket slug + implied probability alongside
+    the director's prediction so downstream sizing and reporting have a single
+    self-contained record.
     """
 
-    market_ticker: str
-    event_ticker: str
+    market_slug: str = Field(
+        description="Polymarket slug of the market that represents the predicted winner's side.",
+    )
+    event_id: str
     event_title: str | None = None
     predicted_winner: str
     predicted_yes_probability: float = Field(ge=0.0, le=1.0)
-    kalshi_implied_probability: float = Field(ge=0.0, le=1.0)
     polymarket_implied_probability: float | None = Field(
         default=None, ge=0.0, le=1.0,
-        description="Polymarket's implied probability for the predicted winner side, if matched.",
+        description="Polymarket's implied probability for the predicted winner side (midpoint of yes bid/ask).",
     )
-    polymarket_market_slug: str | None = Field(
-        default=None,
-        description="Slug of the matched Polymarket market for the predicted winner side.",
-    )
-    edge_bps: int
-    recommendation: Literal["buy_yes", "pass"]
     confidence: Confidence
     reasoning: str = Field(
         description="3-6 sentences explaining the synthesis and how specialists were weighted.",
@@ -187,27 +183,21 @@ class PositionSizing(BaseModel):
     `full_kelly_fraction` is the pure Kelly-optimal stake; `half_kelly_fraction` is the common
     variance-reduction variant; `capped_half_kelly_fraction` additionally caps at
     KELLY_BANKROLL_CAP (0.25) for safety.
+
+    Kelly is reported purely as reference sizing — there's no upstream buy/pass
+    gate, so a zero fraction just means "director's edge vs Polymarket's ask is
+    non-positive," not "skip this event." Leaderboard ranking happens on
+    predicted probability, not Kelly fraction.
     """
 
-    side: Literal["yes", "none"] = Field(
-        description="Which contract to buy. 'none' = do not size a position.",
-    )
-    venue: Literal["kalshi", "polymarket", "none"] = Field(
-        default="none",
-        description="Exchange where the sized contract should be bought. 'none' when no position.",
-    )
-    venue_market_id: str | None = Field(
-        default=None,
-        description="Kalshi ticker or Polymarket slug identifying the specific market to trade.",
-    )
     entry_price_dollars: float | None = Field(
-        description="Ask price used for the sizing calc (yes_ask or no_ask). None if unavailable.",
+        description="Polymarket yes_ask used for the sizing calc. None if the ask is unavailable.",
     )
     win_probability: float | None = Field(
-        description="Probability of the chosen side winning (q if yes, 1-q if no). None if no side.",
+        description="Director's predicted probability for the winning side. None if unavailable.",
     )
     edge: float = Field(
-        description="Signed edge: win_probability - entry_price_dollars. 0 when side='none'.",
+        description="Signed edge vs Polymarket: predicted_probability - yes_ask. 0 when no ask.",
     )
     full_kelly_fraction: float = Field(
         ge=0.0,
@@ -222,7 +212,7 @@ class PositionSizing(BaseModel):
     )
     notes: list[str] = Field(
         default_factory=list,
-        description="Warnings such as 'director recommended buy but Kelly is -EV against ask'.",
+        description="Warnings such as 'no tradeable ask' or '-EV vs predicted probability'.",
     )
 
 

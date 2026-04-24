@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -14,19 +13,22 @@ from skimsmarkets import config as cfg
 from skimsmarkets.agents.director import synthesize_prediction
 from skimsmarkets.agents.schemas import SizedMarketPrediction, SpecialistReport
 from skimsmarkets.agents.specialists import SPECIALISTS
-from skimsmarkets.enriched import EnrichedEvent
-from skimsmarkets.kalshi import KalshiClient
-from skimsmarkets.kalshi.models import KalshiEvent, KalshiMarket
 from skimsmarkets.polymarket import PolymarketClient
-from skimsmarkets.polymarket.matching import match_event
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
 log = logging.getLogger(__name__)
 
+# Only include sides that look like "which team/outcome wins this specific game" —
+# drop futures, spreads, totals, MVP markets. `None` is kept defensively in case
+# the SDK hasn't populated `sportsMarketType` for a given market.
+_ALLOWED_MARKET_TYPES: frozenset[str | None] = frozenset(
+    {"moneyline", "drawable_outcome", None}
+)
+
 
 @dataclass
 class ErrorRecord:
-    event_ticker: str
+    event_id: str
     stage: str  # "specialist:<name>" or "director"
     error: str
 
@@ -38,267 +40,121 @@ class RunResult:
     errors: list[ErrorRecord] = field(default_factory=list)
     fetched_events: int = 0
     considered_events: int = 0
-    polymarket_matched: int = 0
-    polymarket_unmatched: int = 0
 
 
-async def fetch_live_sports(
-    kalshi: KalshiClient,
-    series_filter: str | None,
-) -> list[KalshiEvent]:
-    """Return live events. If series_filter is given, only that series; otherwise union of
-    the seed list + dynamically-discovered sports series."""
-    if series_filter:
-        return await kalshi.list_open_events(series_ticker=series_filter)
+async def fetch_polymarket_slate(
+    pm: PolymarketClient,
+    league: str | None,
+    horizon_hours: int,
+) -> list[PolymarketEvent]:
+    """Fetch the Polymarket sports slate inside the time horizon.
 
-    discovered = await kalshi.list_sports_series()
-    series_tickers = {s.ticker for s in discovered} | set(cfg.SPORTS_SERIES_SEED)
-    log.info("discovered %d sports series (seed+dynamic)", len(series_tickers))
+    The SDK's `events.list` accepts `startTimeMin` / `startTimeMax`, so the
+    horizon filter is pushed server-side — we never pay to parse or BBO games
+    outside the window. `start_time_min` sits 6h in the past to cover overtime
+    and long-tail game endings that haven't settled yet. `start_time_max` is
+    `now + horizon_hours` for the upcoming slate.
 
-    async def _fetch_one(ticker: str) -> list[KalshiEvent]:
-        try:
-            return await kalshi.list_open_events(series_ticker=ticker)
-        except Exception as e:  # noqa: BLE001
-            log.warning("series %s fetch failed: %s", ticker, e)
-            return []
-
-    batches = await asyncio.gather(*(_fetch_one(t) for t in sorted(series_tickers)))
-    return [e for batch in batches for e in batch]
-
-
-async def _fetch_polymarket_series(
-    polymarket: PolymarketClient,
-    series_prefixes: set[str],
-    *,
-    start_time_min: datetime | None = None,
-    start_time_max: datetime | None = None,
-) -> dict[str, list[PolymarketEvent]]:
-    """Fetch polymarket events for each mapped series prefix concurrently.
-
-    One failure per prefix is isolated (warning log + empty list) so a single
-    flaky league doesn't block cross-venue enrichment for the others.
-
-    `start_time_min`/`start_time_max` narrow the Polymarket pool to the window
-    we actually care about — typically derived from the in-horizon Kalshi slate
-    so the PM candidate pool tracks the same prediction horizon (same-day /
-    next-day games) instead of pulling in season-long futures markets.
+    Each returned event is trimmed to its moneyline / drawable_outcome markets
+    (head-to-head NO-side inversion is already baked in by `PolymarketEvent`'s
+    validator). Events with no allowed markets are dropped entirely — futures,
+    spreads, and totals shouldn't hit the specialist pipeline.
     """
+    now = datetime.now(tz=UTC)
+    start_time_min = now - timedelta(hours=6)
+    start_time_max = now + timedelta(hours=horizon_hours)
 
-    async def _one(prefix: str) -> tuple[str, list[PolymarketEvent]]:
-        try:
-            return prefix, await polymarket.list_sports_events(
-                series_prefix=prefix,
-                start_time_min=start_time_min,
-                start_time_max=start_time_max,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("polymarket series=%s fetch failed: %s", prefix, e)
-            return prefix, []
-
-    pairs = await asyncio.gather(*(_one(lg) for lg in sorted(series_prefixes)))
-    # Explicit typed construction so static checkers infer dict[str, list[PolymarketEvent]]
-    # rather than falling back to asyncio.gather's variadic-Any return type.
-    result: dict[str, list[PolymarketEvent]] = {
-        prefix: events for prefix, events in pairs
-    }
-    return result
-
-
-def _kalshi_series_to_poly_prefix(series_ticker: str | None) -> str | None:
-    if series_ticker is None:
-        return None
-    return cfg.KALSHI_SERIES_TO_POLYMARKET_LEAGUE.get(series_ticker)
-
-
-async def _resolve_polymarket_prices(
-    polymarket: PolymarketClient,
-    enriched: EnrichedEvent,
-    sem: asyncio.Semaphore,
-) -> None:
-    """Populate `polymarket_price_by_kalshi_side` with authoritative prices.
-
-    BBO is preferred because it's the live quote; when BBO is unavailable or
-    returns an empty shape we fall back to the snapshot prices the events.list
-    response already embedded. Head-to-head markets can map two Kalshi sides
-    to a single slug (YES direction + NO direction), so BBO is deduped by slug
-    and the NO-side result is derived by inverting the YES bid/ask. Mutates
-    `enriched` in place.
-    """
-    # Index snapshots by (slug, is_no_side) so we can retrieve the right
-    # direction's pre-parsed fallback when BBO is empty.
-    snapshot_by_key: dict[tuple[str, bool], PolymarketMarket] = {
-        (m.slug, m.is_no_side): m
-        for m in (enriched.polymarket.markets if enriched.polymarket else [])
-    }
-
-    # Dedupe BBO calls: two Kalshi sides pairing to YES+NO of the same slug
-    # should only trigger one network call.
-    unique_slugs = {m.polymarket_market_slug for m in enriched.side_map.values()}
-
-    async def _fetch_bbo(slug: str) -> tuple[str, PolymarketMarket | None]:
-        async with sem:
-            return slug, await polymarket.get_bbo(slug)
-
-    bbo_results = await asyncio.gather(*(_fetch_bbo(s) for s in unique_slugs))
-    bbo_by_slug: dict[str, PolymarketMarket | None] = dict(bbo_results)
-
-    for kalshi_side, match in enriched.side_map.items():
-        slug = match.polymarket_market_slug
-        snap = snapshot_by_key.get((slug, match.is_no_side))
-        bbo = bbo_by_slug.get(slug)
-        if bbo is not None and (
-            bbo.yes_bid_dollars is not None or bbo.yes_ask_dollars is not None
-        ):
-            if match.is_no_side:
-                # BBO returns YES-direction bid/ask; invert for the NO side.
-                yes_bid = bbo.yes_bid_dollars
-                yes_ask = bbo.yes_ask_dollars
-                inv_bid = 1.0 - yes_ask if yes_ask is not None else None
-                inv_ask = 1.0 - yes_bid if yes_bid is not None else None
-                resolved = bbo.model_copy(update={
-                    "is_no_side": True,
-                    "yes_sub_title": (snap.yes_sub_title if snap else None)
-                    or match.kalshi_yes_sub_title,
-                    "team_aliases": snap.team_aliases if snap else [],
-                    "yes_bid_dollars": inv_bid,
-                    "yes_ask_dollars": inv_ask,
-                    "last_trade_price_dollars": None,
-                })
-            else:
-                # Carry the snapshot's display metadata forward — BBO doesn't
-                # echo team names back on its own.
-                if snap and snap.yes_sub_title and bbo.yes_sub_title is None:
-                    bbo = bbo.model_copy(update={"yes_sub_title": snap.yes_sub_title})
-                resolved = bbo
-            enriched.polymarket_price_by_kalshi_side[kalshi_side] = resolved
-        elif snap is not None:
-            enriched.polymarket_price_by_kalshi_side[kalshi_side] = snap
-
-
-async def enrich_with_polymarket(
-    polymarket: PolymarketClient | None,
-    kalshi_events: list[KalshiEvent],
-    *,
-    poly_sem: asyncio.Semaphore,
-) -> tuple[list[EnrichedEvent], int, int]:
-    """Attach Polymarket overlay to each Kalshi event. Returns (enriched_list,
-    matched_count, unmatched_count). When `polymarket` is None, every Kalshi
-    event becomes a bare EnrichedEvent with no overlay — the pipeline then
-    behaves identically to the Kalshi-only flow.
-
-    Callers should pass the horizon-filtered Kalshi slate (today/tomorrow), not
-    all open events. This function derives the Polymarket game-start window
-    from those events' settlement times so the PM candidate pool stays aligned
-    with the prediction horizon — no season-winner futures, no playoff games a
-    week out that get filtered downstream anyway.
-    """
-    if polymarket is None:
-        return [EnrichedEvent(kalshi=e) for e in kalshi_events], 0, len(kalshi_events)
-
-    # Group Kalshi events by their mapped Polymarket series prefix so we fetch
-    # each series' event pool exactly once.
-    events_by_prefix: dict[str, list[KalshiEvent]] = defaultdict(list)
-    skipped: list[KalshiEvent] = []
-    for ev in kalshi_events:
-        prefix = _kalshi_series_to_poly_prefix(ev.series_ticker)
-        if prefix is None:
-            skipped.append(ev)
-            continue
-        events_by_prefix[prefix].append(ev)
-
-    if not events_by_prefix:
-        log.info(
-            "polymarket enrichment: 0/%d kalshi events have a mapped series prefix",
-            len(kalshi_events),
-        )
-        return [EnrichedEvent(kalshi=e) for e in kalshi_events], 0, len(kalshi_events)
-
-    # Bound the PM game-start window to what the Kalshi slate actually needs.
-    # Kalshi `expected_expiration_time` lands shortly after game end; PM
-    # `game_start_time` is tipoff (typically 2-6h earlier). A 6h pad on both
-    # ends covers clock skew and long-tail games (OT, rain delays, 3h+ MLB).
-    k_expirations = [
-        m.expected_expiration_time
-        for ev in kalshi_events
-        for m in ev.markets
-        if m.expected_expiration_time is not None
-    ]
-    start_time_min = datetime.now(tz=UTC) - timedelta(hours=6)
-    start_time_max = (max(k_expirations) + timedelta(hours=6)) if k_expirations else None
-
-    pm_by_prefix = await _fetch_polymarket_series(
-        polymarket,
-        set(events_by_prefix),
+    events = await pm.list_sports_events(
+        series_prefix=league,
         start_time_min=start_time_min,
         start_time_max=start_time_max,
     )
+    log.info(
+        "fetched %d polymarket events (league=%s, horizon=%sh)",
+        len(events),
+        league or "all",
+        horizon_hours,
+    )
 
-    enriched_list: list[EnrichedEvent] = []
-    matched = 0
-    unmatched = 0
-
-    for prefix, kalshi_batch in events_by_prefix.items():
-        pool = pm_by_prefix.get(prefix, [])
-        for ev in kalshi_batch:
-            em = match_event(ev, pool)
-            if em is None:
-                enriched_list.append(EnrichedEvent(kalshi=ev))
-                unmatched += 1
-                continue
-            enriched = EnrichedEvent(
-                kalshi=ev,
-                polymarket=em.polymarket_event,
-                side_map=em.side_map,
-            )
-            try:
-                await _resolve_polymarket_prices(polymarket, enriched, poly_sem)
-            except Exception as e:  # noqa: BLE001
-                # A BBO fan-out failure at this level is unusual — individual
-                # failures are already caught inside get_bbo. Log and continue
-                # with whatever sides did resolve.
-                log.warning(
-                    "polymarket BBO fan-out failed for %s: %s",
-                    ev.event_ticker,
-                    e,
-                )
-            matched += 1
-            enriched_list.append(enriched)
-
-    # Carry through the skipped events so the caller sees a 1:1 mapping with kalshi_events.
-    for ev in skipped:
-        enriched_list.append(EnrichedEvent(kalshi=ev))
-        unmatched += 1
+    kept: list[PolymarketEvent] = []
+    for ev in events:
+        allowed_markets = [
+            m for m in ev.markets if m.sports_market_type in _ALLOWED_MARKET_TYPES
+        ]
+        if not allowed_markets:
+            continue
+        # Rebuild the event with the filtered market list so downstream stages
+        # don't have to re-filter. Pydantic model_copy is the cheapest way to
+        # get an updated copy without re-validating every other field.
+        kept.append(ev.model_copy(update={"markets": allowed_markets}))
 
     log.info(
-        "polymarket enrichment: matched %d / %d kalshi events "
-        "(skipped %d with unmapped series)",
-        matched,
-        len(kalshi_events),
-        len(skipped),
+        "kept %d events with moneyline/drawable_outcome markets (dropped %d)",
+        len(kept),
+        len(events) - len(kept),
     )
-    return enriched_list, matched, unmatched
+    return kept
 
 
-def is_within_horizon(market: KalshiMarket, hours: int) -> bool:
-    """True when the market's expected settlement is within `hours` from now.
+async def resolve_market_prices(
+    pm: PolymarketClient,
+    events: list[PolymarketEvent],
+    sem: asyncio.Semaphore,
+) -> None:
+    """Refresh each event's market prices with live BBO, mutating in place.
 
-    Uses `expected_expiration_time` (shortly after game end), not `close_time` (which
-    is the outer market expiry, often weeks out even for tonight's games).
+    Head-to-head events carry two records per slug after NO-side expansion
+    (YES + inverted NO). A single `get_bbo(slug)` call covers both: the NO-side
+    record's bid/ask is derived by inverting the YES book (`no_bid = 1 − yes_ask`,
+    `no_ask = 1 − yes_bid`). Slugs with an already-populated snapshot keep those
+    prices when the BBO call returns None — a fallback that matters in practice
+    because BBO is the flakier of the two endpoints.
     """
-    if market.expected_expiration_time is None:
-        return False
-    horizon = datetime.now(tz=UTC) + timedelta(hours=hours)
-    return market.expected_expiration_time <= horizon
+    unique_slugs: set[str] = {m.slug for ev in events for m in ev.markets}
 
+    async def _one(slug: str) -> tuple[str, PolymarketMarket | None]:
+        async with sem:
+            return slug, await pm.get_bbo(slug)
 
-def event_within_horizon(event: KalshiEvent, hours: int) -> bool:
-    """An event is in-horizon if ANY of its markets is."""
-    return any(is_within_horizon(m, hours) for m in event.markets)
+    bbo_results = await asyncio.gather(*(_one(s) for s in sorted(unique_slugs)))
+    # Explicit comprehension instead of `dict(...)` so the checker keeps the
+    # PolymarketMarket|None value type through to the lookup site below.
+    bbo_by_slug: dict[str, PolymarketMarket | None] = {
+        slug: bbo for slug, bbo in bbo_results
+    }
+
+    for ev in events:
+        for i, m in enumerate(ev.markets):
+            bbo = bbo_by_slug.get(m.slug)
+            if bbo is None:
+                continue
+            yes_bid = bbo.yes_bid_dollars
+            yes_ask = bbo.yes_ask_dollars
+            if yes_bid is None and yes_ask is None:
+                continue
+            if m.is_no_side:
+                new_bid = 1.0 - yes_ask if yes_ask is not None else None
+                new_ask = 1.0 - yes_bid if yes_bid is not None else None
+            else:
+                new_bid = yes_bid
+                new_ask = yes_ask
+            ev.markets[i] = m.model_copy(update={
+                "yes_bid_dollars": new_bid,
+                "yes_ask_dollars": new_ask,
+                # last_trade is YES-directional — drop on the NO clone to avoid
+                # misleading the reader.
+                "last_trade_price_dollars": (
+                    None if m.is_no_side
+                    else bbo.last_trade_price_dollars or m.last_trade_price_dollars
+                ),
+                "volume_dollars": bbo.volume_dollars or m.volume_dollars,
+                "liquidity_dollars": bbo.liquidity_dollars or m.liquidity_dollars,
+            })
 
 
 async def _run_specialists(
     xai: XAIAsyncClient,
-    enriched: EnrichedEvent,
+    event: PolymarketEvent,
     sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
 ) -> dict[str, SpecialistReport] | None:
@@ -308,7 +164,7 @@ async def _run_specialists(
     async def _one(specialist: str) -> tuple[str, "SpecialistReport | Exception"]:
         async with sem:
             try:
-                return specialist, await SPECIALISTS[specialist](xai, enriched)
+                return specialist, await SPECIALISTS[specialist](xai, event)
             except Exception as e:  # noqa: BLE001
                 return specialist, e
 
@@ -319,7 +175,7 @@ async def _run_specialists(
         if isinstance(result, Exception):
             errors.append(
                 ErrorRecord(
-                    event_ticker=enriched.kalshi.event_ticker,
+                    event_id=event.id,
                     stage=f"specialist:{name}",
                     error=f"{type(result).__name__}: {result}",
                 )
@@ -335,29 +191,23 @@ async def _run_specialists(
 async def process_event(
     xai: XAIAsyncClient,
     anthropic: AsyncAnthropic,
-    enriched: EnrichedEvent,
+    event: PolymarketEvent,
     specialist_sem: asyncio.Semaphore,
     director_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
 ) -> SizedMarketPrediction | None:
-    event = enriched.kalshi
-    log.info(
-        "processing event %s (%s) polymarket=%s",
-        event.event_ticker,
-        event.title,
-        "matched" if enriched.has_polymarket else "none",
-    )
-    reports = await _run_specialists(xai, enriched, specialist_sem, errors)
+    log.info("processing event %s (%s)", event.id, event.title)
+    reports = await _run_specialists(xai, event, specialist_sem, errors)
     if reports is None:
         return None
 
     async with director_sem:
         try:
-            return await synthesize_prediction(anthropic, enriched, reports)
+            return await synthesize_prediction(anthropic, event, reports)
         except Exception as e:  # noqa: BLE001
             errors.append(
                 ErrorRecord(
-                    event_ticker=event.event_ticker,
+                    event_id=event.id,
                     stage="director",
                     error=f"{type(e).__name__}: {e}",
                 )
@@ -367,16 +217,13 @@ async def process_event(
 
 async def run_pipeline(
     *,
-    series_filter: str | None = None,
+    league: str | None = None,
     dry_run: bool = False,
-    horizon_hours: int = cfg.MAX_HOURS_UNTIL_EXPIRATION,
-    polymarket_enabled: bool | None = None,
+    horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
 ) -> RunResult:
-    """End-to-end: fetch live sports (Kalshi + optional Polymarket overlay), run 4
-    specialists + director per event.
-
-    `polymarket_enabled=None` defers to the env-derived `cfg.polymarket_enabled()`.
-    Pass False explicitly from the CLI's --no-polymarket flag.
+    """End-to-end: fetch the Polymarket sports slate inside the horizon, refresh
+    each event's BBO, then run 4 specialists + director per event. Returns a
+    leaderboard-ready `RunResult` sorted downstream by predicted probability.
     """
     config = cfg.Config.from_env()
     run_id = uuid.uuid4().hex[:8]
@@ -386,87 +233,41 @@ async def run_pipeline(
     director_sem = asyncio.Semaphore(cfg.DIRECTOR_SEM)
     poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
 
-    use_polymarket = (
-        polymarket_enabled
-        if polymarket_enabled is not None
-        else cfg.polymarket_enabled()
-    )
+    async with PolymarketClient() as pm:
+        events = await fetch_polymarket_slate(pm, league, horizon_hours)
+        result.fetched_events = len(events)
 
-    async with KalshiClient() as kalshi:
-        # Polymarket client lifetime is scoped to the kalshi block so both clients
-        # are active for the whole fetch + enrichment phase. The exit stack nests
-        # cleanly since both are plain async context managers.
-        pm_client: PolymarketClient | None = (
-            PolymarketClient() if use_polymarket else None
-        )
-        if pm_client is not None:
-            await pm_client.__aenter__()
+        await resolve_market_prices(pm, events, poly_sem)
 
+        if dry_run:
+            events = events[:1]
+        result.considered_events = len(events)
+        log.info("considering %d events (dry_run=%s)", len(events), dry_run)
+
+        if not events:
+            return result
+
+        xai = XAIAsyncClient(api_key=config.xai_api_key)
+        anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
         try:
-            kalshi_events = await fetch_live_sports(kalshi, series_filter)
-            result.fetched_events = len(kalshi_events)
-            log.info("fetched %d live kalshi events", len(kalshi_events))
-
-            # Horizon-filter BEFORE Polymarket enrichment: there's no point
-            # matching/BBO-fetching for events we're going to drop. This also
-            # lets enrich_with_polymarket derive its PM game-start window from
-            # the in-horizon slate, so the PM candidate pool tracks the same
-            # prediction horizon instead of hauling in season-winner futures.
-            in_horizon_kalshi = [
-                e for e in kalshi_events if event_within_horizon(e, horizon_hours)
-            ]
-            log.info(
-                "in-horizon kalshi events: %d / %d (horizon=%sh)",
-                len(in_horizon_kalshi),
-                len(kalshi_events),
-                horizon_hours,
-            )
-
-            enriched_all, matched, unmatched = await enrich_with_polymarket(
-                pm_client,
-                in_horizon_kalshi,
-                poly_sem=poly_sem,
-            )
-            result.polymarket_matched = matched
-            result.polymarket_unmatched = unmatched
-
-            in_horizon = enriched_all
-            if dry_run:
-                in_horizon = in_horizon[:1]
-            result.considered_events = len(in_horizon)
-            log.info(
-                "considering %d events (dry_run=%s)",
-                len(in_horizon),
-                dry_run,
-            )
-
-            if not in_horizon:
-                return result
-
-            xai = XAIAsyncClient(api_key=config.xai_api_key)
-            anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
-            try:
-                predictions = await asyncio.gather(
-                    *(
-                        process_event(
-                            xai,
-                            anthropic,
-                            e,
-                            specialist_sem,
-                            director_sem,
-                            result.errors,
-                        )
-                        for e in in_horizon
+            predictions = await asyncio.gather(
+                *(
+                    process_event(
+                        xai,
+                        anthropic,
+                        e,
+                        specialist_sem,
+                        director_sem,
+                        result.errors,
                     )
+                    for e in events
                 )
-            finally:
-                await xai.close()
-
-            for p in predictions:
-                if p is not None:
-                    result.predictions.append(p)
+            )
         finally:
-            if pm_client is not None:
-                await pm_client.__aexit__(None, None, None)
+            await xai.close()
+
+        for p in predictions:
+            if p is not None:
+                result.predictions.append(p)
 
     return result

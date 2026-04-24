@@ -3,8 +3,7 @@
 Why a wrapper when CLAUDE.md permits the SDK directly:
 - One place to normalize SDK response shapes before they bleed into our Pydantic
   models (the SDK's public shapes are still in flux per the fresh docs).
-- Consistent `async with` semantics that mirror KalshiClient, so the pipeline
-  can open both clients under the same context-manager pattern.
+- Consistent `async with` semantics for the pipeline's context-manager pattern.
 - Central seam for test doubles / fault injection.
 
 All calls here are read-only (public market data). No credentials are needed.
@@ -113,7 +112,8 @@ class PolymarketClient:
             except Exception as e:  # noqa: BLE001 — skip one bad event, keep going
                 log.debug(
                     "failed to parse polymarket event: %s (raw keys=%s)",
-                    e, list(item.keys()) if isinstance(item, dict) else type(item),
+                    e,
+                    list(item.keys()) if isinstance(item, dict) else type(item),
                 )
                 continue
             if series_prefix:
@@ -129,8 +129,8 @@ class PolymarketClient:
         """Fetch best bid/offer for a market and return a PolymarketMarket.
 
         Returns None if the call fails or the response shape isn't recognizable
-        — callers should treat None as "no Polymarket price available" and fall
-        back to the Kalshi-only path.
+        — callers should treat None as "no live BBO" and fall back to whatever
+        snapshot prices the events.list response already carried.
         """
         try:
             raw = await self._sdk.markets.bbo(market_slug)
