@@ -7,7 +7,9 @@ from anthropic import AsyncAnthropic
 from anthropic.types import (
     CacheControlEphemeralParam,
     MessageParam,
+    OutputConfigParam,
     TextBlockParam,
+    ThinkingConfigAdaptiveParam,
 )
 
 from skimsmarkets.agents.prompts import DIRECTOR_SYSTEM
@@ -27,7 +29,10 @@ from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 log = logging.getLogger(__name__)
 
 CLAUDE_MODEL = "claude-opus-4-7"
-MAX_OUTPUT_TOKENS = 2048
+# max_tokens is required by the Messages API and must cover thinking + response
+# combined. 128_000 is the model's output ceiling — we let adaptive thinking
+# decide how much of it to use rather than capping artificially.
+CLAUDE_MAX_OUTPUT_TOKENS = 128_000
 
 
 def _render_event_context_block(event: PolymarketEvent) -> str:
@@ -128,10 +133,15 @@ async def synthesize_prediction(
 
     parsed = await anthropic.messages.parse(
         model=CLAUDE_MODEL,
-        max_tokens=MAX_OUTPUT_TOKENS,
+        max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
         system=[system_block],
         messages=[user_message],
         output_format=EventPrediction,
+        # Opus 4.7 only supports adaptive thinking. `effort` is NOT inside the
+        # thinking dict — it's a sibling field under `output_config`. "max" lets
+        # the model spend unconstrained reasoning budget per event.
+        thinking=ThinkingConfigAdaptiveParam(type="adaptive"),
+        output_config=OutputConfigParam(effort="max"),
     )
     event_pred = parsed.parsed_output
     if event_pred is None:
