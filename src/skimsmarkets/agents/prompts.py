@@ -174,14 +174,16 @@ Rules for synthesis:
 - specialist_weights keys must be exactly: 'statistics', 'injury', 'narrative',
   'market_context', and the values should approximately sum to 1.
 
-If a "Flow signals (Unusual Whales, YES side...)" block appears in the event context, it is
-raw on-chain flow data from the offshore Polymarket venue (NOT Polymarket US where our prices
-come from — same underlying game, different liquidity pool, so treat it as directional signal
-rather than price-level truth). The specialists did NOT see this data — it reaches you as
-background alongside bid/ask, not mediated through any specialist's opinion.
+If a "Flow signals (Unusual Whales, side='<team>'...)" block appears in the event context, it
+is raw on-chain flow data from the offshore Polymarket venue (NOT Polymarket US where our
+prices come from — same underlying game, different liquidity pool, so treat it as directional
+signal rather than price-level truth). The block header explicitly names which team the flow
+is about via `side='<team_name>'` — that name comes directly from the UW API's outcome label,
+no inference needed. The specialists did NOT see this data — it reaches you as background
+alongside bid/ask, not mediated through any specialist's opinion.
 How to read it:
 - tag weights: each is a weighted score UW computes from its wallet-reputation database.
-  Higher = more of that behaviour observed on the YES side; zero = the tag didn't trigger.
+  Higher = more of that behaviour observed on the named side; zero = the tag didn't trigger.
     * smart_money: net activity from wallets with a historically profitable track record.
     * contrarian_whales: large wallets positioning AGAINST the current consensus price.
     * insider_trades: wallets that entered unusually early with unusually-right timing.
@@ -191,8 +193,8 @@ How to read it:
   recent change; large positive delta = conviction building, large negative = unwinding.
 - unusual_score: sum of weighted tag scores. Treat >5 as notable, >8 as material.
 - smart-money / contrarian-whale trade lists: recent fills. `taker=buyer` means someone hit
-  the ask (BUY pressure on YES); `taker=seller` means someone hit the bid (SELL pressure on
-  YES). Direction matters.
+  the ask (BUY pressure on the named side); `taker=seller` means someone hit the bid (SELL
+  pressure on the named side). Direction matters.
 - insiders: top wallet-level position holders with their average entry price.
 Use flow as a cross-check on your synthesized probability — especially when it disagrees
 materially with the MarketContextReport's consensus. Do NOT let UW override a sportsbook
@@ -213,12 +215,12 @@ Be detailed but concise — no hedging language, no filler. Leave `uw_flow_note`
 UW block was in the context. Do NOT fabricate one. This field is for the reader's inspection,
 not for replacing reasoning — keep your main synthesis in `reasoning` as usual.
 
-Example of a good note: "Smart_money 3.24 and contrarian_whales 3.00 on YES side, with
-unusual_score 8.24 (material). Recent smart-money trades split: ~3 taker=buyer fills around
-$0.015, ~2 taker=seller fills at $0.014 — net mildly long YES. Contrarian whales are all
-taker=seller at $0.01, consistent with large accounts fading the consensus favorite. MCI
-value 98.3 with delta +58.3 — strong conviction building. Net flow diverges from sportsbook
-consensus (which has Team A at 75%), leaning toward the underdog YES side."
+Example of a good note: "Smart_money 3.24 and contrarian_whales 3.00 on the Nuggets side,
+with unusual_score 8.24 (material). Recent smart-money trades split: ~3 taker=buyer fills
+around $0.015, ~2 taker=seller fills at $0.014 — net mildly long Nuggets. Contrarian whales
+are all taker=seller at $0.01, consistent with large accounts fading the consensus favorite.
+MCI value 98.3 with delta +58.3 — strong conviction building. Net flow diverges from
+sportsbook consensus (which has Timberwolves at 97%), leaning toward the Nuggets underdog."
 
 Structure the `reasoning` field (3-6 sentences) in this order:
 1. Which specialists you weighted most heavily and why.

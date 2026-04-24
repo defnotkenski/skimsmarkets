@@ -144,6 +144,7 @@ def _context_from_detail(
         return UnusualWhalesContext(
             asset_id=asset_id,
             question=data.get("question"),
+            outcome_label=_outcome_label(data),
             unusual_score=_best_unusual_score(data),
             volume=data.get("volume"),
             tag_scores=tag_scores_from_list(data.get("tag_scores")),
@@ -162,6 +163,23 @@ def _context_from_detail(
     except Exception as e:  # noqa: BLE001
         log.warning("uw context build failed for %s: %s", asset_id, e)
         return None
+
+
+def _outcome_label(data: dict[str, Any]) -> str | None:
+    """Resolve `outcomes[outcome_index]` → the team/outcome name for this asset.
+
+    UW returns the asset's outcome list and the index of which one this asset
+    represents; the team name is just `outcomes[outcome_index]`. Falls back to
+    None on any shape mismatch — the renderer treats `None` as "unknown side."
+    """
+    outcomes = data.get("outcomes")
+    idx = data.get("outcome_index")
+    if not isinstance(outcomes, list) or not isinstance(idx, int):
+        return None
+    if 0 <= idx < len(outcomes):
+        label = outcomes[idx]
+        return label if isinstance(label, str) else None
+    return None
 
 
 def _best_unusual_score(data: dict[str, Any]) -> Any:

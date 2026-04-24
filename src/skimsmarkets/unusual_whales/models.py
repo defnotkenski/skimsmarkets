@@ -164,6 +164,10 @@ class UnusualWhalesContext(BaseModel):
 
     asset_id: str
     question: str | None = None
+    # The team / outcome name this asset_id represents — taken directly from
+    # `outcomes[outcome_index]` in the UW detail response. Lets renderers and
+    # the director identify which side flow is on without inferring from price.
+    outcome_label: str | None = None
     unusual_score: float | None = None
     volume: float | None = None
     tag_scores: UWTagScores = Field(default_factory=UWTagScores)

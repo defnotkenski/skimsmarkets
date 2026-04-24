@@ -87,7 +87,11 @@ def render_uw_block(ctx: UnusualWhalesContext) -> str:
     )
 
     lines: list[str] = []
-    header = "Flow signals (Unusual Whales, YES side"
+    # Header explicitly names the team this flow data is about — `outcome_label`
+    # is the exact `outcomes[outcome_index]` value from the UW API, so the
+    # director / reader doesn't have to infer side from the bid/ask.
+    side = ctx.outcome_label or "YES side"
+    header = f"Flow signals (Unusual Whales, side='{side}'"
     if ctx.question:
         header += f" — {ctx.question!r}"
     header += "):"
