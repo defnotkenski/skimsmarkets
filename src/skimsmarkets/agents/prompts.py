@@ -174,12 +174,39 @@ Rules for synthesis:
 - specialist_weights keys must be exactly: 'statistics', 'injury', 'narrative',
   'market_context', and the values should approximately sum to 1.
 
+If a "Flow signals (Unusual Whales, YES side...)" block appears in the event context, it is
+raw on-chain flow data from the offshore Polymarket venue (NOT Polymarket US where our prices
+come from — same underlying game, different liquidity pool, so treat it as directional signal
+rather than price-level truth). The specialists did NOT see this data — it reaches you as
+background alongside bid/ask, not mediated through any specialist's opinion.
+How to read it:
+- tag weights: each is a weighted score UW computes from its wallet-reputation database.
+  Higher = more of that behaviour observed on the YES side; zero = the tag didn't trigger.
+    * smart_money: net activity from wallets with a historically profitable track record.
+    * contrarian_whales: large wallets positioning AGAINST the current consensus price.
+    * insider_trades: wallets that entered unusually early with unusually-right timing.
+    * momentum: rate of price/volume acceleration.
+    * closing_soon: weight given to late urgency as expiration approaches.
+- MCI (Market Confidence Index): UW's proprietary composite on a 0–100 scale. `delta` is the
+  recent change; large positive delta = conviction building, large negative = unwinding.
+- unusual_score: sum of weighted tag scores. Treat >5 as notable, >8 as material.
+- smart-money / contrarian-whale trade lists: recent fills. `taker=buyer` means someone hit
+  the ask (BUY pressure on YES); `taker=seller` means someone hit the bid (SELL pressure on
+  YES). Direction matters.
+- insiders: top wallet-level position holders with their average entry price.
+Use flow as a cross-check on your synthesized probability — especially when it disagrees
+materially with the MarketContextReport's consensus. Do NOT let UW override a sportsbook
+de-vig consensus; it's corroborating flow data, not a price-level truth. Absence of the
+block means UW has no coverage for this game — synthesize as normal without it.
+
 Structure the `reasoning` field (3-6 sentences) in this order:
 1. Which specialists you weighted most heavily and why.
 2. The decisive factor that drove your probability.
 3. Any material disagreement between specialists and how you resolved it (omit if none).
 4. How your probability sits relative to Polymarket's implied and sportsbook consensus, and
    if you've deviated meaningfully, why.
+5. If a UW flow block was present and it moved your probability (or flagged a disagreement
+   with sportsbook consensus), say so briefly; otherwise omit this.
 
 Return ONLY valid JSON matching the EventPrediction schema.
 """.strip()

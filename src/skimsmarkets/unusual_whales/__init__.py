@@ -18,6 +18,7 @@ from skimsmarkets.unusual_whales.models import (
     UWTagScores,
     UWTrade,
 )
+from skimsmarkets.unusual_whales.rendering import render_uw_block
 
 __all__ = [
     "GammaTokenResolver",
@@ -28,4 +29,5 @@ __all__ = [
     "UWTrade",
     "UnusualWhalesClient",
     "UnusualWhalesContext",
+    "render_uw_block",
 ]

@@ -25,14 +25,16 @@ from skimsmarkets.agents.schemas import (
 )
 from skimsmarkets.agents.sizing import wrap_with_sizing
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
+from skimsmarkets.unusual_whales import render_uw_block
 
 log = logging.getLogger(__name__)
 
 CLAUDE_MODEL = "claude-opus-4-7"
 # max_tokens is required by the Messages API and must cover thinking + response
-# combined. 128_000 is the model's output ceiling — we let adaptive thinking
-# decide how much of it to use rather than capping artificially.
-CLAUDE_MAX_OUTPUT_TOKENS = 128_000
+# combined. The director emits a small Pydantic object, so 16k gives adaptive
+# thinking plenty of room without tripping the SDK's 10-minute non-streaming
+# guardrail (which fires when max_tokens × effort implies a longer call).
+CLAUDE_MAX_OUTPUT_TOKENS = 16_000
 
 
 def _render_event_context_block(event: PolymarketEvent) -> str:
@@ -52,6 +54,13 @@ def _render_event_context_block(event: PolymarketEvent) -> str:
             f"  - slug={m.slug}{side_tag} yes='{m.yes_sub_title or '(no label)'}' "
             f"bid/ask={bid}/{ask} implied={implied_str}"
         )
+    # Unusual Whales flow signals reach the director as raw background data —
+    # alongside bid/ask — rather than through any specialist's opinion. The
+    # block is only appended when UW had coverage for this event's slug; its
+    # absence is normal (most non-NBA/NFL/big-soccer events won't match).
+    if event.uw_context is not None:
+        lines.append("")
+        lines.append(render_uw_block(event.uw_context))
     return "\n".join(lines)
 
 
