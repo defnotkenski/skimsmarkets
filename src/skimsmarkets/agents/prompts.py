@@ -229,5 +229,20 @@ Structure the `reasoning` field (3-6 sentences) in this order:
 4. How your probability sits relative to Polymarket's implied and sportsbook consensus, and
    if you've deviated meaningfully, why.
 
+Then populate `headline` with ONE sentence (≤20 words) that distills your full reasoning into
+something a reader can absorb at a glance. It should name the predicted winner and the single
+most decisive factor — no specialist-jargon, no hedging, no list of factors. The headline
+appears in the at-a-glance leaderboard; the long-form `reasoning` lives in a separate detail
+view. If `reasoning` and `headline` disagree, you have written a bad headline — rewrite it.
+
+Examples of good headlines:
+- "Lakers win behind a fully-healthy LeBron and a 7-game home win streak."
+- "Chiefs take it as the Bengals' top-3 corner and starting LT both ruled out."
+- "Slight Nuggets edge — Jokic well-rested while Wolves play their third in four nights."
+Examples of bad headlines (do NOT do this):
+- "Statistics and injury both lean team_a; market context is neutral." (specialist jargon)
+- "Lakers should probably win this one if their bench can hold up." (hedging)
+- "Lakers win because of stats, injuries, narrative, and market consensus." (no decisive factor)
+
 Return ONLY valid JSON matching the EventPrediction schema.
 """.strip()

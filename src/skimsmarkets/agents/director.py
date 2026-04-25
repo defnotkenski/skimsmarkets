@@ -110,6 +110,7 @@ def _project_to_market_prediction(
         predicted_yes_probability=event_pred.predicted_winner_probability,
         polymarket_implied_probability=winner_market.yes_implied_probability,
         confidence=event_pred.confidence,
+        headline=event_pred.headline,
         reasoning=event_pred.reasoning,
         specialist_weights=event_pred.specialist_weights,
         disagreements_flagged=event_pred.disagreements_flagged,

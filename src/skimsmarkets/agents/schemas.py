@@ -132,6 +132,15 @@ class EventPrediction(BaseModel):
         description="Probability the predicted winner actually wins, 0-1.",
     )
     confidence: Confidence
+    headline: str = Field(
+        description=(
+            "ONE sentence, max ~20 words, plain English. The single most decisive "
+            "reason this side wins — readable at a glance with no jargon. Example: "
+            "'Lakers win behind a fully-healthy LeBron and a 7-game home win streak.' "
+            "This is what shows up in the at-a-glance leaderboard; the long-form "
+            "synthesis lives in `reasoning`."
+        ),
+    )
     reasoning: str = Field(
         description="3-6 sentences explaining the synthesis and how specialists were weighted.",
     )
@@ -176,6 +185,9 @@ class MarketPrediction(BaseModel):
         description="Polymarket's implied probability for the predicted winner side (midpoint of yes bid/ask).",
     )
     confidence: Confidence
+    headline: str = Field(
+        description="One-sentence glanceable summary — projected from EventPrediction.",
+    )
     reasoning: str = Field(
         description="3-6 sentences explaining the synthesis and how specialists were weighted.",
     )

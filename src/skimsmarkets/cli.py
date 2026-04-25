@@ -8,7 +8,6 @@ import sys
 from skimsmarkets import config as cfg
 from skimsmarkets.pipeline import (
     fetch_polymarket_slate,
-    resolve_market_prices,
     run_pipeline,
 )
 from skimsmarkets.polymarket import PolymarketClient
@@ -51,8 +50,9 @@ def _setup_logging(verbose: bool) -> None:
 async def _fetch_only(league: str | None) -> int:
     poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
     async with PolymarketClient() as pm:
-        events = await fetch_polymarket_slate(pm, league, cfg.DEFAULT_HORIZON_HOURS)
-        await resolve_market_prices(pm, events, poly_sem)
+        events = await fetch_polymarket_slate(
+            pm, league, cfg.DEFAULT_HORIZON_HOURS, poly_sem
+        )
     print_events_table(events, league, horizon_hours=cfg.DEFAULT_HORIZON_HOURS)
     return 0
 

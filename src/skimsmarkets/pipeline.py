@@ -47,19 +47,36 @@ async def fetch_polymarket_slate(
     pm: PolymarketClient,
     league: str | None,
     horizon_hours: int,
+    poly_sem: asyncio.Semaphore,
 ) -> list[PolymarketEvent]:
-    """Fetch the Polymarket sports slate inside the time horizon.
+    """Fetch the Polymarket sports slate, refresh BBO, and return the tradable
+    set.
 
-    The SDK's `events.list` accepts `startTimeMin` / `startTimeMax`, so the
-    horizon filter is pushed server-side — we never pay to parse or BBO games
-    outside the window. `start_time_min` sits 6h in the past to cover overtime
-    and long-tail game endings that haven't settled yet. `start_time_max` is
-    `now + horizon_hours` for the upcoming slate.
+    This is the single source of truth for "what's in today's slate" — both the
+    --fetch-only display path and the full pipeline iterate exactly the events
+    returned here, with no further filtering. Filters layered server→client:
 
-    Each returned event is trimmed to its moneyline / drawable_outcome markets
-    (head-to-head NO-side inversion is already baked in by `PolymarketEvent`'s
-    validator). Events with no allowed markets are dropped entirely — futures,
-    spreads, and totals shouldn't hit the specialist pipeline.
+    1. **Server-side time window.** The SDK's `events.list` accepts
+       `startTimeMin` / `startTimeMax`, so we never parse or BBO games outside
+       the window. `start_time_min` sits 6h in the past to catch overtime and
+       long-tail endings that haven't settled yet; `start_time_max` is
+       `now + horizon_hours` for the upcoming slate.
+    2. **Market-type filter.** Keep only moneyline / drawable_outcome markets
+       (head-to-head NO-side inversion is already baked in by
+       `PolymarketEvent`'s validator). Futures, spreads, totals are dropped —
+       predicting "will this team win" on a season-winner market poisons the
+       output.
+    3. **BBO refresh.** Live bid/ask from `markets.bbo(slug)` overwrites the
+       events.list snapshot prices.
+    4. **Tradability filter.** Drop markets without a `yes_sub_title` label
+       (can't tell the LLM which side is which) or without bid/ask (no live
+       prices to reason about). This catches ended/settled games naturally —
+       once a market settles its BBO disappears. Drop the event entirely if no
+       markets survive.
+
+    Filtering tradability AFTER BBO refresh is load-bearing: the events.list
+    snapshot is often missing prices that the live BBO does provide, so we'd
+    drop too many events if we filtered before the refresh.
     """
     now = datetime.now(tz=UTC)
     start_time_min = now - timedelta(hours=6)
@@ -77,7 +94,7 @@ async def fetch_polymarket_slate(
         horizon_hours,
     )
 
-    kept: list[PolymarketEvent] = []
+    type_filtered: list[PolymarketEvent] = []
     for ev in events:
         allowed_markets = [
             m for m in ev.markets if m.sports_market_type in _ALLOWED_MARKET_TYPES
@@ -87,14 +104,38 @@ async def fetch_polymarket_slate(
         # Rebuild the event with the filtered market list so downstream stages
         # don't have to re-filter. Pydantic model_copy is the cheapest way to
         # get an updated copy without re-validating every other field.
-        kept.append(ev.model_copy(update={"markets": allowed_markets}))
+        type_filtered.append(ev.model_copy(update={"markets": allowed_markets}))
 
     log.info(
-        "kept %d events with moneyline/drawable_outcome markets (dropped %d)",
-        len(kept),
-        len(events) - len(kept),
+        "kept %d events after market-type filter (dropped %d)",
+        len(type_filtered),
+        len(events) - len(type_filtered),
     )
-    return kept
+
+    await resolve_market_prices(pm, type_filtered, poly_sem)
+
+    # Tradability filter: a market is tradable when it has a labeled side AND a
+    # live bid/ask. After BBO refresh, settled/ended games and unpriced lines
+    # fail this and get dropped here so neither --fetch-only nor the pipeline
+    # has to re-filter downstream.
+    tradable: list[PolymarketEvent] = []
+    for ev in type_filtered:
+        live_markets = [
+            m for m in ev.markets
+            if m.yes_sub_title
+            and m.yes_bid_dollars is not None
+            and m.yes_ask_dollars is not None
+        ]
+        if not live_markets:
+            continue
+        tradable.append(ev.model_copy(update={"markets": live_markets}))
+
+    log.info(
+        "kept %d events with live tradable markets (dropped %d)",
+        len(tradable),
+        len(type_filtered) - len(tradable),
+    )
+    return tradable
 
 
 async def resolve_market_prices(
@@ -291,10 +332,13 @@ async def run_pipeline(
         PolymarketClient() as pm,
         UnusualWhalesClient(config.unusual_whales_api_key) as uw,
     ):
-        events = await fetch_polymarket_slate(pm, league, horizon_hours)
+        # `fetch_polymarket_slate` is the single source of truth for the slate:
+        # it fetches, refreshes BBO, and applies the tradability filter so the
+        # slate matches what --fetch-only displays.
+        events = await fetch_polymarket_slate(
+            pm, league, horizon_hours, poly_sem
+        )
         result.fetched_events = len(events)
-
-        await resolve_market_prices(pm, events, poly_sem)
 
         if dry_run:
             events = events[:1]
