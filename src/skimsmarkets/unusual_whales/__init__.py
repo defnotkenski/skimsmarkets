@@ -9,7 +9,11 @@ prompt.
 """
 
 from skimsmarkets.unusual_whales.client import UnusualWhalesClient
-from skimsmarkets.unusual_whales.gamma import GammaTokenResolver
+from skimsmarkets.unusual_whales.gamma import (
+    GammaTokenResolver,
+    fetch_gamma_event,
+    list_gamma_events,
+)
 from skimsmarkets.unusual_whales.models import (
     UnusualWhalesContext,
     UWInsider,
@@ -29,5 +33,7 @@ __all__ = [
     "UWTrade",
     "UnusualWhalesClient",
     "UnusualWhalesContext",
+    "fetch_gamma_event",
+    "list_gamma_events",
     "render_uw_block",
 ]

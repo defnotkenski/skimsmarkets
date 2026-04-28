@@ -6,10 +6,6 @@ from pydantic import BaseModel, Field
 
 Confidence = Literal["low", "medium", "high"]
 
-# Conventional safety cap on half-Kelly sizing — never stake more than 25% of bankroll
-# on a single contract, even if Kelly math would recommend more.
-KELLY_BANKROLL_CAP = 0.25
-
 
 class StatisticsReport(BaseModel):
     """Quantitative lens: form, head-to-head, splits, base rates."""
@@ -131,7 +127,19 @@ class EventPrediction(BaseModel):
         ge=0.0, le=1.0,
         description="Probability the predicted winner actually wins, 0-1.",
     )
-    confidence: Confidence
+    confidence: Confidence = Field(
+        description=(
+            "Robustness of the prediction to any single input being wrong — NOT a "
+            "measure of how lopsided the matchup is. high = multiple specialists "
+            "(and UW flow when present) independently support predicted_winner, so "
+            "removing any one input leaves the winner unchanged; medium = most agree "
+            "but one is load-bearing; low = predicted_winner flips if a single input "
+            "is wrong, or specialists themselves mostly reported confidence='low'. "
+            "A 52-48 call with all four lenses agreeing directionally IS high "
+            "confidence; an 80-20 call resting entirely on one late injury report "
+            "is low confidence."
+        ),
+    )
     headline: str = Field(
         description=(
             "ONE sentence, max ~20 words, plain English. The single most decisive "
@@ -178,6 +186,10 @@ class MarketPrediction(BaseModel):
     )
     event_id: str
     event_title: str | None = None
+    # Carried over from `PolymarketEvent.venue` so the leaderboard can mark
+    # offshore rows (gamma-api fallback) — different liquidity pool from
+    # polymarket-us; not tradable on US.
+    venue: Literal["us", "offshore"] = "us"
     predicted_winner: str
     predicted_yes_probability: float = Field(ge=0.0, le=1.0)
     polymarket_implied_probability: float | None = Field(
@@ -199,50 +211,3 @@ class MarketPrediction(BaseModel):
         description="Empty when specialists aligned.",
     )
     uw_flow_note: str | None = None
-
-
-class PositionSizing(BaseModel):
-    """Kelly-based position sizing as a fraction of bankroll.
-
-    All fractions are dimensionless (multiply by your actual bankroll to get a dollar stake).
-    `full_kelly_fraction` is the pure Kelly-optimal stake; `half_kelly_fraction` is the common
-    variance-reduction variant; `capped_half_kelly_fraction` additionally caps at
-    KELLY_BANKROLL_CAP (0.25) for safety.
-
-    Kelly is reported purely as reference sizing — there's no upstream buy/pass
-    gate, so a zero fraction just means "director's edge vs Polymarket's ask is
-    non-positive," not "skip this event." Leaderboard ranking happens on
-    predicted probability, not Kelly fraction.
-    """
-
-    entry_price_dollars: float | None = Field(
-        description="Polymarket yes_ask used for the sizing calc. None if the ask is unavailable.",
-    )
-    win_probability: float | None = Field(
-        description="Director's predicted probability for the winning side. None if unavailable.",
-    )
-    edge: float = Field(
-        description="Signed edge vs Polymarket: predicted_probability - yes_ask. 0 when no ask.",
-    )
-    full_kelly_fraction: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="Kelly-optimal fraction of bankroll. 0 when no +EV side.",
-    )
-    half_kelly_fraction: float = Field(ge=0.0, le=1.0)
-    capped_half_kelly_fraction: float = Field(
-        ge=0.0,
-        le=KELLY_BANKROLL_CAP,
-        description=f"Half-Kelly capped at {KELLY_BANKROLL_CAP:.0%} of bankroll — recommended stake.",
-    )
-    notes: list[str] = Field(
-        default_factory=list,
-        description="Warnings such as 'no tradeable ask' or '-EV vs predicted probability'.",
-    )
-
-
-class SizedMarketPrediction(BaseModel):
-    """Director's prediction + deterministic Kelly sizing."""
-
-    prediction: MarketPrediction
-    sizing: PositionSizing

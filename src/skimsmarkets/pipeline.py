@@ -6,16 +6,22 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+import httpx
 from anthropic import AsyncAnthropic
 from xai_sdk import AsyncClient as XAIAsyncClient
 
 from skimsmarkets import config as cfg
 from skimsmarkets.agents.director import synthesize_prediction
-from skimsmarkets.agents.schemas import SizedMarketPrediction, SpecialistReport
+from skimsmarkets.agents.schemas import MarketPrediction, SpecialistReport
 from skimsmarkets.agents.specialists import SPECIALISTS
 from skimsmarkets.polymarket import PolymarketClient
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
-from skimsmarkets.unusual_whales import GammaTokenResolver, UnusualWhalesClient
+from skimsmarkets.unusual_whales import (
+    GammaTokenResolver,
+    UnusualWhalesClient,
+    fetch_gamma_event,
+    list_gamma_events,
+)
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +43,7 @@ class ErrorRecord:
 @dataclass
 class RunResult:
     run_id: str
-    predictions: list[SizedMarketPrediction] = field(default_factory=list)
+    predictions: list[MarketPrediction] = field(default_factory=list)
     errors: list[ErrorRecord] = field(default_factory=list)
     fetched_events: int = 0
     considered_events: int = 0
@@ -121,7 +127,8 @@ async def fetch_polymarket_slate(
     tradable: list[PolymarketEvent] = []
     for ev in type_filtered:
         live_markets = [
-            m for m in ev.markets
+            m
+            for m in ev.markets
             if m.yes_sub_title
             and m.yes_bid_dollars is not None
             and m.yes_ask_dollars is not None
@@ -138,6 +145,129 @@ async def fetch_polymarket_slate(
     return tradable
 
 
+async def fetch_gamma_events(
+    http: httpx.AsyncClient,
+    slugs: list[str],
+    horizon_hours: int,
+    sem: asyncio.Semaphore,
+) -> list[PolymarketEvent]:
+    """Fetch specific offshore-Polymarket events by slug from gamma-api.
+
+    Opt-in fallback for events that don't list on polymarket-us (mostly
+    international soccer, niche sports). Each slug fetched in parallel under
+    `sem`; failures degrade per-slug — bogus slugs log a warning and drop out.
+
+    Applies the same horizon window as `fetch_polymarket_slate` (now-6h to
+    now+horizon_hours) on each event's `game_start_time` so a stale CLI
+    argument for a past game doesn't sneak into the slate.
+    """
+    if not slugs:
+        return []
+
+    async def _one(slug: str) -> PolymarketEvent | None:
+        async with sem:
+            payload = await fetch_gamma_event(http, slug)
+            if payload is None:
+                return None
+            event = PolymarketEvent.from_gamma(payload)
+            if event is None:
+                log.warning(
+                    "gamma slug=%s: no tradable moneyline markets after filter",
+                    slug,
+                )
+            return event
+
+    raw_events = await asyncio.gather(*(_one(s) for s in slugs))
+
+    now = datetime.now(tz=UTC)
+    horizon_start = now - timedelta(hours=6)
+    horizon_end = now + timedelta(hours=horizon_hours)
+    kept: list[PolymarketEvent] = []
+    for ev in raw_events:
+        if ev is None:
+            continue
+        # Use the earliest market `game_start_time` we have. Gamma populates
+        # this from the event's `endDate` (= game time) inside `from_gamma`.
+        starts = [t for m in ev.markets if (t := m.game_start_time) is not None]
+        if starts:
+            tipoff = min(starts)
+            if not (horizon_start <= tipoff <= horizon_end):
+                log.info(
+                    "gamma slug=%s: tipoff %s outside horizon [%s, %s], dropping",
+                    ev.slug,
+                    tipoff.isoformat(),
+                    horizon_start.isoformat(),
+                    horizon_end.isoformat(),
+                )
+                continue
+        kept.append(ev)
+
+    log.info(
+        "fetched %d/%d offshore events from gamma-api",
+        len(kept),
+        len(slugs),
+    )
+    return kept
+
+
+async def fetch_gamma_league_slate(
+    http: httpx.AsyncClient,
+    prefixes: list[str],
+    horizon_hours: int,
+) -> list[PolymarketEvent]:
+    """Fetch all near-term offshore-Polymarket events whose slug starts with
+    any of `prefixes` (e.g. ['lib', 'ucl'] → Copa Libertadores + Champions
+    League). Mirrors the polymarket-us `--league` prefix-match pattern, but
+    matches on slug prefix rather than `seriesSlug` since gamma omits that
+    field.
+
+    One HTTP call lists up to 200 upcoming events ordered by soonest tipoff;
+    we filter client-side. Pagination isn't worth the complexity here —
+    single-league horizons rarely exceed 200 events. If a user wants more,
+    they can add `--gamma-slug` for specific stragglers.
+    """
+    if not prefixes:
+        return []
+
+    payloads = await list_gamma_events(http)
+    if not payloads:
+        return []
+
+    # Match against `<prefix>-` so `arg` doesn't accidentally swallow `argf-`
+    # or any other longer prefix that happens to share the leading letters.
+    match_prefixes = [f"{p}-" for p in prefixes]
+
+    now = datetime.now(tz=UTC)
+    horizon_start = now - timedelta(hours=6)
+    horizon_end = now + timedelta(hours=horizon_hours)
+
+    kept: list[PolymarketEvent] = []
+    for payload in payloads:
+        slug = payload.get("slug")
+        if not isinstance(slug, str) or not slug:
+            continue
+        if not any(slug.startswith(p) for p in match_prefixes):
+            continue
+        ev = PolymarketEvent.from_gamma(payload)
+        if ev is None:
+            # `from_gamma` already drops -more-markets variants, settled
+            # markets, etc. Silently skip those.
+            continue
+        starts = [t for m in ev.markets if (t := m.game_start_time) is not None]
+        if starts:
+            tipoff = min(starts)
+            if not (horizon_start <= tipoff <= horizon_end):
+                continue
+        kept.append(ev)
+
+    log.info(
+        "fetched %d offshore events matching prefixes %s",
+        len(kept),
+        prefixes,
+    )
+    return kept
+
+
 async def resolve_market_prices(
     pm: PolymarketClient,
     events: list[PolymarketEvent],
@@ -151,8 +281,16 @@ async def resolve_market_prices(
     `no_ask = 1 − yes_bid`). Slugs with an already-populated snapshot keep those
     prices when the BBO call returns None — a fallback that matters in practice
     because BBO is the flakier of the two endpoints.
+
+    Offshore events (`venue == "offshore"`) are skipped — gamma-api populates
+    bid/ask on the `/events` payload directly, and there's no `markets.bbo()`
+    analog on the gamma side. Trying to call it via the polymarket-us SDK would
+    404 because gamma slugs don't exist on the US venue.
     """
-    unique_slugs: set[str] = {m.slug for ev in events for m in ev.markets}
+    us_events = [ev for ev in events if ev.venue == "us"]
+    if not us_events:
+        return
+    unique_slugs: set[str] = {m.slug for ev in us_events for m in ev.markets}
 
     async def _one(slug: str) -> tuple[str, PolymarketMarket | None]:
         async with sem:
@@ -165,7 +303,7 @@ async def resolve_market_prices(
         slug: bbo for slug, bbo in bbo_results
     }
 
-    for ev in events:
+    for ev in us_events:
         for i, m in enumerate(ev.markets):
             bbo = bbo_by_slug.get(m.slug)
             if bbo is None:
@@ -180,18 +318,21 @@ async def resolve_market_prices(
             else:
                 new_bid = yes_bid
                 new_ask = yes_ask
-            ev.markets[i] = m.model_copy(update={
-                "yes_bid_dollars": new_bid,
-                "yes_ask_dollars": new_ask,
-                # last_trade is YES-directional — drop on the NO clone to avoid
-                # misleading the reader.
-                "last_trade_price_dollars": (
-                    None if m.is_no_side
-                    else bbo.last_trade_price_dollars or m.last_trade_price_dollars
-                ),
-                "volume_dollars": bbo.volume_dollars or m.volume_dollars,
-                "liquidity_dollars": bbo.liquidity_dollars or m.liquidity_dollars,
-            })
+            ev.markets[i] = m.model_copy(
+                update={
+                    "yes_bid_dollars": new_bid,
+                    "yes_ask_dollars": new_ask,
+                    # last_trade is YES-directional — drop on the NO clone to avoid
+                    # misleading the reader.
+                    "last_trade_price_dollars": (
+                        None
+                        if m.is_no_side
+                        else bbo.last_trade_price_dollars or m.last_trade_price_dollars
+                    ),
+                    "volume_dollars": bbo.volume_dollars or m.volume_dollars,
+                    "liquidity_dollars": bbo.liquidity_dollars or m.liquidity_dollars,
+                }
+            )
 
 
 async def resolve_unusual_whales(
@@ -229,9 +370,9 @@ async def resolve_unusual_whales(
 
     resolver = GammaTokenResolver(uw.http)
 
-    async def _one(slug: str, evs: list[PolymarketEvent]) -> None:
+    async def _one(s: str, evs: list[PolymarketEvent]) -> None:
         async with sem:
-            token_ids = await resolver.resolve(slug)
+            token_ids = await resolver.resolve(s)
             if token_ids is None:
                 return
             yes_asset_id, _no_asset_id = token_ids
@@ -289,7 +430,7 @@ async def process_event(
     specialist_sem: asyncio.Semaphore,
     director_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
-) -> SizedMarketPrediction | None:
+) -> MarketPrediction | None:
     log.info("processing event %s (%s)", event.id, event.title)
     reports = await _run_specialists(xai, event, specialist_sem, errors)
     if reports is None:
@@ -314,10 +455,24 @@ async def run_pipeline(
     league: str | None = None,
     dry_run: bool = False,
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
+    gamma_slugs: list[str] | None = None,
+    gamma_leagues: list[str] | None = None,
+    skip_us: bool = False,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon, refresh
     each event's BBO, then run 4 specialists + director per event. Returns a
     leaderboard-ready `RunResult` sorted downstream by predicted probability.
+
+    Offshore fallback (gamma-api):
+    - `gamma_slugs`: explicit list of offshore event slugs to include.
+    - `gamma_leagues`: list of slug prefixes (e.g. 'lib', 'ucl') to bulk-pull
+      all near-term offshore events for that league. Independent of `--league`
+      because US and offshore use different naming conventions for league codes.
+    Both add events tagged `venue="offshore"` to the slate.
+
+    `skip_us=True` bypasses the polymarket-us fetch entirely — only the
+    offshore events from `gamma_slugs`/`gamma_leagues` will reach the slate.
+    `league` is silently ignored under `skip_us=True` (it's a US-only filter).
     """
     config = cfg.Config.from_env()
     run_id = uuid.uuid4().hex[:8]
@@ -327,17 +482,41 @@ async def run_pipeline(
     director_sem = asyncio.Semaphore(cfg.DIRECTOR_SEM)
     poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
     uw_sem = asyncio.Semaphore(cfg.UW_FETCH_SEM)
+    gamma_sem = asyncio.Semaphore(cfg.GAMMA_FETCH_SEM)
 
     async with (
         PolymarketClient() as pm,
         UnusualWhalesClient(config.unusual_whales_api_key) as uw,
     ):
-        # `fetch_polymarket_slate` is the single source of truth for the slate:
-        # it fetches, refreshes BBO, and applies the tradability filter so the
-        # slate matches what --fetch-only displays.
-        events = await fetch_polymarket_slate(
-            pm, league, horizon_hours, poly_sem
-        )
+        # `fetch_polymarket_slate` is the single source of truth for the US
+        # slate: it fetches, refreshes BBO, and applies the tradability filter
+        # so the slate matches what --fetch-only displays. `skip_us` bypasses
+        # it for offshore-only runs.
+        if skip_us:
+            events = []
+        else:
+            events = await fetch_polymarket_slate(pm, league, horizon_hours, poly_sem)
+        # Offshore fallback: gamma events arrive with bid/ask already populated
+        # and venue="offshore", so they bypass `resolve_market_prices`. Slugs
+        # and leagues compose — both lists union into the slate.
+        offshore: list[PolymarketEvent] = []
+        if gamma_slugs:
+            offshore += await fetch_gamma_events(
+                uw.http, gamma_slugs, horizon_hours, gamma_sem
+            )
+        if gamma_leagues:
+            offshore += await fetch_gamma_league_slate(
+                uw.http, gamma_leagues, horizon_hours
+            )
+        if offshore:
+            # Dedupe by event id so a slug supplied via both --gamma-slug and
+            # --gamma-league only lands once. Preserve first-seen order.
+            seen: set[str] = {ev.id for ev in events}
+            for ev in offshore:
+                if ev.id in seen:
+                    continue
+                seen.add(ev.id)
+                events.append(ev)
         result.fetched_events = len(events)
 
         if dry_run:

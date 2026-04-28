@@ -19,11 +19,9 @@ from skimsmarkets.agents.schemas import (
     MarketContextReport,
     MarketPrediction,
     NarrativeReport,
-    SizedMarketPrediction,
     SpecialistReport,
     StatisticsReport,
 )
-from skimsmarkets.agents.sizing import wrap_with_sizing
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 from skimsmarkets.unusual_whales import render_uw_block
 
@@ -38,9 +36,21 @@ CLAUDE_MAX_OUTPUT_TOKENS = 16_000
 
 
 def _render_event_context_block(event: PolymarketEvent) -> str:
+    # Venue marker — important when prices come from gamma-api (offshore) vs
+    # polymarket-us (US). Different liquidity pools, different participants;
+    # the director should know where the numbers came from. Lives in the
+    # per-event user message (NOT the cached system prompt) so the prompt
+    # cache hit on DIRECTOR_SYSTEM is preserved.
+    venue_line = (
+        "Polymarket venue: OFFSHORE (gamma-api) — different liquidity pool from "
+        "polymarket-us; offshore-only signals like UW flow apply directly here."
+        if event.venue == "offshore"
+        else "Polymarket venue: US (polymarket-us)"
+    )
     lines = [
         f"Event: {event.id} — {event.title or '(untitled)'}",
         f"Series: {event.series_slug or '?'}",
+        venue_line,
         event.game_state_line(),
         f"Tradable sides ({len(event.markets)}):",
     ]
@@ -100,12 +110,13 @@ def _project_to_market_prediction(
     event_pred: EventPrediction,
 ) -> MarketPrediction:
     """Project the event-level prediction onto the winning side's Polymarket
-    market so sizing and reporting have a single self-contained record.
+    market so reporting has a single self-contained record.
     """
     return MarketPrediction(
         market_slug=winner_market.slug,
         event_id=event.id,
         event_title=event.title,
+        venue=event.venue,
         predicted_winner=event_pred.predicted_winner,
         predicted_yes_probability=event_pred.predicted_winner_probability,
         polymarket_implied_probability=winner_market.yes_implied_probability,
@@ -122,10 +133,9 @@ async def synthesize_prediction(
     anthropic: AsyncAnthropic,
     event: PolymarketEvent,
     reports: dict[str, SpecialistReport],
-) -> SizedMarketPrediction:
-    """Synthesize four specialist reports into an event-level EventPrediction, then
-    project onto the predicted winner's market and attach Kelly sizing against
-    Polymarket's ask.
+) -> MarketPrediction:
+    """Synthesize four specialist reports into an event-level EventPrediction,
+    then project onto the predicted winner's market.
     """
     user_msg = _render_user_message(
         event=event,
@@ -175,5 +185,4 @@ async def synthesize_prediction(
             f"Known sides: {[m.yes_sub_title for m in event.markets]}"
         )
 
-    prediction = _project_to_market_prediction(event, winner_market, event_pred)
-    return wrap_with_sizing(prediction, winner_market)
+    return _project_to_market_prediction(event, winner_market, event_pred)

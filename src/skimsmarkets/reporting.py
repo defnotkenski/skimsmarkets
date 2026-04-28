@@ -105,6 +105,10 @@ def print_events_table(
         side_label = (m.yes_sub_title or "—")[:30]
         if m.is_no_side:
             side_label += " [NO]"
+        # Mark offshore rows so the user doesn't mistake them for US-tradable
+        # markets — the prices come from a different liquidity pool.
+        if ev.venue == "offshore":
+            side_label += f" [{_PEACH}][OFFSHORE][/]"
         table.add_row(
             ev.series_slug or "—",
             (ev.title or ev.id)[:40],
@@ -124,6 +128,11 @@ def print_events_table(
         )
         return
     console.print(table)
+    if any(ev.venue == "offshore" for ev in events):
+        console.print(
+            f"[{_PEACH}]Note: [OFFSHORE] rows come from gamma-api (offshore Polymarket) "
+            "and are NOT tradable on polymarket-us.[/]"
+        )
 
 
 def print_run_summary(result: RunResult) -> None:
@@ -138,11 +147,10 @@ def print_run_summary(result: RunResult) -> None:
 
     if result.predictions:
         # Leaderboard ranks events by the director's confidence in the winner —
-        # highest predicted probability first. Kelly is reference sizing only;
-        # it doesn't drive the rank order.
+        # highest predicted probability first.
         ranked = sorted(
             result.predictions,
-            key=lambda sm: sm.prediction.predicted_yes_probability,
+            key=lambda p: p.predicted_yes_probability,
             reverse=True,
         )
 
@@ -160,21 +168,15 @@ def print_run_summary(result: RunResult) -> None:
         )
         leaderboard.add_column("Pred", justify="right")
         leaderboard.add_column("Poly impl", justify="right")
-        leaderboard.add_column("Entry ask", justify="right")
-        leaderboard.add_column("Capped ½K", justify="right")
         leaderboard.add_column("Conf", justify="center")
 
-        for rank, s in enumerate(ranked, start=1):
-            p, z = s.prediction, s.sizing
+        for rank, p in enumerate(ranked, start=1):
             event_display = p.event_title or p.event_id
+            if p.venue == "offshore":
+                event_display = f"{event_display} [{_PEACH}][OFFSHORE][/]"
             poly_impl_str = (
                 f"{p.polymarket_implied_probability:.3f}"
                 if p.polymarket_implied_probability is not None
-                else "—"
-            )
-            entry_str = (
-                f"${z.entry_price_dollars:.2f}"
-                if z.entry_price_dollars is not None
                 else "—"
             )
             leaderboard.add_row(
@@ -183,8 +185,6 @@ def print_run_summary(result: RunResult) -> None:
                 p.predicted_winner,
                 f"{p.predicted_yes_probability:.3f}",
                 poly_impl_str,
-                entry_str,
-                f"[bold {_MINT}]{z.capped_half_kelly_fraction:.1%}[/]",
                 f"[{_confidence_style(p.confidence)}]{p.confidence}[/]",
             )
         console.print(leaderboard)
@@ -204,8 +204,7 @@ def print_run_summary(result: RunResult) -> None:
             "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
         )
         headline_table.add_column("Headline", overflow="fold")
-        for s in ranked:
-            p = s.prediction
+        for p in ranked:
             headline_table.add_row(
                 p.event_title or p.event_id,
                 p.predicted_winner,
@@ -218,7 +217,7 @@ def print_run_summary(result: RunResult) -> None:
         # row with the reasoning text without squishing both. Only events
         # with a non-null `uw_flow_note` appear here; everything else is
         # silently omitted, including events with no UW coverage at all.
-        uw_rows = [s for s in ranked if s.prediction.uw_flow_note]
+        uw_rows = [p for p in ranked if p.uw_flow_note]
         if uw_rows:
             uw_table = Table(
                 title=f"[{_CREAM}]Unusual Whales flow (where UW had coverage)[/]",
@@ -232,8 +231,7 @@ def print_run_summary(result: RunResult) -> None:
                 "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
             )
             uw_table.add_column("UW flow", overflow="fold")
-            for s in uw_rows:
-                p = s.prediction
+            for p in uw_rows:
                 uw_table.add_row(
                     p.event_title or p.event_id,
                     p.predicted_winner,
@@ -242,13 +240,11 @@ def print_run_summary(result: RunResult) -> None:
             console.print(uw_table)
 
         # Flags get their own table so long notes don't break the leaderboard rows.
-        flag_rows: list[tuple[str, str, str]] = []
-        for s in ranked:
-            label = s.prediction.event_title or s.prediction.event_id
-            for note in s.sizing.notes:
-                flag_rows.append((label, "sizing", note))
-            for disagreement in s.prediction.disagreements_flagged:
-                flag_rows.append((label, "director", disagreement))
+        flag_rows: list[tuple[str, str]] = []
+        for p in ranked:
+            label = p.event_title or p.event_id
+            for disagreement in p.disagreements_flagged:
+                flag_rows.append((label, disagreement))
         if flag_rows:
             flag_table = Table(
                 title=f"[{_CREAM}]Flags[/]",
@@ -258,10 +254,9 @@ def print_run_summary(result: RunResult) -> None:
                 header_style=_LAVENDER,
             )
             flag_table.add_column("Event", style=_SKY)
-            flag_table.add_column("Source", style=_PEACH)
             flag_table.add_column("Note")
-            for label, source, note in flag_rows:
-                flag_table.add_row(label, source, note)
+            for label, note in flag_rows:
+                flag_table.add_row(label, note)
             console.print(flag_table)
 
     if result.errors:

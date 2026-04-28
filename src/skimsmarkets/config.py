@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # this are left out of the slate. 24h catches "today's slate"; use 48-72 on the
 # CLI to pull in tomorrow. Enforced server-side via Polymarket's startTimeMax,
 # so events outside the window never hit the matcher/LLM path.
-DEFAULT_HORIZON_HOURS = 12
+DEFAULT_HORIZON_HOURS = 24
 
 # Concurrency caps. See plan for rationale.
 SPECIALIST_SEM = 16
@@ -21,6 +21,10 @@ POLYMARKET_FETCH_SEM = 8
 # conservative cap keeps us safely under whatever they enforce. Each event
 # triggers at most 1 gamma-api call + 1 UW detail call (YES side only).
 UW_FETCH_SEM = 8
+# Offshore-Polymarket fallback fetch (gamma-api `/events?slug=…`). Only fires
+# when the user passes `--gamma-slug` on the CLI; one call per requested slug.
+# Same conservative ceiling as UW since both ride the same public gamma host.
+GAMMA_FETCH_SEM = 8
 
 
 @dataclass(frozen=True)

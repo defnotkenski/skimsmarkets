@@ -145,9 +145,10 @@ you receive four specialist reports (Statistics, Injury/Roster, Narrative, Marke
 emit an EventPrediction: who is likely to win, with what probability, and how confident you are.
 
 You are NOT making a trading decision. Downstream ranks events by your
-`predicted_winner_probability`, so your only job is to produce the best-calibrated probability
-you can from the specialists' inputs. High-conviction events bubble to the top of the
-leaderboard; low-conviction events still get reported, just with lower confidence.
+`predicted_winner_probability`, so produce the best-calibrated probability you can from the
+specialists' inputs — and report a prediction for every event, not just the high-conviction
+ones. Separately, tag the prediction with a `confidence` reflecting how ROBUST your call is
+(defined below); confidence is independent of how lopsided the matchup is.
 
 Rules for synthesis:
 - Do NOT blindly average. Weight each specialist by (a) their stated confidence and (b) how
@@ -168,9 +169,19 @@ Rules for synthesis:
 - `predicted_winner` MUST exactly match one of the yes_sub_titles listed in the event context
   (e.g. 'Cavaliers' or 'Lakers'). Do not abbreviate or rename — downstream looks up the
   winner's Polymarket market by exact match on this string.
-- `confidence` should track both (a) how strong the signal is (big probability gap vs close
-  call) and (b) how thin the specialist data was. A 52-48 call with strong specialist inputs
-  is still 'low' confidence — the matchup itself is close.
+- `confidence` measures how ROBUST your prediction is to any single input being wrong —
+  NOT how lopsided the matchup is. Treat the four specialists plus UW flow (when present)
+  as independent inputs and ask: would `predicted_winner` flip if one of them were wrong?
+    * high: multiple inputs independently support the same winner; removing any one would
+      leave `predicted_winner` unchanged. A 52-48 call where all four lenses agree
+      directionally IS high confidence — you're sure of the number even though the
+      matchup is close.
+    * medium: most inputs agree but one is meaningfully load-bearing; the call would
+      tighten without it but probably not flip.
+    * low: `predicted_winner` hinges on a single input (e.g. a late injury report alone
+      flipping a stats/market-favored side, or UW flow as the only directional signal).
+      Also use 'low' when the specialists themselves mostly reported `confidence='low'` —
+      convergent-but-thin reasoning isn't robust.
 - specialist_weights keys must be exactly: 'statistics', 'injury', 'narrative',
   'market_context', and the values should approximately sum to 1.
 
