@@ -6,6 +6,14 @@ Unusual Whales indexes everything by the ERC-1155 `asset_id`, but our
 gamma-api fills the gap: `https://gamma-api.polymarket.com/markets?slug=X`
 returns `clobTokenIds` as a JSON-stringified `[yes_token_id, no_token_id]`
 pair. No auth required. One lookup per unique slug, cached per run.
+
+The same `/markets?slug=` response also carries supplementary fields the
+polymarket-us SDK doesn't surface — `oneDayPriceChange`, `competitive`,
+`spread`, `liquidityClob`, `acceptingOrders`. Since we already pay for the
+HTTP call to get clobTokenIds, the resolver caches the full snapshot and
+exposes both: `resolve()` keeps the legacy token-tuple shape for callers
+that only need IDs (UW path), and `resolve_snapshot()` returns the full
+record for the pipeline's gamma-piggyback merge.
 """
 
 from __future__ import annotations
@@ -13,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -23,21 +32,73 @@ _GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 _GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
 
+@dataclass(frozen=True, slots=True)
+class GammaMarketSnapshot:
+    """A single gamma `/markets?slug=` payload reduced to the fields we use.
+
+    All fields are optional — gamma occasionally returns markets without
+    book state (settled, unfunded) or without the computed momentum
+    fields. None means "absent or unparseable"; renderers should skip
+    rather than substitute a default.
+
+    `clob_token_ids` is the original purpose of the call (UW asset-id
+    lookup); the rest are free riders piggybacked on the same response.
+    """
+
+    clob_token_ids: tuple[str, str] | None
+    spread: float | None
+    one_day_price_change: float | None
+    one_month_price_change: float | None
+    competitive: float | None
+    liquidity_clob: float | None
+    volume_clob: float | None
+    accepting_orders: bool | None
+    enable_order_book: bool | None
+
+
+def _coerce_float(v: Any) -> float | None:
+    """Best-effort float coercion. Returns None on anything unparseable."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_bool(v: Any) -> bool | None:
+    """Pass through real bools; reject anything else (don't coerce 0/1/"true")."""
+    if isinstance(v, bool):
+        return v
+    return None
+
+
 class GammaTokenResolver:
-    """Async cache over gamma-api's slug → (yes_token_id, no_token_id) lookup.
+    """Async cache over gamma-api's slug → market-snapshot lookup.
 
     Instantiate once per pipeline run (cache has run-scoped lifetime); each
     unique slug is fetched at most once even under concurrent access thanks
     to a per-slug lock. Failures cache as `None` so we don't retry a bad slug.
+
+    Two read APIs share the same cache:
+    - `resolve(slug)` returns just the `(yes_asset_id, no_asset_id)` tuple
+      for backwards compatibility with the UW token-resolution path.
+    - `resolve_snapshot(slug)` returns the full `GammaMarketSnapshot` for
+      the pipeline's gamma-piggyback enrichment.
     """
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
-        self._cache: dict[str, tuple[str, str] | None] = {}
+        self._cache: dict[str, GammaMarketSnapshot | None] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def resolve(self, slug: str) -> tuple[str, str] | None:
         """Return `(yes_asset_id, no_asset_id)` for `slug`, or None on any failure."""
+        snap = await self.resolve_snapshot(slug)
+        return snap.clob_token_ids if snap is not None else None
+
+    async def resolve_snapshot(self, slug: str) -> GammaMarketSnapshot | None:
+        """Return the full gamma snapshot for `slug`, or None on any failure."""
         if slug in self._cache:
             return self._cache[slug]
         # Per-slug lock coalesces concurrent requests for the same slug so we
@@ -50,7 +111,7 @@ class GammaTokenResolver:
             self._cache[slug] = result
             return result
 
-    async def _fetch(self, slug: str) -> tuple[str, str] | None:
+    async def _fetch(self, slug: str) -> GammaMarketSnapshot | None:
         try:
             resp = await self._client.get(_GAMMA_URL, params={"slug": slug})
             resp.raise_for_status()
@@ -65,7 +126,17 @@ class GammaTokenResolver:
         record = _first_record(data)
         if record is None:
             return None
-        return _parse_clob_token_ids(record.get("clobTokenIds"))
+        return GammaMarketSnapshot(
+            clob_token_ids=_parse_clob_token_ids(record.get("clobTokenIds")),
+            spread=_coerce_float(record.get("spread")),
+            one_day_price_change=_coerce_float(record.get("oneDayPriceChange")),
+            one_month_price_change=_coerce_float(record.get("oneMonthPriceChange")),
+            competitive=_coerce_float(record.get("competitive")),
+            liquidity_clob=_coerce_float(record.get("liquidityClob")),
+            volume_clob=_coerce_float(record.get("volumeClob")),
+            accepting_orders=_coerce_bool(record.get("acceptingOrders")),
+            enable_order_book=_coerce_bool(record.get("enableOrderBook")),
+        )
 
 
 async def list_gamma_events(

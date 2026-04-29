@@ -15,6 +15,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from skimsmarkets.clob import invert_sparkline as _invert_sparkline
 from skimsmarkets.unusual_whales.models import UnusualWhalesContext
 
 
@@ -104,20 +105,53 @@ def _team_aliases(team: dict[str, Any] | None) -> list[str]:
     return seen
 
 
+def _team_record(team: dict[str, Any] | None) -> str | None:
+    """Pull the W/L record string from a team dict, normalizing empty to None.
+
+    Polymarket populates `record` (e.g. "28-6") for real sports teams; for
+    futures-style "team" entries (player MVP candidates) the field is the
+    empty string — treat that as absence.
+    """
+    if not isinstance(team, dict):
+        return None
+    raw = team.get("record")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def _team_provider_ids(team: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return the team's external-provider ID list verbatim, or [] if absent.
+
+    Sportradar / DraftKings / etc. IDs land here as `[{"provider": "...",
+    "id": "..."}, ...]`. Kept as raw dicts for forward compatibility — we
+    don't currently consume them, but they unlock cross-vendor joins later.
+    """
+    if not isinstance(team, dict):
+        return []
+    raw = team.get("providerIds")
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
+
 def _extract_team_side(
     market_sides: Any,
     *,
     want_long: bool,
-) -> tuple[str | None, list[str]]:
-    """Pull the team label + alias list for one side (long=True → YES, False → NO).
+) -> tuple[str | None, list[str], str | None, list[dict[str, Any]]]:
+    """Pull the team label + alias list + record + providerIds for one side.
 
-    Returns (display_label, aliases). Display label is the `name` field (mascot
-    for team sports, person for individual sports); aliases carry every form
-    we know for matching. Both default to ``(None, [])`` when the requested
-    side isn't represented or the team record is missing.
+    `want_long=True` → YES side, `False` → NO side. Returns
+    `(display_label, aliases, record, provider_ids)`. Display label is the
+    `name` field (mascot for team sports, person for individual sports);
+    aliases carry every form we know for matching. Record is the team's
+    W/L string ("28-6") or None for futures placeholders. provider_ids is
+    the raw external-ID list. All default to absent values when the
+    requested side isn't represented or the team record is missing.
     """
     if not isinstance(market_sides, list):
-        return None, []
+        return None, [], None, []
     # Prefer explicit long=True/False flag; fall back to description=Yes/No.
     for side in market_sides:
         if not isinstance(side, dict):
@@ -126,7 +160,7 @@ def _extract_team_side(
             team = side.get("team")
             aliases = _team_aliases(team)
             display = aliases[0] if aliases else None
-            return display, aliases
+            return display, aliases, _team_record(team), _team_provider_ids(team)
     for side in market_sides:
         if not isinstance(side, dict):
             continue
@@ -134,8 +168,8 @@ def _extract_team_side(
             team = side.get("team")
             aliases = _team_aliases(team)
             display = aliases[0] if aliases else None
-            return display, aliases
-    return None, []
+            return display, aliases, _team_record(team), _team_provider_ids(team)
+    return None, [], None, []
 
 
 # Candidate field names for Polymarket's "when does the game START" timestamp.
@@ -169,9 +203,10 @@ class PolymarketMarket(BaseModel):
 
     Initial prices are parsed from the events.list snapshot (`outcomePrices` +
     `marketSides`) when present; the pipeline refreshes authoritative bid/ask
-    from `markets.bbo(slug)` for the sides it actually needs. Fields default to
-    None so an unfetched market is still representable (used while building the
-    side map before BBO is resolved).
+    + book depth + intraday stats from `markets.book(slug)` for the sides it
+    actually needs. Fields default to None so an unfetched market is still
+    representable (used while building the side map before the book is
+    resolved).
 
     `game_start_time` and `expected_expiration_time` are both captured because
     they serve different purposes: the former is the actual game time (used
@@ -208,15 +243,113 @@ class PolymarketMarket(BaseModel):
     yes_bid_dollars: float | None = None
     yes_ask_dollars: float | None = None
     last_trade_price_dollars: float | None = None
-    # Dollar volume is derived in `PolymarketClient.get_bbo` as `sharesTraded ×
-    # reference_price` — polymarket-us only exposes cumulative shares, not
-    # dollars. `liquidity_dollars` holds dollar OPEN INTEREST (outstanding shares
-    # × price), NOT order-book depth. The SDK doesn't publish book-depth dollars;
-    # user-facing renderers should label this field as "Open interest" to avoid
-    # implying "how much you can trade right now." Field name kept for backwards
-    # compatibility and to make room for a future real-liquidity feed.
+    # Number of distinct PRICE LEVELS on each side of the book (not contract
+    # counts at top — that lives in `yes_bid_size_top` / `yes_ask_size_top`).
+    # Empirical: BBO's `bidDepth`/`askDepth` exactly equal `len(bids)` /
+    # `len(offers)` from the book response. A 1-level book vs. a 7-level
+    # book tells a real story about how spread out the resting interest is.
+    # Inverted on the NO clone — depth is symmetric, just the side label flips.
+    yes_bid_depth: int | None = None
+    yes_ask_depth: int | None = None
+    # Top-of-book SIZE in contracts — the qty available to trade at exactly
+    # the best bid / best ask. From `bids[0].qty` / `offers[0].qty` on the
+    # book response. A `5/4` here vs `500/400` is the difference between
+    # "would move on a single fill" and "can absorb real flow."
+    yes_bid_size_top: float | None = None
+    yes_ask_size_top: float | None = None
+    # Total dollars resting across the entire visible book on each side
+    # (sum of `qty × px` across all levels). Includes far-out rest orders
+    # (e.g. $0.001 panic-buy bids) so it's a "what's everyone willing to
+    # do at any price" number, not a tight-spread depth measure.
+    yes_bid_book_dollars: float | None = None
+    yes_ask_book_dollars: float | None = None
+    # `MARKET_STATE_OPEN` / `…SUSPENDED` / `…HALTED` / `…MATCH_AND_CLOSE_AUCTION`
+    # / `…PREOPEN` / `…EXPIRED` / `…TERMINATED`. Authoritative tradability
+    # flag from the book response. `None` means we never fetched the book
+    # (e.g. offshore events go through `from_gamma()`, which has no analog).
+    market_state: str | None = None
+    # Intraday price stats from `marketData.stats` on the book response.
+    # `notional_traded_dollars` is the TRUE USD volume — Polymarket
+    # computes it as Σ(price_at_fill × qty), which captures price drift
+    # during the session that our derived `volume_dollars` (sharesTraded ×
+    # current ref price) does not. Prefer this over `volume_dollars` in
+    # renderers when present.
+    notional_traded_dollars: float | None = None
+    high_px_dollars: float | None = None
+    low_px_dollars: float | None = None
+    open_px_dollars: float | None = None
+    close_px_dollars: float | None = None
+    # Size on the most recent print, in contracts. A 5-share dust trade
+    # vs a 500-share rip carry very different information about that
+    # last_trade_price.
+    last_trade_qty: float | None = None
+    # Dollar volume is derived in `PolymarketClient.get_book` as
+    # `sharesTraded × reference_price` when `notional_traded_dollars` is
+    # absent. When present, `notional_traded_dollars` is the truth and
+    # this number falls back to it for backwards compat.
     volume_dollars: float | None = None
+    # `open_interest_dollars` is the canonical name for "outstanding shares ×
+    # price" — what user-facing renderers should read. `liquidity_dollars` is
+    # populated identically and kept as a backwards-compat alias for any
+    # external consumer (logs, downstream tools) that already reads the old
+    # field name. The misleading "liquidity" framing is what we're moving
+    # away from: this number is open interest, NOT order-book depth.
+    # Real CLOB liquidity arrives via `gamma_liquidity_dollars` below when
+    # the gamma piggyback fires.
+    open_interest_dollars: float | None = None
     liquidity_dollars: float | None = None
+    # Per-side W/L record string (e.g. "28-6"), pulled from
+    # `marketSides[].team.record`. Empty for futures-style "team" entries
+    # (player MVP candidates). Surfaced in the leaderboard side label so
+    # the user sees season form at a glance and specialists don't have to
+    # web-search for it.
+    team_record: str | None = None
+    # Raw external-provider ID list (sportradar / draftkings / etc.) for
+    # this side's team. Currently unconsumed; carried forward so future
+    # cross-vendor joins (injuries, lineups, advanced stats) don't need
+    # slug-fuzzing.
+    team_provider_ids: list[dict[str, Any]] = Field(default_factory=list)
+    # Gamma piggyback fields — populated by the pipeline only when the
+    # Unusual Whales gamma resolver runs (UW key set). Source:
+    # `gamma /markets?slug=` response, the same call the resolver already
+    # makes for clobTokenIds. All optional; None means "UW disabled" or
+    # "gamma had no matching market." Naming uses a `gamma_` prefix so the
+    # source is obvious in the JSONL log and so we don't shadow our own
+    # derived `volume_dollars` / `open_interest_dollars`.
+    gamma_spread: float | None = None
+    gamma_one_day_price_change: float | None = None
+    gamma_one_month_price_change: float | None = None
+    gamma_competitive: float | None = None
+    # `gamma_liquidity_dollars` is gamma's `liquidityClob` — the *real*
+    # CLOB order-book liquidity in dollars, distinct from our derived
+    # `open_interest_dollars`. Renderers can show both side-by-side so
+    # the LLM sees "how much sits on the book" and "how much is held" as
+    # separate signals.
+    gamma_liquidity_dollars: float | None = None
+    gamma_volume_dollars: float | None = None
+    gamma_accepting_orders: bool | None = None
+    # CLOB price-history enrichment fields — populated only when the
+    # pipeline's `enrich_price_history` stage runs (gated by
+    # `CLOB_HISTORY_ENABLED`). Source: `clob.polymarket.com/prices-history`.
+    # Naming uses a `clob_` prefix so the source is unambiguous in JSONL
+    # logs and so we don't shadow gamma's `gamma_one_day_price_change`
+    # (different windowing — gamma's value is publisher-defined; CLOB
+    # values are computed by us from a fixed sample-and-window).
+    # Scalars are signed price moves over the named window (positive =
+    # YES side moved up). On NO clones they're sign-flipped via
+    # `inverted_no_side`.
+    clob_price_change_30m: float | None = None
+    clob_price_change_1h: float | None = None
+    clob_price_change_4h: float | None = None
+    clob_price_change_24h: float | None = None
+    # Pre-formatted N-point sparkline string (e.g. `"0.520→0.554→0.601"`)
+    # ready for direct insertion into LLM context. NO clone carries the
+    # `1 - p` inverted version.
+    clob_price_path_sparkline: str | None = None
+    # Raw `(epoch_seconds, mid_price)` points kept for backtest / debug
+    # consumers. Never rendered to LLM context — too verbose. NO clone
+    # carries the `(t, 1 - p)` inverted version.
+    clob_price_history: list[tuple[int, float]] | None = None
     game_start_time: datetime | None = None
     expected_expiration_time: datetime | None = None
 
@@ -224,8 +357,29 @@ class PolymarketMarket(BaseModel):
         "yes_bid_dollars",
         "yes_ask_dollars",
         "last_trade_price_dollars",
+        "yes_bid_size_top",
+        "yes_ask_size_top",
+        "yes_bid_book_dollars",
+        "yes_ask_book_dollars",
+        "notional_traded_dollars",
+        "high_px_dollars",
+        "low_px_dollars",
+        "open_px_dollars",
+        "close_px_dollars",
+        "last_trade_qty",
         "volume_dollars",
+        "open_interest_dollars",
         "liquidity_dollars",
+        "gamma_spread",
+        "gamma_one_day_price_change",
+        "gamma_one_month_price_change",
+        "gamma_competitive",
+        "gamma_liquidity_dollars",
+        "gamma_volume_dollars",
+        "clob_price_change_30m",
+        "clob_price_change_1h",
+        "clob_price_change_4h",
+        "clob_price_change_24h",
         mode="before",
     )
     @classmethod
@@ -256,14 +410,23 @@ class PolymarketMarket(BaseModel):
             return data
         data = dict(data)  # shallow copy; don't mutate caller's dict
 
-        if data.get("yes_sub_title") is None or not data.get("team_aliases"):
-            display, aliases = _extract_team_side(
+        if (
+            data.get("yes_sub_title") is None
+            or not data.get("team_aliases")
+            or data.get("team_record") is None
+            or not data.get("team_provider_ids")
+        ):
+            display, aliases, record, provider_ids = _extract_team_side(
                 data.get("marketSides"), want_long=True
             )
             if data.get("yes_sub_title") is None and display:
                 data["yes_sub_title"] = display
             if not data.get("team_aliases") and aliases:
                 data["team_aliases"] = aliases
+            if data.get("team_record") is None and record:
+                data["team_record"] = record
+            if not data.get("team_provider_ids") and provider_ids:
+                data["team_provider_ids"] = provider_ids
 
         if data.get("sports_market_type") is None and data.get("sportsMarketType"):
             data["sports_market_type"] = data["sportsMarketType"]
@@ -298,14 +461,24 @@ class PolymarketMarket(BaseModel):
         return data
 
     def inverted_no_side(
-        self, no_display: str, no_aliases: list[str]
+        self,
+        no_display: str,
+        no_aliases: list[str],
+        *,
+        no_record: str | None = None,
+        no_provider_ids: list[dict[str, Any]] | None = None,
     ) -> "PolymarketMarket":
         """Return a sibling market record representing the NO direction.
 
         Same slug, team aliases swapped to the NO-side team, bid/ask inverted
-        so the consumer sees "price to buy this team" directly. Kept as a
-        method so the PolymarketEvent validator can derive NO-side records
-        without rebuilding the full model state by hand.
+        so the consumer sees "price to buy this team" directly. Top-of-book
+        depth is also swapped (the bid stack of the YES book is the ask stack
+        of the implied NO book and vice versa — depth is symmetric, no
+        `1 - x` flip). Gamma fields (`spread`, `1d`, `competitive`,
+        `liquidityClob`) are market-level not side-directional, so they
+        carry through unchanged. Kept as a method so the PolymarketEvent
+        validator can derive NO-side records without rebuilding the full
+        model state by hand.
         """
         inv_bid = (
             1.0 - self.yes_ask_dollars if self.yes_ask_dollars is not None else None
@@ -318,10 +491,62 @@ class PolymarketMarket(BaseModel):
                 "is_no_side": True,
                 "yes_sub_title": no_display,
                 "team_aliases": no_aliases,
+                "team_record": no_record,
+                "team_provider_ids": no_provider_ids or [],
                 "yes_bid_dollars": inv_bid,
                 "yes_ask_dollars": inv_ask,
+                # All depth-style fields swap sides — the YES bid book IS the
+                # implied NO ask book and vice versa. None of them need a
+                # `1 - x` flip; only prices do.
+                "yes_bid_depth": self.yes_ask_depth,
+                "yes_ask_depth": self.yes_bid_depth,
+                "yes_bid_size_top": self.yes_ask_size_top,
+                "yes_ask_size_top": self.yes_bid_size_top,
+                "yes_bid_book_dollars": self.yes_ask_book_dollars,
+                "yes_ask_book_dollars": self.yes_bid_book_dollars,
+                # Intraday range fields are session-level (not side-directional)
+                # but they describe the YES price trajectory — drop on the NO
+                # clone rather than try to invert (`1 - high_px` is meaningless
+                # when high and low were set at different timestamps).
+                "high_px_dollars": None,
+                "low_px_dollars": None,
+                "open_px_dollars": None,
+                "close_px_dollars": None,
                 # last_trade is directional — drop it on the NO clone to avoid misleading display.
                 "last_trade_price_dollars": None,
+                "last_trade_qty": None,
+                # CLOB scalars are signed price moves of the YES side over
+                # a window — the implied NO move is the negation. Sparkline
+                # and raw history get value-inverted (`1 - p`) so the NO
+                # series tells the same story from the NO side.
+                "clob_price_change_30m": (
+                    -self.clob_price_change_30m
+                    if self.clob_price_change_30m is not None
+                    else None
+                ),
+                "clob_price_change_1h": (
+                    -self.clob_price_change_1h
+                    if self.clob_price_change_1h is not None
+                    else None
+                ),
+                "clob_price_change_4h": (
+                    -self.clob_price_change_4h
+                    if self.clob_price_change_4h is not None
+                    else None
+                ),
+                "clob_price_change_24h": (
+                    -self.clob_price_change_24h
+                    if self.clob_price_change_24h is not None
+                    else None
+                ),
+                "clob_price_path_sparkline": _invert_sparkline(
+                    self.clob_price_path_sparkline
+                ),
+                "clob_price_history": (
+                    [(t, 1.0 - p) for t, p in self.clob_price_history]
+                    if self.clob_price_history is not None
+                    else None
+                ),
             }
         )
 
@@ -376,7 +601,7 @@ class PolymarketEvent(BaseModel):
     # populated only by `from_gamma()` for events that don't list on US.
     # Different liquidity pools, so the leaderboard renders the venue tag and
     # `resolve_market_prices` skips offshore events (gamma already returned
-    # bid/ask on the events.list payload — there's no markets.bbo() analog).
+    # bid/ask on the events.list payload — there's no markets.book() analog).
     venue: Literal["us", "offshore"] = "us"
     # Attached post-validation by `resolve_unusual_whales()` when UW is enabled
     # and this event's YES-side asset_id resolved to an UW-tracked market.
@@ -444,8 +669,12 @@ class PolymarketEvent(BaseModel):
                 if not isinstance(raw, dict):
                     continue
                 sides = raw.get("marketSides")
-                yes_display, yes_aliases = _extract_team_side(sides, want_long=True)
-                no_display, no_aliases = _extract_team_side(sides, want_long=False)
+                yes_display, yes_aliases, _yes_record, _yes_provider_ids = (
+                    _extract_team_side(sides, want_long=True)
+                )
+                no_display, no_aliases, no_record, no_provider_ids = (
+                    _extract_team_side(sides, want_long=False)
+                )
                 # Only expand when both sides carry a DIFFERENT team (head-to-
                 # head). MVP-style futures have the same team on both sides —
                 # those stay as a single record.
@@ -459,6 +688,8 @@ class PolymarketEvent(BaseModel):
                     "title": raw.get("title"),
                     "yes_sub_title": no_display,
                     "team_aliases": no_aliases,
+                    "team_record": no_record,
+                    "team_provider_ids": no_provider_ids,
                     "sports_market_type": raw.get("sportsMarketType"),
                     "is_no_side": True,
                     # Invert prices when we have both halves; otherwise leave None.
@@ -470,6 +701,9 @@ class PolymarketEvent(BaseModel):
                     ),
                     # Carry forward time + volume signals; last_trade is YES-directional so skip.
                     "volume_dollars": raw.get("volume"),
+                    # Populate both naming variants from the same source so
+                    # the legacy field stays valid for older readers.
+                    "open_interest_dollars": raw.get("liquidity"),
                     "liquidity_dollars": raw.get("liquidity"),
                     "gameStartTime": raw.get("gameStartTime")
                     or raw.get("startTime")
@@ -624,6 +858,12 @@ class PolymarketEvent(BaseModel):
             label = raw.get("groupItemTitle") or raw.get("question")
             if not isinstance(label, str) or not label:
                 continue
+            # Gamma payloads carry the same supplementary fields the US-path
+            # piggyback pulls from `gamma /markets?slug=` — we already have
+            # them on this dict, so populate the gamma_* fields directly
+            # instead of forcing offshore events through a separate fetch.
+            oi_dollars = _coerce_float(raw.get("liquidity"))
+            accepting = raw.get("acceptingOrders")
             markets.append(
                 PolymarketMarket(
                     slug=m_slug,
@@ -639,7 +879,21 @@ class PolymarketEvent(BaseModel):
                     yes_ask_dollars=ask,
                     last_trade_price_dollars=_coerce_float(raw.get("lastTradePrice")),
                     volume_dollars=_coerce_float(raw.get("volume")),
-                    liquidity_dollars=_coerce_float(raw.get("liquidity")),
+                    open_interest_dollars=oi_dollars,
+                    liquidity_dollars=oi_dollars,
+                    gamma_spread=_coerce_float(raw.get("spread")),
+                    gamma_one_day_price_change=_coerce_float(
+                        raw.get("oneDayPriceChange")
+                    ),
+                    gamma_one_month_price_change=_coerce_float(
+                        raw.get("oneMonthPriceChange")
+                    ),
+                    gamma_competitive=_coerce_float(raw.get("competitive")),
+                    gamma_liquidity_dollars=_coerce_float(raw.get("liquidityClob")),
+                    gamma_volume_dollars=_coerce_float(raw.get("volumeClob")),
+                    gamma_accepting_orders=(
+                        bool(accepting) if isinstance(accepting, bool) else None
+                    ),
                     game_start_time=game_time,
                     expected_expiration_time=_coerce_time(raw.get("endDate")),
                 )

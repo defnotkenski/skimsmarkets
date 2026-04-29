@@ -10,6 +10,7 @@ prompt.
 
 from skimsmarkets.unusual_whales.client import UnusualWhalesClient
 from skimsmarkets.unusual_whales.gamma import (
+    GammaMarketSnapshot,
     GammaTokenResolver,
     fetch_gamma_event,
     list_gamma_events,
@@ -25,6 +26,7 @@ from skimsmarkets.unusual_whales.models import (
 from skimsmarkets.unusual_whales.rendering import render_uw_block
 
 __all__ = [
+    "GammaMarketSnapshot",
     "GammaTokenResolver",
     "UWInsider",
     "UWLiquidity",

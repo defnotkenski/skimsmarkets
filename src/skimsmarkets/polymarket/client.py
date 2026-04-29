@@ -54,6 +54,29 @@ def _coerce_float_safe(v: Any) -> float | None:
         return None
 
 
+def _parse_book_side(levels: Any) -> list[tuple[float, float]]:
+    """Turn a list of `{px: {value, currency}, qty: "..."}` levels into
+    `(price, qty)` float tuples, dropping any level with unparseable parts.
+
+    Order is preserved — the SDK returns bids best-first (highest price)
+    and offers best-first (lowest price), and downstream consumers
+    (`bid_levels[0]` → top of book, `sum(qty × px)` → full-book dollars)
+    rely on that ordering.
+    """
+    if not isinstance(levels, list):
+        return []
+    out: list[tuple[float, float]] = []
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        px = _coerce_float_safe(_extract_value(level, "px"))
+        qty = _coerce_float_safe(level.get("qty"))
+        if px is None or qty is None:
+            continue
+        out.append((px, qty))
+    return out
+
+
 def _reference_price(
     bid: Any, ask: Any, last: Any
 ) -> float | None:
@@ -159,25 +182,33 @@ class PolymarketClient:
             events.append(ev)
         return events
 
-    async def get_bbo(self, market_slug: str) -> PolymarketMarket | None:
-        """Fetch best bid/offer for a market and return a PolymarketMarket.
+    async def get_book(self, market_slug: str) -> PolymarketMarket | None:
+        """Fetch the order book for a market and return a PolymarketMarket.
+
+        Why `markets.book` instead of `markets.bbo`: the book response is a
+        strict superset of BBO — same one HTTP call, but it also carries the
+        full bids/offers ladders, intraday `stats` (open/high/low/close +
+        `notionalTraded`, the *true* USD volume), an authoritative `state`
+        flag (OPEN / SUSPENDED / HALTED / …) and `lastTradeQty`. See
+        `/tmp/skimsmarkets_probes/poly_us_markets_book.json` for the shape.
 
         Returns None if the call fails or the response shape isn't recognizable
-        — callers should treat None as "no live BBO" and fall back to whatever
+        — callers should treat None as "no live book" and fall back to whatever
         snapshot prices the events.list response already carried.
 
-        Dollar volume / open interest: polymarket-us publishes `sharesTraded`
-        (cumulative shares traded) and `openInterest` (outstanding shares) —
-        neither as dollar figures. We derive dollar values by multiplying by a
-        reference price (mid of bid/ask, falling back to last/bid/ask). The
-        resulting `liquidity_dollars` is dollar OPEN INTEREST, not order-book
-        liquidity; the field name is kept for backwards compatibility but
-        callers that render it to users should label it "Open interest."
+        Dollar volume: when `notionalTraded` is present we use it as
+        `volume_dollars` directly (Polymarket's own Σ(price_at_fill × qty),
+        which captures intraday price drift). When absent, we fall back to
+        the legacy `sharesTraded × reference_price` derivation.
+
+        `open_interest_dollars` continues to mean "outstanding shares × ref
+        price" — a market-size measure, NOT order-book depth. Real book
+        depth is `yes_bid_book_dollars` / `yes_ask_book_dollars`.
         """
         try:
-            raw = await self._sdk.markets.bbo(market_slug)
+            raw = await self._sdk.markets.book(market_slug)
         except Exception as e:  # noqa: BLE001
-            log.warning("polymarket bbo(%s) failed: %s", market_slug, e)
+            log.warning("polymarket book(%s) failed: %s", market_slug, e)
             return None
         if raw is None:
             return None
@@ -185,19 +216,52 @@ class PolymarketClient:
         if md is None:
             # Some SDK shapes flatten it; try the raw response.
             md = raw if isinstance(raw, dict) else {}
-        bid = _extract_value(md, "bestBid")
-        ask = _extract_value(md, "bestAsk")
-        last = _extract_value(md, "lastTradePrice")
+        if not isinstance(md, dict):
+            return None
+        stats = md.get("stats") if isinstance(md.get("stats"), dict) else {}
 
-        shares_traded = _coerce_float_safe(md.get("sharesTraded")) if isinstance(md, dict) else None
-        open_interest = _coerce_float_safe(md.get("openInterest")) if isinstance(md, dict) else None
-        ref_price = _reference_price(bid, ask, last)
-        volume_dollars = (
-            shares_traded * ref_price
-            if shares_traded is not None and ref_price is not None
-            else None
+        # Best bid/ask come from the top of the bids/offers ladders. The
+        # ladders are sorted best-first (highest bid first, lowest ask
+        # first), and each level is `{px: {value, currency}, qty: "..."}`.
+        bids_raw = md.get("bids") if isinstance(md.get("bids"), list) else []
+        offers_raw = md.get("offers") if isinstance(md.get("offers"), list) else []
+        bid_levels = _parse_book_side(bids_raw)
+        ask_levels = _parse_book_side(offers_raw)
+        bid = bid_levels[0][0] if bid_levels else None
+        ask = ask_levels[0][0] if ask_levels else None
+        bid_size_top = bid_levels[0][1] if bid_levels else None
+        ask_size_top = ask_levels[0][1] if ask_levels else None
+        # Total $ resting on each side across all visible levels.
+        bid_book_dollars = (
+            sum(px * qty for px, qty in bid_levels) if bid_levels else None
         )
-        liquidity_dollars = (
+        ask_book_dollars = (
+            sum(px * qty for px, qty in ask_levels) if ask_levels else None
+        )
+
+        last = _extract_value(stats, "lastTradePx")
+        # Intraday range — all four are value-wrapped Amounts in `stats`.
+        high_px = _extract_value(stats, "highPx")
+        low_px = _extract_value(stats, "lowPx")
+        open_px = _extract_value(stats, "openPx")
+        close_px = _extract_value(stats, "closePx")
+        last_trade_qty = _coerce_float_safe(stats.get("lastTradeQty"))
+        # `notionalTraded` is value-wrapped; `sharesTraded` and `openInterest`
+        # are bare strings (legacy from the BBO shape).
+        notional_traded = _coerce_float_safe(_extract_value(stats, "notionalTraded"))
+        shares_traded = _coerce_float_safe(stats.get("sharesTraded"))
+        open_interest = _coerce_float_safe(stats.get("openInterest"))
+        state = md.get("state") if isinstance(md.get("state"), str) else None
+
+        ref_price = _reference_price(bid, ask, last)
+        # Prefer the true notional Polymarket computed; only derive from
+        # shares × ref when notional isn't published. The derived number
+        # is wrong whenever price moved during the session — see
+        # PolymarketMarket field comments.
+        volume_dollars = notional_traded
+        if volume_dollars is None and shares_traded is not None and ref_price is not None:
+            volume_dollars = shares_traded * ref_price
+        oi_dollars = (
             open_interest * ref_price
             if open_interest is not None and ref_price is not None
             else None
@@ -207,9 +271,23 @@ class PolymarketClient:
             slug=market_slug,
             yes_bid_dollars=bid,
             yes_ask_dollars=ask,
+            yes_bid_depth=len(bid_levels) if bid_levels else None,
+            yes_ask_depth=len(ask_levels) if ask_levels else None,
+            yes_bid_size_top=bid_size_top,
+            yes_ask_size_top=ask_size_top,
+            yes_bid_book_dollars=bid_book_dollars,
+            yes_ask_book_dollars=ask_book_dollars,
+            market_state=state,
             last_trade_price_dollars=last,
+            last_trade_qty=last_trade_qty,
+            notional_traded_dollars=notional_traded,
+            high_px_dollars=high_px,
+            low_px_dollars=low_px,
+            open_px_dollars=open_px,
+            close_px_dollars=close_px,
             volume_dollars=volume_dollars,
-            liquidity_dollars=liquidity_dollars,
+            open_interest_dollars=oi_dollars,
+            liquidity_dollars=oi_dollars,
         )
 
     @staticmethod

@@ -79,16 +79,118 @@ def render_context(event: PolymarketEvent) -> str:
         ask = f"${m.yes_ask_dollars:.3f}" if m.yes_ask_dollars is not None else "?"
         implied_str = f"{implied:.3f}" if implied is not None else "unknown"
         extras: list[str] = []
+        # State first — when not OPEN it's load-bearing (don't trust the
+        # price). When OPEN, omit to keep the line tight; absence implies
+        # nominal tradability.
+        if m.market_state and m.market_state != "MARKET_STATE_OPEN":
+            # Strip the `MARKET_STATE_` prefix so the LLM sees a clean tag
+            # like `SUSPENDED` / `HALTED` / `MATCH_AND_CLOSE_AUCTION`.
+            extras.append(f"state={m.market_state.removeprefix('MARKET_STATE_')}")
         if m.yes_bid_dollars is not None and m.yes_ask_dollars is not None:
             spread_bps = int(round((m.yes_ask_dollars - m.yes_bid_dollars) * 10000))
             extras.append(f"spread={spread_bps}bps")
+        if m.yes_bid_size_top is not None or m.yes_ask_size_top is not None:
+            # `size=B/A` is top-of-book contracts (the qty available at the
+            # exact best bid / best ask). One-sided books and very thin
+            # two-sided books are a strong low-confidence signal even when
+            # both bid and ask are quoted. This replaces the older
+            # `depth=` line — price-level counts (`yes_bid_depth`) are
+            # weaker signal than actual contracts at top.
+            bs = (
+                f"{m.yes_bid_size_top:.0f}"
+                if m.yes_bid_size_top is not None
+                else "?"
+            )
+            asz = (
+                f"{m.yes_ask_size_top:.0f}"
+                if m.yes_ask_size_top is not None
+                else "?"
+            )
+            extras.append(f"size={bs}/{asz}")
+        if (
+            m.yes_bid_book_dollars is not None
+            or m.yes_ask_book_dollars is not None
+        ):
+            # `book=$B/A` is total $ resting across the entire visible
+            # ladder on each side. Together with `size` it tells "how
+            # much at top" and "how much across all levels." Distinct
+            # from gamma's `liq` (which is a single market-level number).
+            bb = (
+                f"${m.yes_bid_book_dollars:,.0f}"
+                if m.yes_bid_book_dollars is not None
+                else "$?"
+            )
+            ab = (
+                f"${m.yes_ask_book_dollars:,.0f}"
+                if m.yes_ask_book_dollars is not None
+                else "$?"
+            )
+            extras.append(f"book={bb}/{ab}")
+        if (
+            m.open_px_dollars is not None
+            and m.yes_bid_dollars is not None
+            and m.yes_ask_dollars is not None
+        ):
+            # Session sentiment in one number: how much has the price moved
+            # since the open. Positive = market bid this side up over the
+            # session; near-zero = stable consensus. Drop on NO-side clones
+            # (open_px is YES-trajectory).
+            mid = (m.yes_bid_dollars + m.yes_ask_dollars) / 2.0
+            extras.append(f"from_open={mid - m.open_px_dollars:+.3f}")
+        if (
+            m.high_px_dollars is not None
+            and m.low_px_dollars is not None
+        ):
+            # Intraday range as a vol proxy. Wide range (e.g. `range=0.10`)
+            # on a market priced near 0.50 means the price has been
+            # contested today; narrow range means consensus.
+            extras.append(
+                f"range={m.high_px_dollars - m.low_px_dollars:.3f}"
+            )
+        if m.last_trade_qty is not None and m.last_trade_price_dollars is not None:
+            # Size on the most recent print. A 5-share dust trade vs a
+            # 500-share rip carry very different information about
+            # last_trade_price. Drop on NO clone (directional).
+            extras.append(f"last_qty={m.last_trade_qty:.0f}")
         if m.volume_dollars is not None:
             extras.append(f"vol=${m.volume_dollars:,.0f}")
-        if m.liquidity_dollars is not None:
-            # Labeled "oi" (open interest) because polymarket-us doesn't
-            # publish order-book liquidity as a dollar figure — what we have
-            # is dollar open interest, not "how much can I trade right now."
-            extras.append(f"oi=${m.liquidity_dollars:,.0f}")
+        if m.open_interest_dollars is not None:
+            # Labeled "oi" (open interest) — outstanding shares × price, NOT
+            # order-book depth. Polymarket's real CLOB liquidity arrives via
+            # `liq=$...` below when the gamma piggyback ran.
+            extras.append(f"oi=${m.open_interest_dollars:,.0f}")
+        if m.gamma_liquidity_dollars is not None:
+            # `liq` is gamma's `liquidityClob` — the actual dollars sitting
+            # on the order book, distinct from `oi` (open interest). Both
+            # are surfaced so the LLM sees "how much is held" and "how much
+            # can I trade right now" as separate signals.
+            extras.append(f"liq=${m.gamma_liquidity_dollars:,.0f}")
+        if m.gamma_one_day_price_change is not None:
+            # Signed price move over the past 24h in dollars. Positive ≈
+            # smart money pushed the line up; near-zero ≈ stable consensus.
+            extras.append(f"1d={m.gamma_one_day_price_change:+.3f}")
+        if m.gamma_competitive is not None:
+            # Polymarket's own competitiveness score (0..1, higher = more
+            # contested). Worth surfacing for the LLM to factor in.
+            extras.append(f"comp={m.gamma_competitive:.2f}")
+        if m.team_record:
+            # W/L record for this side's team (e.g. "28-6"). Saves the
+            # specialist a web-search round trip for season form.
+            extras.append(f"record={m.team_record}")
+        # CLOB price-history extras. `path=` is a 5-point sparkline of the
+        # past ~24h (e.g. `0.520→0.554→0.601→0.612→0.620`) — captures the
+        # *shape* of the move, distinct from the scalar `1d=` (gamma) and
+        # the recency-windowed scalars below. Order: longest → shortest so
+        # the LLM can read "session move was X, last 4h was Y, last hour
+        # was Z" as a recency funnel.
+        if m.clob_price_path_sparkline:
+            extras.append(f"path={m.clob_price_path_sparkline}")
+        if m.clob_price_change_4h is not None:
+            extras.append(f"4h={m.clob_price_change_4h:+.3f}")
+        if m.clob_price_change_1h is not None:
+            extras.append(f"1h={m.clob_price_change_1h:+.3f}")
+        if m.clob_price_change_30m is not None:
+            extras.append(f"30m={m.clob_price_change_30m:+.3f}")
         # [NO side, inverted] flags head-to-head markets where this side's prices
         # were derived by inverting the slug's YES book. Keep readers aware that
         # the numbers came from that flip, not a directly-quoted second market.

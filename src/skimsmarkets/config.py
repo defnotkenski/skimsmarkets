@@ -25,6 +25,20 @@ UW_FETCH_SEM = 8
 # when the user passes `--gamma-slug` on the CLI; one call per requested slug.
 # Same conservative ceiling as UW since both ride the same public gamma host.
 GAMMA_FETCH_SEM = 8
+# CLOB price-history fetch (clob.polymarket.com `/prices-history?market=…`).
+# Fires once per unique slug when `CLOB_HISTORY_ENABLED` (below) is True;
+# same conservative ceiling as UW. Public, unauthed endpoint, but we hedge
+# against unannounced rate limits.
+CLOB_FETCH_SEM = 8
+
+# Opt-in CLOB price-history enrichment toggle. When True, the pipeline
+# fetches ~24h of mid-price points per unique slug from `clob.polymarket.com`
+# and attaches a sparkline + recency-windowed scalars (30m/1h/4h/24h) to
+# each market for the director's context. Adds one HTTP call per unique
+# slug. Flip to True here when you want the enrichment on; no env var is
+# read for this, the source-of-truth lives in this file so the setting is
+# visible in code review and easily greppable.
+CLOB_HISTORY_ENABLED = True
 
 
 @dataclass(frozen=True)

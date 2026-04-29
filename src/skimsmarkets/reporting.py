@@ -103,12 +103,21 @@ def print_events_table(
             else "—"
         )
         side_label = (m.yes_sub_title or "—")[:30]
+        # Append the team's W/L record inline ("Cavaliers (28-6)") rather
+        # than adding a column — keeps the table width manageable and
+        # ties the record to the side it belongs to.
+        if m.team_record:
+            side_label += f" ({m.team_record})"
         if m.is_no_side:
             side_label += " [NO]"
         # Mark offshore rows so the user doesn't mistake them for US-tradable
         # markets — the prices come from a different liquidity pool.
         if ev.venue == "offshore":
             side_label += f" [{_PEACH}][OFFSHORE][/]"
+        # Read the canonical `open_interest_dollars` field. The legacy
+        # `liquidity_dollars` alias still exists on the model for any
+        # external consumer that hasn't migrated, but in-tree readers
+        # should prefer the unambiguous name.
         table.add_row(
             ev.series_slug or "—",
             (ev.title or ev.id)[:40],
@@ -116,7 +125,11 @@ def print_events_table(
             bidask,
             f"{implied:.2f}" if implied is not None else "—",
             f"${m.volume_dollars:,.0f}" if m.volume_dollars is not None else "—",
-            f"${m.liquidity_dollars:,.0f}" if m.liquidity_dollars is not None else "—",
+            (
+                f"${m.open_interest_dollars:,.0f}"
+                if m.open_interest_dollars is not None
+                else "—"
+            ),
             _rel_time(m.game_start_time),
         )
 
