@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 from anthropic import AsyncAnthropic
@@ -423,6 +425,48 @@ async def _run_specialists(
     return reports
 
 
+# Logs live at <repo-root>/logs/runs/<run_id>.jsonl. Resolved at module-load
+# so behaviour doesn't drift with cwd. `parents[2]` walks
+# src/skimsmarkets/pipeline.py → src/skimsmarkets → src → repo-root.
+_LOG_ROOT = Path(__file__).resolve().parents[2] / "logs" / "runs"
+
+
+def _persist_run(result: RunResult) -> None:
+    """Write each prediction (with its entry decision) to a per-run JSONL.
+
+    One file per run named `<run_id>.jsonl`. Best-effort: any I/O failure is
+    logged and swallowed — persistence must never abort the run, matching the
+    enrichment-stage posture.
+
+    Why JSONL not parquet: lines are easy to tail, easy to grep, easy to feed
+    into a future grading script that joins against gamma settlement after
+    kickoff. Volume is tiny (one line per ranked event, ~30/day).
+    """
+    try:
+        _LOG_ROOT.mkdir(parents=True, exist_ok=True)
+        path = _LOG_ROOT / f"{result.run_id}.jsonl"
+        logged_at = datetime.now(UTC).isoformat()
+        with path.open("w") as f:
+            for p in result.predictions:
+                payload = {
+                    "run_id": result.run_id,
+                    "logged_at_utc": logged_at,
+                    "event_id": p.event_id,
+                    "event_title": p.event_title,
+                    "market_slug": p.market_slug,
+                    "venue": p.venue,
+                    "predicted_winner": p.predicted_winner,
+                    "predicted_yes_probability": p.predicted_yes_probability,
+                    "polymarket_implied_probability": p.polymarket_implied_probability,
+                    "confidence": p.confidence,
+                    "headline": p.headline,
+                }
+                f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        log.info("persisted %d predictions to %s", len(result.predictions), path)
+    except Exception as e:  # noqa: BLE001
+        log.warning("run-log persistence failed: %s", e)
+
+
 async def process_event(
     xai: XAIAsyncClient,
     anthropic: AsyncAnthropic,
@@ -554,4 +598,6 @@ async def run_pipeline(
             if p is not None:
                 result.predictions.append(p)
 
+    if result.predictions:
+        _persist_run(result)
     return result

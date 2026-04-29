@@ -32,3 +32,10 @@ CLAUDE.md
 
 # OS
 .DS_Store
+
+# Backtest data cache (gamma events, CLOB price history, parquet)
+backtest_cache/
+BACKTEST_REPORT.md
+
+# Per-run JSONL logs (director predictions + entry decisions)
+logs/
