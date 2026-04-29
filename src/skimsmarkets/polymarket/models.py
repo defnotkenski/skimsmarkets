@@ -855,49 +855,73 @@ class PolymarketEvent(BaseModel):
                 # Mirror the US tradability filter — drop sides without a
                 # live two-sided book.
                 continue
-            label = raw.get("groupItemTitle") or raw.get("question")
-            if not isinstance(label, str) or not label:
-                continue
+            # Side-label resolution. Soccer-style gamma events split each
+            # outcome into its own market with `groupItemTitle` set per side
+            # (e.g. "Real Madrid" / "Barcelona" / "Draw"). Non-soccer
+            # head-to-heads (ATP, UFC, etc.) instead expose a SINGLE binary
+            # market with `groupItemTitle: None` and the question carrying
+            # both names ("Tournament: Player A vs Player B"). When we see
+            # the latter shape, parse player names from the question and
+            # synthesize a NO clone — same shape the US head-to-head path
+            # produces via `_pull_event_aliases`.
+            group_item = raw.get("groupItemTitle")
+            h2h: tuple[str, str] | None = None
+            if not (isinstance(group_item, str) and group_item):
+                h2h = _parse_h2h_question(raw.get("question"))
+            if h2h is not None:
+                yes_label, no_label = h2h
+            else:
+                fallback = group_item or raw.get("question")
+                if not isinstance(fallback, str) or not fallback:
+                    continue
+                yes_label = fallback
+                no_label = None
             # Gamma payloads carry the same supplementary fields the US-path
             # piggyback pulls from `gamma /markets?slug=` — we already have
             # them on this dict, so populate the gamma_* fields directly
             # instead of forcing offshore events through a separate fetch.
             oi_dollars = _coerce_float(raw.get("liquidity"))
             accepting = raw.get("acceptingOrders")
-            markets.append(
-                PolymarketMarket(
-                    slug=m_slug,
-                    id=str(raw.get("id")) if raw.get("id") is not None else None,
-                    title=raw.get("question"),
-                    yes_sub_title=label,
-                    team_aliases=[label],
-                    # Synthesized: gamma omits sportsMarketType, but the slug
-                    # filter above keeps only moneyline-style outcomes.
-                    sports_market_type="moneyline",
-                    is_no_side=False,
-                    yes_bid_dollars=bid,
-                    yes_ask_dollars=ask,
-                    last_trade_price_dollars=_coerce_float(raw.get("lastTradePrice")),
-                    volume_dollars=_coerce_float(raw.get("volume")),
-                    open_interest_dollars=oi_dollars,
-                    liquidity_dollars=oi_dollars,
-                    gamma_spread=_coerce_float(raw.get("spread")),
-                    gamma_one_day_price_change=_coerce_float(
-                        raw.get("oneDayPriceChange")
-                    ),
-                    gamma_one_month_price_change=_coerce_float(
-                        raw.get("oneMonthPriceChange")
-                    ),
-                    gamma_competitive=_coerce_float(raw.get("competitive")),
-                    gamma_liquidity_dollars=_coerce_float(raw.get("liquidityClob")),
-                    gamma_volume_dollars=_coerce_float(raw.get("volumeClob")),
-                    gamma_accepting_orders=(
-                        bool(accepting) if isinstance(accepting, bool) else None
-                    ),
-                    game_start_time=game_time,
-                    expected_expiration_time=_coerce_time(raw.get("endDate")),
-                )
+            yes_market = PolymarketMarket(
+                slug=m_slug,
+                id=str(raw.get("id")) if raw.get("id") is not None else None,
+                title=raw.get("question"),
+                yes_sub_title=yes_label,
+                team_aliases=[yes_label],
+                # Synthesized: gamma omits sportsMarketType, but the slug
+                # filter above keeps only moneyline-style outcomes.
+                sports_market_type="moneyline",
+                is_no_side=False,
+                yes_bid_dollars=bid,
+                yes_ask_dollars=ask,
+                last_trade_price_dollars=_coerce_float(raw.get("lastTradePrice")),
+                volume_dollars=_coerce_float(raw.get("volume")),
+                open_interest_dollars=oi_dollars,
+                liquidity_dollars=oi_dollars,
+                gamma_spread=_coerce_float(raw.get("spread")),
+                gamma_one_day_price_change=_coerce_float(
+                    raw.get("oneDayPriceChange")
+                ),
+                gamma_one_month_price_change=_coerce_float(
+                    raw.get("oneMonthPriceChange")
+                ),
+                gamma_competitive=_coerce_float(raw.get("competitive")),
+                gamma_liquidity_dollars=_coerce_float(raw.get("liquidityClob")),
+                gamma_volume_dollars=_coerce_float(raw.get("volumeClob")),
+                gamma_accepting_orders=(
+                    bool(accepting) if isinstance(accepting, bool) else None
+                ),
+                game_start_time=game_time,
+                expected_expiration_time=_coerce_time(raw.get("endDate")),
             )
+            markets.append(yes_market)
+            if no_label is not None:
+                # `inverted_no_side` flips prices, swaps depth, drops
+                # intraday/last-trade, and pre-emptively negates CLOB scalars
+                # (all None at this stage — CLOB enrichment runs later in
+                # the pipeline and applies its own sign-flip when it sees
+                # `is_no_side=True`).
+                markets.append(yes_market.inverted_no_side(no_label, [no_label]))
 
         if not markets:
             return None
@@ -947,6 +971,42 @@ def _is_non_moneyline_gamma_slug(slug: str) -> bool:
         or s.endswith("-totals")
         or "-ou-" in s
     )
+
+
+def _parse_h2h_question(question: Any) -> tuple[str, str] | None:
+    """Parse a gamma single-binary head-to-head question into (yes, no) names.
+
+    Used by `PolymarketEvent.from_gamma` to detect non-soccer head-to-heads
+    (ATP/UFC/etc.) where gamma exposes the moneyline as ONE binary market with
+    `groupItemTitle: None` and the question carrying both names — distinct
+    from soccer events which carry one market per outcome with
+    `groupItemTitle` set per side.
+
+    Pattern: `"Tournament: Player A vs Player B"`. The tournament prefix
+    (everything before the first `:`) is stripped if present; the body is
+    then split on " vs. " (preferred) or " vs ". Returns None when the
+    string isn't a recognizable head-to-head — caller falls back to using
+    the question as a single-side label.
+
+    Examples:
+        "Shymkent 2: Mathys Erhard vs Andrej Nedic" → ("Mathys Erhard", "Andrej Nedic")
+        "Real Madrid vs Barcelona" → ("Real Madrid", "Barcelona")
+        "Will Erhard win?" → None  (no separator)
+        "A vs B vs C" → None  (more than two halves; ambiguous)
+    """
+    if not isinstance(question, str) or not question.strip():
+        return None
+    body = question.split(":", 1)[-1].strip()
+    for sep in (" vs. ", " vs "):
+        if sep in body:
+            parts = body.split(sep)
+            if len(parts) != 2:
+                return None
+            a, b = parts[0].strip(), parts[1].strip()
+            if a and b:
+                return a, b
+            return None
+    return None
 
 
 def _gamma_series_from_tags(tags: Any) -> str | None:

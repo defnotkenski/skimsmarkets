@@ -182,6 +182,45 @@ class UnusualWhalesContext(BaseModel):
     def _f(cls, v: Any) -> Any:
         return _coerce_float(v)
 
+    def has_actionable_signal(self) -> bool:
+        """True iff this context carries any flow signal beyond raw liquidity.
+
+        UW's index covers more markets than its smart-money / insider / tag
+        pipelines do — offshore (gamma) events in particular often resolve on
+        the detail endpoint with a 200 but no enrichment: empty trade arrays,
+        all tag weights null, volume=0, MCI absent. The only field UW still
+        returns in that case is `liquidity`, which is just the gamma book
+        and duplicates our main bid/ask block.
+
+        Caller (pipeline) drops these signal-less contexts so the director
+        doesn't see a UW block whose every field reads `?`. `liquidity`
+        alone is intentionally NOT enough to count as a signal — it adds no
+        information beyond what the per-market microstructure block carries.
+        """
+        if self.smart_trades or self.contrarian_whale_trades or self.insiders:
+            return True
+        tags = self.tag_scores
+        if any(
+            getattr(tags, n) is not None
+            for n in (
+                "smart_money",
+                "contrarian_whales",
+                "insider_trades",
+                "momentum",
+                "closing_soon",
+            )
+        ):
+            return True
+        if self.mci is not None and (
+            self.mci.value is not None or self.mci.delta is not None
+        ):
+            return True
+        if self.unusual_score is not None and self.unusual_score > 0:
+            return True
+        if self.volume is not None and self.volume > 0:
+            return True
+        return False
+
 
 def tag_scores_from_list(tag_scores_raw: Any) -> UWTagScores:
     """Build `UWTagScores` from UW's `tag_scores: list[{tag, weighted, ...}]` shape.

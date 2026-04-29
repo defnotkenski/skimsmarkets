@@ -422,7 +422,14 @@ async def resolve_unusual_whales(
             if snap.clob_token_ids is not None:
                 yes_asset_id, _no_asset_id = snap.clob_token_ids
                 ctx = await uw.get_market_detail(yes_asset_id)
-                if ctx is not None:
+                # Skip contexts that carry no flow signal — UW's index
+                # extends past its smart-money / tag pipelines, so e.g.
+                # offshore tennis markets resolve to a 200 with empty
+                # trades, null tags, volume=0, no MCI. Attaching that
+                # gives the director a UW block that's all `?`s and adds
+                # no information past the main bid/ask. See
+                # `UnusualWhalesContext.has_actionable_signal`.
+                if ctx is not None and ctx.has_actionable_signal():
                     for e in evs:
                         e.uw_context = ctx
             # Merge gamma fields onto every market on every event sharing
