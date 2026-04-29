@@ -164,9 +164,13 @@ async def fetch_gamma_events(
     international soccer, niche sports). Each slug fetched in parallel under
     `sem`; failures degrade per-slug — bogus slugs log a warning and drop out.
 
-    Applies the same horizon window as `fetch_polymarket_slate` (now-6h to
-    now+horizon_hours) on each event's `game_start_time` so a stale CLI
-    argument for a past game doesn't sneak into the slate.
+    No horizon filter is applied here, unlike `fetch_polymarket_slate` and
+    `fetch_gamma_league_slate`. Slugs reach this function only via explicit
+    `--gamma-slug` CLI args, so the user has already opted in to that specific
+    event — second-guessing with a horizon check produces surprising drops when
+    gamma's `endDate` is a settlement window (e.g. some ATP markets) rather
+    than a tipoff. `horizon_hours` is kept in the signature for symmetry with
+    the league-prefix path.
     """
     if not slugs:
         return []
@@ -185,29 +189,7 @@ async def fetch_gamma_events(
             return event
 
     raw_events = await asyncio.gather(*(_one(s) for s in slugs))
-
-    now = datetime.now(tz=UTC)
-    horizon_start = now - timedelta(hours=6)
-    horizon_end = now + timedelta(hours=horizon_hours)
-    kept: list[PolymarketEvent] = []
-    for ev in raw_events:
-        if ev is None:
-            continue
-        # Use the earliest market `game_start_time` we have. Gamma populates
-        # this from the event's `endDate` (= game time) inside `from_gamma`.
-        starts = [t for m in ev.markets if (t := m.game_start_time) is not None]
-        if starts:
-            tipoff = min(starts)
-            if not (horizon_start <= tipoff <= horizon_end):
-                log.info(
-                    "gamma slug=%s: tipoff %s outside horizon [%s, %s], dropping",
-                    ev.slug,
-                    tipoff.isoformat(),
-                    horizon_start.isoformat(),
-                    horizon_end.isoformat(),
-                )
-                continue
-        kept.append(ev)
+    kept = [ev for ev in raw_events if ev is not None]
 
     log.info(
         "fetched %d/%d offshore events from gamma-api",
