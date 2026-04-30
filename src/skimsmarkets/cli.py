@@ -150,9 +150,10 @@ def _build_slate_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="SLUG",
         help=(
-            "Add a specific event by slug, bypassing the horizon filter. "
-            "Repeatable. Useful for events outside the standard horizon window "
-            "or matches the default browse hasn't picked up yet."
+            "Show a specific event by slug, bypassing the horizon filter. "
+            "Repeatable. When passed alone (no --league), the default browse "
+            "is skipped and ONLY the requested slugs land in the slate. "
+            "Combine with --league to union: default browse + explicit slugs."
         ),
     )
     p.add_argument(

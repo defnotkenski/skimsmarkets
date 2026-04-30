@@ -220,19 +220,29 @@ async def fetch_slate(
     path passes a standalone `httpx.AsyncClient` since it has no UW
     context to piggyback on.
 
-    Two composable inputs:
-    - `opts.leagues` filters the default browse by slug prefix(es). Empty
-      list = no filter (browse all sports).
-    - `opts.slugs` adds explicit one-off events by slug, bypassing the
-      horizon filter so the user can pull a specific event regardless of
-      when it starts.
+    Composition rules — chosen so each flag matches its instinctive read:
+    - bare (no flags): default browse, all sports within horizon.
+    - `--league` only: default browse filtered by those league prefixes.
+    - `--slug` only: those events specifically. The default browse is
+      SKIPPED — `skims fetch --slug X` means "show me X", not "show me X
+      plus today's whole slate".
+    - `--league` + `--slug`: union (default browse filtered by leagues,
+      plus the explicit slugs added on top, deduped by event id).
 
-    Dedupe by `ev.id` — a slug supplied via both paths only lands once.
-    CLOB book + price-history enrichment runs in the caller after
-    `fetch_slate` returns, so the heavy HTTP fan-out happens once on the
-    deduped union rather than per-fetcher.
+    `--slug` always bypasses the horizon filter so the user can pull a
+    specific event regardless of when it starts. CLOB book + price-history
+    enrichment runs in the caller after `fetch_slate` returns, so the
+    heavy HTTP fan-out happens once on the deduped union rather than
+    per-fetcher.
     """
-    events = await fetch_gamma_slate(http, opts.leagues, opts.horizon_hours)
+    # Skip the default browse when the user gave only `--slug` and no
+    # `--league` — they're asking for those events specifically, not "those
+    # events plus today's full slate". When both flags are present, the
+    # default browse runs (filtered by leagues) and slugs add on top.
+    if opts.slugs and not opts.leagues:
+        events: list[PolymarketEvent] = []
+    else:
+        events = await fetch_gamma_slate(http, opts.leagues, opts.horizon_hours)
 
     if opts.slugs:
         extra = await fetch_gamma_events(http, opts.slugs, opts.horizon_hours, gamma_sem)
