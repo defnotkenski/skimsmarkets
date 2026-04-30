@@ -10,6 +10,7 @@ it's captured for completeness only.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -833,12 +834,23 @@ class PolymarketEvent(BaseModel):
         if slug.endswith("-more-markets"):
             return None
 
-        # Gamma's event-level `endDate` is the game-time analog (e.g.
-        # `aus-syd-auc-2025-12-27` has endDate=2025-12-27); `startDate` is
-        # weeks earlier (when the market opened). Use endDate for tipoff so
-        # downstream slate-filter and renderer code (`game_start_time`,
-        # "starts <iso>") work unchanged.
-        game_time = _coerce_time(payload.get("endDate"))
+        # Tipoff resolution. Mirrors the US-side precedence at the NO-side
+        # synthesis below — `gameStartTime` || `startTime` || (last resort)
+        # `endDate`. Empirical shape across gamma:
+        # - Per-market `gameStartTime` is the load-bearing field. It's
+        #   rescheduling-aware (updates when fixtures move) and populated
+        #   for every match-shaped event observed (soccer, tennis, UFC).
+        # - Event-level `startTime` carries the same value and is the right
+        #   fallback when a market lacks `gameStartTime`.
+        # - Event-level `endDate` is a *trap*: it's frozen at market
+        #   creation, so on rescheduled fixtures it lags by days/months
+        #   (e.g. `arg-gye-def-2026-03-05` has endDate=2026-03-05 but the
+        #   actual game is 2026-05-04). It also represents tournament-end
+        #   for ATP-shaped events. Kept only as a defensive last resort —
+        #   real game events should never hit it in practice.
+        event_start_fallback = _coerce_time(
+            payload.get("startTime")
+        ) or _coerce_time(payload.get("endDate"))
 
         markets: list[PolymarketMarket] = []
         for raw in payload.get("markets") or []:
@@ -876,6 +888,12 @@ class PolymarketEvent(BaseModel):
                     continue
                 yes_label = fallback
                 no_label = None
+            # Per-market `gameStartTime` first — see the
+            # `event_start_fallback` comment above for the precedence
+            # rationale and why event-level `endDate` is a trap.
+            game_time = (
+                _coerce_time(raw.get("gameStartTime")) or event_start_fallback
+            )
             # Gamma payloads carry the same supplementary fields the US-path
             # piggyback pulls from `gamma /markets?slug=` — we already have
             # them on this dict, so populate the gamma_* fields directly
@@ -951,8 +969,25 @@ class PolymarketEvent(BaseModel):
         )
 
 
+# Partial-period winners — tennis "first set winner", soccer "first/second
+# half winner", basketball "Q1 winner", hockey "period 1 winner", baseball
+# "1st inning winner". These resolve before the match ends and aren't full
+# match-moneyline markets, so they shouldn't be ranked alongside them.
+# Anchored to a dash on both sides so we don't accidentally match a team
+# slug that contains "-set-" or similar mid-token. Centralized regex
+# rather than a long substring-or chain because the ordinal × period
+# product is too broad to enumerate.
+_PARTIAL_PERIOD_WINNER_RE = re.compile(
+    r"-(?:set|half|quarter|period|inning)-\d+-winner(?:-|$)"
+    r"|-(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)-"
+    r"(?:set|half|quarter|period|inning)-winner(?:-|$)"
+)
+
+
 def _is_non_moneyline_gamma_slug(slug: str) -> bool:
-    """True for gamma market slugs that are spreads/totals/BTTS/over-under.
+    """True for gamma market slugs that aren't full match-winner moneylines —
+    spreads, totals, BTTS, over/under, and partial-period winners (e.g.
+    tennis first-set winner, soccer first-half winner).
 
     Match on slug suffix tokens because gamma omits `sportsMarketType`. False
     positives here would silently drop a legit moneyline side, so the patterns
@@ -970,6 +1005,7 @@ def _is_non_moneyline_gamma_slug(slug: str) -> bool:
         or s.endswith("-total")
         or s.endswith("-totals")
         or "-ou-" in s
+        or _PARTIAL_PERIOD_WINNER_RE.search(s) is not None
     )
 
 

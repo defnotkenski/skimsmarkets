@@ -56,6 +56,25 @@ class RunResult:
     considered_events: int = 0
 
 
+@dataclass(frozen=True)
+class SlateOptions:
+    """Inputs shared by every slate-building entry point — both the
+    `skims fetch` CLI path and `run_pipeline`'s own slate stage. Frozen so
+    callers can pass the same instance through multiple stages without
+    worrying about mutation.
+
+    `gamma_slugs` and `gamma_leagues` default to empty lists rather than `None`
+    because every callsite already normalizes the "no offshore requested" case
+    to an empty iterable; one less branch downstream.
+    """
+
+    league: str | None = None
+    gamma_slugs: list[str] = field(default_factory=list)
+    gamma_leagues: list[str] = field(default_factory=list)
+    skip_us: bool = False
+    horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS
+
+
 async def fetch_polymarket_slate(
     pm: PolymarketClient,
     league: str | None,
@@ -65,9 +84,10 @@ async def fetch_polymarket_slate(
     """Fetch the Polymarket sports slate, refresh BBO, and return the tradable
     set.
 
-    This is the single source of truth for "what's in today's slate" — both the
-    --fetch-only display path and the full pipeline iterate exactly the events
-    returned here, with no further filtering. Filters layered server→client:
+    This is the single source of truth for "what's in today's slate" — both
+    the `skims fetch` display path and the full pipeline iterate exactly the
+    events returned here, with no further filtering. Filters layered
+    server→client:
 
     1. **Server-side time window.** The SDK's `events.list` accepts
        `startTimeMin` / `startTimeMax`, so we never parse or BBO games outside
@@ -129,7 +149,7 @@ async def fetch_polymarket_slate(
 
     # Tradability filter: a market is tradable when it has a labeled side AND a
     # live bid/ask. After BBO refresh, settled/ended games and unpriced lines
-    # fail this and get dropped here so neither --fetch-only nor the pipeline
+    # fail this and get dropped here so neither `skims fetch` nor the pipeline
     # has to re-filter downstream.
     tradable: list[PolymarketEvent] = []
     for ev in type_filtered:
@@ -255,6 +275,64 @@ async def fetch_gamma_league_slate(
         prefixes,
     )
     return kept
+
+
+async def fetch_slate(
+    opts: SlateOptions,
+    *,
+    pm: PolymarketClient | None,
+    http: httpx.AsyncClient,
+    poly_sem: asyncio.Semaphore,
+    gamma_sem: asyncio.Semaphore,
+) -> list[PolymarketEvent]:
+    """Build the unified US + offshore slate. Single source of truth used by
+    both `run_pipeline` and the `skims fetch` CLI path so they can never
+    drift.
+
+    Caller owns the lifetimes of `pm` and `http`. `run_pipeline` passes
+    `uw.http` (sharing the UW client's httpx for connection reuse); the
+    `skims fetch` path passes a standalone `httpx.AsyncClient` since it has
+    no UW context to piggyback on.
+
+    `pm` may be `None` when `opts.skip_us` is set — the US fetch is bypassed
+    so opening a `PolymarketClient` would be a wasted connection. Required
+    otherwise; we raise rather than silently degrade so misuse fails loud.
+
+    `fetch_gamma_league_slate` deliberately takes no semaphore — it issues a
+    single bulk list call and filters client-side, so the per-slug fan-out
+    `gamma_sem` would gate doesn't apply.
+    """
+    if opts.skip_us:
+        events: list[PolymarketEvent] = []
+    else:
+        if pm is None:
+            raise ValueError("fetch_slate: pm is required when skip_us is False")
+        events = await fetch_polymarket_slate(
+            pm, opts.league, opts.horizon_hours, poly_sem
+        )
+
+    # Offshore fallback: gamma events arrive with bid/ask already populated
+    # and venue="offshore", so they bypass `resolve_market_prices`. Slugs
+    # and leagues compose — both lists union into the slate.
+    offshore: list[PolymarketEvent] = []
+    if opts.gamma_slugs:
+        offshore += await fetch_gamma_events(
+            http, opts.gamma_slugs, opts.horizon_hours, gamma_sem
+        )
+    if opts.gamma_leagues:
+        offshore += await fetch_gamma_league_slate(
+            http, opts.gamma_leagues, opts.horizon_hours
+        )
+    if offshore:
+        # Dedupe by event id so a slug supplied via both --gamma-slug and
+        # --gamma-league only lands once. Preserve first-seen order.
+        seen: set[str] = {ev.id for ev in events}
+        for ev in offshore:
+            if ev.id in seen:
+                continue
+            seen.add(ev.id)
+            events.append(ev)
+    return events
 
 
 async def resolve_market_prices(
@@ -718,35 +796,24 @@ async def run_pipeline(
         httpx.AsyncClient(timeout=20.0) as public_http,
     ):
         gamma_resolver = GammaTokenResolver(public_http)
-        # `fetch_polymarket_slate` is the single source of truth for the US
-        # slate: it fetches, refreshes BBO, and applies the tradability filter
-        # so the slate matches what --fetch-only displays. `skip_us` bypasses
-        # it for offshore-only runs.
-        if skip_us:
-            events = []
-        else:
-            events = await fetch_polymarket_slate(pm, league, horizon_hours, poly_sem)
-        # Offshore fallback: gamma events arrive with bid/ask already populated
-        # and venue="offshore", so they bypass `resolve_market_prices`. Slugs
-        # and leagues compose — both lists union into the slate.
-        offshore: list[PolymarketEvent] = []
-        if gamma_slugs:
-            offshore += await fetch_gamma_events(
-                uw.http, gamma_slugs, horizon_hours, gamma_sem
-            )
-        if gamma_leagues:
-            offshore += await fetch_gamma_league_slate(
-                uw.http, gamma_leagues, horizon_hours
-            )
-        if offshore:
-            # Dedupe by event id so a slug supplied via both --gamma-slug and
-            # --gamma-league only lands once. Preserve first-seen order.
-            seen: set[str] = {ev.id for ev in events}
-            for ev in offshore:
-                if ev.id in seen:
-                    continue
-                seen.add(ev.id)
-                events.append(ev)
+        # `fetch_slate` is the single source of truth for the slate (US +
+        # offshore + dedup) — same call shape as the `skims fetch` CLI path
+        # so the two can never drift. We pass `uw.http` so gamma calls share
+        # the UW client's httpx connection pool.
+        slate_opts = SlateOptions(
+            league=league,
+            gamma_slugs=gamma_slugs or [],
+            gamma_leagues=gamma_leagues or [],
+            skip_us=skip_us,
+            horizon_hours=horizon_hours,
+        )
+        events = await fetch_slate(
+            slate_opts,
+            pm=pm,
+            http=uw.http,
+            poly_sem=poly_sem,
+            gamma_sem=gamma_sem,
+        )
         result.fetched_events = len(events)
 
         if dry_run:
