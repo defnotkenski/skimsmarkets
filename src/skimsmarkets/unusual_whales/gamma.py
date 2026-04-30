@@ -146,12 +146,12 @@ async def list_gamma_events(
     page_size: int = 500,
     max_pages: int = 6,
 ) -> list[dict[str, Any]]:
-    """List upcoming offshore-Polymarket events from gamma-api, paginated.
+    """List upcoming Polymarket events from gamma-api, paginated.
 
     Returns raw event dicts (slug, markets, endDate, etc.) ordered by
-    soonest game-time first via `order=endDate&ascending=true`. Used by the
-    `--gamma-league <prefix>` path to filter client-side by slug prefix —
-    gamma has no `seriesSlug` field, so league filtering rides the slug
+    soonest game-time first via `order=endDate&ascending=true`. Used by
+    `fetch_gamma_slate` to filter client-side by slug prefix — gamma has
+    no canonical `seriesSlug` field, so league filtering rides the slug
     prefix convention (`lib-`, `ucl-`, `arg-`, `epl-`, `spl-`, etc.).
 
     Pagination is necessary because esports (cs2, lol, dota2) and

@@ -32,6 +32,7 @@ import httpx
 log = logging.getLogger(__name__)
 
 _CLOB_HISTORY_URL = "https://clob.polymarket.com/prices-history"
+_CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 
 # Time-window targets for the LLM-facing scalars, in seconds.
 _WINDOW_30M = 30 * 60
@@ -212,6 +213,121 @@ def _build_sparkline(points: list[tuple[int, float]], n: int) -> str:
     step = last / (n - 1)
     sampled = [points[round(i * step)][1] for i in range(n)]
     return "→".join(f"{p:.3f}" for p in sampled)
+
+
+@dataclass(frozen=True, slots=True)
+class BookSummary:
+    """Compact view of a CLOB order book for one side of a market.
+
+    Mirrors the per-side fields the pipeline writes onto `PolymarketMarket`
+    (`yes_bid_*` / `yes_ask_*`). All fields are optional so that a one-sided
+    book (only bids resting, or only offers) still produces a usable summary
+    rather than `None`.
+    """
+
+    bid_top: float | None
+    bid_top_size: float | None
+    bid_book_dollars: float | None
+    bid_depth: int | None
+    ask_top: float | None
+    ask_top_size: float | None
+    ask_book_dollars: float | None
+    ask_depth: int | None
+
+
+async def fetch_book(
+    client: httpx.AsyncClient,
+    token_id: str,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
+    """GET clob.polymarket.com/book. Returns `(bid_levels, ask_levels)` or
+    None on any failure.
+
+    Each level is a `(price, size)` tuple of floats. Levels are returned
+    best-first: bids ordered descending by price (highest bid first), asks
+    ordered ascending by price (lowest ask first). The CLOB endpoint
+    actually returns bids ascending and asks descending — we reverse both
+    here so callers don't have to remember which way the raw shape goes.
+
+    Public, unauthed. No internal semaphore — the caller owns concurrency
+    via `CLOB_FETCH_SEM`. Same degrade-on-failure pattern as
+    `fetch_price_history`: warn + return None.
+    """
+    try:
+        resp = await client.get(_CLOB_BOOK_URL, params={"token_id": token_id})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, log + skip
+        log.warning("clob book token=%s failed: %s", token_id, e)
+        return None
+    if not isinstance(data, dict):
+        log.warning("clob book token=%s: bad shape", token_id)
+        return None
+    bid_levels = _parse_book_side(data.get("bids"))
+    ask_levels = _parse_book_side(data.get("asks"))
+    # Both sides arrive worst-first from the CLOB (bids ascending by price,
+    # asks descending). Reverse so consumers can read `levels[0]` as
+    # top-of-book without thinking about it.
+    bid_levels.reverse()
+    ask_levels.reverse()
+    return bid_levels, ask_levels
+
+
+def _parse_book_side(levels: Any) -> list[tuple[float, float]]:
+    """Turn `[{"price": "...", "size": "..."}, ...]` into `(px, sz)` tuples,
+    dropping any level whose fields don't parse cleanly.
+    """
+    if not isinstance(levels, list):
+        return []
+    out: list[tuple[float, float]] = []
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        try:
+            px = float(level["price"])
+            sz = float(level["size"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append((px, sz))
+    return out
+
+
+def summarize_book(
+    book: tuple[list[tuple[float, float]], list[tuple[float, float]]] | None,
+) -> BookSummary | None:
+    """Reduce raw `(bid_levels, ask_levels)` to a `BookSummary`.
+
+    Returns None when the book is None (fetch failed). Returns a `BookSummary`
+    with per-side fields set to None when one side is empty — a one-sided
+    book is still informative ("nothing offered" is a real market state).
+
+    `*_book_dollars` is `Σ price × size` across all visible levels on that
+    side — the user asked for total $ resting, not just top-of-book qty.
+    """
+    if book is None:
+        return None
+    bid_levels, ask_levels = book
+
+    def _side(levels: list[tuple[float, float]]) -> tuple[
+        float | None, float | None, float | None, int | None
+    ]:
+        if not levels:
+            return None, None, None, None
+        top_px, top_size = levels[0]
+        book_dollars = sum(px * sz for px, sz in levels)
+        return top_px, top_size, book_dollars, len(levels)
+
+    bid_top, bid_top_size, bid_book_dollars, bid_depth = _side(bid_levels)
+    ask_top, ask_top_size, ask_book_dollars, ask_depth = _side(ask_levels)
+    return BookSummary(
+        bid_top=bid_top,
+        bid_top_size=bid_top_size,
+        bid_book_dollars=bid_book_dollars,
+        bid_depth=bid_depth,
+        ask_top=ask_top,
+        ask_top_size=ask_top_size,
+        ask_book_dollars=ask_book_dollars,
+        ask_depth=ask_depth,
+    )
 
 
 def invert_sparkline(sparkline: str | None) -> str | None:

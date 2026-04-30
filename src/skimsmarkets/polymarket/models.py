@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -597,13 +597,12 @@ class PolymarketEvent(BaseModel):
     sport_type: str | None = None
     teams: list[dict[str, Any]] = Field(default_factory=list)
     markets: list[PolymarketMarket] = Field(default_factory=list)
-    # Which Polymarket venue this event was fetched from. "us" = polymarket-us
-    # SDK (KYC-gated, our default price source). "offshore" = gamma-api,
-    # populated only by `from_gamma()` for events that don't list on US.
-    # Different liquidity pools, so the leaderboard renders the venue tag and
-    # `resolve_market_prices` skips offshore events (gamma already returned
-    # bid/ask on the events.list payload — there's no markets.book() analog).
-    venue: Literal["us", "offshore"] = "us"
+    # AI-generated pre-match prose summary that gamma ships in
+    # `eventMetadata.context_description`. ~150 tokens of narrative context
+    # (form, recent H2H, line motivation) — fed verbatim to the director's
+    # per-event user message. None when gamma hasn't generated one yet
+    # (common for niche tennis events).
+    context_description: str | None = None
     # Attached post-validation by `resolve_unusual_whales()` when UW is enabled
     # and this event's YES-side asset_id resolved to an UW-tracked market.
     # Always None when the event comes straight off the SDK response.
@@ -819,11 +818,18 @@ class PolymarketEvent(BaseModel):
         tradability filter does.
 
         Filtering rules:
-        - Skip the event if its slug ends in `-more-markets` (gamma's variant
-          slug for the alternate bets bundle: spreads, totals, BTTS).
-        - Within each event, skip markets whose slug suffix matches any of
-          `-spread`, `-spread-`, `-total-`, `-totals-`, `-btts`, `-ou-`. These
-          are non-moneyline lines that can leak into the base event.
+        - Skip the event entirely if its slug ends in any of
+          `_GAMMA_VARIANT_EVENT_SUFFIXES` — these are gamma's alternate-bets
+          bundle slugs (spreads/totals/BTTS, halftime result, exact score,
+          total corners, player props). They host markets that look like
+          moneylines on the surface (`groupItemTitle="Seattle Sounders FC"`
+          for halftime-result-home) but resolve on a different question
+          than full-match winner.
+        - Within each event, skip markets whose slug matches
+          `_is_non_moneyline_gamma_slug` (spreads, totals, BTTS, set
+          handicaps, partial-period winners). These can leak into the base
+          moneyline event (e.g. tennis events ship a set-handicap market
+          alongside the moneyline).
         - Skip markets without bid/ask (settled or unfunded) so the
           tradability invariant holds: every kept market has live prices.
         """
@@ -831,7 +837,7 @@ class PolymarketEvent(BaseModel):
         ev_id = payload.get("id")
         if not isinstance(slug, str) or not slug or ev_id is None:
             return None
-        if slug.endswith("-more-markets"):
+        if slug.endswith(_GAMMA_VARIANT_EVENT_SUFFIXES):
             return None
 
         # Tipoff resolution. Mirrors the US-side precedence at the NO-side
@@ -851,6 +857,20 @@ class PolymarketEvent(BaseModel):
         event_start_fallback = _coerce_time(
             payload.get("startTime")
         ) or _coerce_time(payload.get("endDate"))
+
+        # Build a name→team-record lookup from the event's `teams[]`. Used
+        # below to populate `team_record` on each per-side market by matching
+        # the YES/NO label against gamma's team `name`. Falls back to None
+        # if the matchup is futures-style (no team objects) or the side
+        # label doesn't match any team — render path already handles None.
+        team_record_by_name: dict[str, str] = {}
+        for t in payload.get("teams") or []:
+            if not isinstance(t, dict):
+                continue
+            n = t.get("name")
+            r = t.get("record")
+            if isinstance(n, str) and isinstance(r, str) and r.strip():
+                team_record_by_name[n.lower()] = r.strip()
 
         markets: list[PolymarketMarket] = []
         for raw in payload.get("markets") or []:
@@ -900,12 +920,25 @@ class PolymarketEvent(BaseModel):
             # instead of forcing offshore events through a separate fetch.
             oi_dollars = _coerce_float(raw.get("liquidity"))
             accepting = raw.get("acceptingOrders")
+            m_closed = raw.get("closed")
+            # Collapse gamma's `acceptingOrders` + `closed` booleans into the
+            # same string `market_state` field that downstream renderers read.
+            # Lossy vs. the US enum (US had OPEN/HALTED/CLOSED/PAUSED), but
+            # the actionable distinctions for ranking are preserved: open
+            # books are tradable, halted/closed books are not.
+            market_state = _gamma_market_state(accepting, m_closed)
+            # Pull market-level volume24hr first; this is the gamma global-
+            # window volume that replaces US's `notional_traded_dollars`.
+            # Falls back to lifetime `volume` only when 24h is missing.
+            volume24 = _coerce_float(raw.get("volume24hr"))
+            yes_record = team_record_by_name.get(yes_label.lower())
             yes_market = PolymarketMarket(
                 slug=m_slug,
                 id=str(raw.get("id")) if raw.get("id") is not None else None,
                 title=raw.get("question"),
                 yes_sub_title=yes_label,
                 team_aliases=[yes_label],
+                team_record=yes_record,
                 # Synthesized: gamma omits sportsMarketType, but the slug
                 # filter above keeps only moneyline-style outcomes.
                 sports_market_type="moneyline",
@@ -913,6 +946,11 @@ class PolymarketEvent(BaseModel):
                 yes_bid_dollars=bid,
                 yes_ask_dollars=ask,
                 last_trade_price_dollars=_coerce_float(raw.get("lastTradePrice")),
+                market_state=market_state,
+                # `notional_traded_dollars` is gamma's 24h CLOB volume — same
+                # semantic role as US's `notionalTraded` (today's trading)
+                # but scoped globally instead of US-only.
+                notional_traded_dollars=volume24,
                 volume_dollars=_coerce_float(raw.get("volume")),
                 open_interest_dollars=oi_dollars,
                 liquidity_dollars=oi_dollars,
@@ -939,33 +977,73 @@ class PolymarketEvent(BaseModel):
                 # (all None at this stage — CLOB enrichment runs later in
                 # the pipeline and applies its own sign-flip when it sees
                 # `is_no_side=True`).
-                markets.append(yes_market.inverted_no_side(no_label, [no_label]))
+                no_record = team_record_by_name.get(no_label.lower())
+                markets.append(
+                    yes_market.inverted_no_side(
+                        no_label, [no_label], no_record=no_record
+                    )
+                )
 
         if not markets:
             return None
 
         # Pick the most specific sport tag as a series_slug stand-in. Gamma
         # tags don't carry league granularity (just `soccer`, `tennis`, etc.),
-        # so `series_slug` is best-effort here — the league filter on the US
-        # path doesn't apply to offshore events.
-        series_slug = _gamma_series_from_tags(payload.get("tags"))
+        # but a series with explicit `seriesSlug` (e.g. `serie-a-2025`) takes
+        # precedence when present.
+        series_slug = _gamma_series_slug(payload) or _gamma_series_from_tags(
+            payload.get("tags")
+        )
+        # `sport_type` is the broad sport class (soccer / tennis / basketball)
+        # — comes from the same tag list but stripped of league specificity
+        # so the renderer's `game_state_line()` can prefix `Game state
+        # (Polymarket, soccer):` regardless of which league is showing.
+        sport_type = _gamma_sport_from_tags(payload.get("tags"))
+        # Live game state — gamma exposes these at event top-level for
+        # in-progress matches; verified live-update parity with the
+        # legacy US `eventState` block.
+        live = payload.get("live")
+        ended = payload.get("ended")
+        score = payload.get("score") if isinstance(payload.get("score"), str) else None
+        period = (
+            payload.get("period") if isinstance(payload.get("period"), str) else None
+        )
+        elapsed = (
+            payload.get("elapsed") if isinstance(payload.get("elapsed"), str) else None
+        )
+        # `eventMetadata.context_description` is gamma's AI-generated
+        # pre-match prose — pass through verbatim so the director can fold
+        # it into per-event user context (no caching impact).
+        ctx_meta = payload.get("eventMetadata")
+        context_description: str | None = None
+        if isinstance(ctx_meta, dict):
+            cd = ctx_meta.get("context_description")
+            if isinstance(cd, str) and cd.strip():
+                context_description = cd
+        teams_payload = payload.get("teams")
+        teams_list: list[dict[str, Any]] = (
+            [t for t in teams_payload if isinstance(t, dict)]
+            if isinstance(teams_payload, list)
+            else []
+        )
 
         return cls(
             id=str(ev_id),
             slug=slug,
             title=payload.get("title"),
-            category=None,
+            category=payload.get("category"),
             series_slug=series_slug,
             active=payload.get("active"),
             closed=payload.get("closed"),
-            # Gamma doesn't expose live game state on the events payload, so
-            # the renderer's `game_state_line()` returns PRE-MATCH. Fine for
-            # the user's primary use case (adding non-US-listed games).
-            live=None,
-            ended=None,
-            teams=[],
+            live=live if isinstance(live, bool) else None,
+            ended=ended if isinstance(ended, bool) else None,
+            score=score,
+            period=period,
+            elapsed=elapsed,
+            sport_type=sport_type,
+            teams=teams_list,
             markets=markets,
-            venue="offshore",
+            context_description=context_description,
         )
 
 
@@ -983,17 +1061,46 @@ _PARTIAL_PERIOD_WINNER_RE = re.compile(
     r"(?:set|half|quarter|period|inning)-winner(?:-|$)"
 )
 
+# Whole-event slug suffixes that gamma uses to host alternate-bets bundles
+# (one event per market type). Each event-slug below is a sibling of a base
+# moneyline event sharing the same `<league>-<teamA>-<teamB>-<date>` prefix,
+# so dropping by suffix doesn't risk hiding the moneyline. Probed empirically
+# 2026-04-29; expand if gamma ships new alternate-bundle variants.
+#
+# `-halftime-result` is the most dangerous to leave in: its markets carry
+# `groupItemTitle="Seattle Sounders FC"` / `"Draw"` / `"Real Salt Lake"`,
+# indistinguishable from the full-match moneyline on the side label, but
+# they resolve on the half-time score rather than the final.
+_GAMMA_VARIANT_EVENT_SUFFIXES: tuple[str, ...] = (
+    "-more-markets",
+    "-halftime-result",
+    "-exact-score",
+    "-total-corners",
+    "-player-props",
+)
+
 
 def _is_non_moneyline_gamma_slug(slug: str) -> bool:
     """True for gamma market slugs that aren't full match-winner moneylines —
-    spreads, totals, BTTS, over/under, and partial-period winners (e.g.
-    tennis first-set winner, soccer first-half winner).
+    spreads, totals, BTTS, over/under, set handicaps, and partial-period
+    winners (e.g. tennis first-set winner, soccer first-half winner).
 
     Match on slug suffix tokens because gamma omits `sportsMarketType`. False
     positives here would silently drop a legit moneyline side, so the patterns
     are anchored to the dash-separated tail of the slug — e.g. team slugs end
     in the team abbreviation (`...-syd`, `...-auc`, `...-draw`) which never
     look like the suffixes below.
+
+    `-set-handicap-` lives inline next to the moneyline in tennis events
+    (e.g. `wta-blinkov-jovic-2026-02-23-set-handicap-away-1pt5` ships in the
+    same `wta-blinkov-jovic-2026-02-23` event as the binary moneyline) so we
+    have to filter at the market level — the event-level variant filter
+    can't catch it.
+
+    NBA events ship player-props markets (`-points-`, `-rebounds-`,
+    `-assists-`) and a first-half moneyline (`-1h-moneyline`) inline next
+    to the full-match moneyline — same pattern as set-handicap, also
+    filtered here.
     """
     s = slug.lower()
     return (
@@ -1005,6 +1112,13 @@ def _is_non_moneyline_gamma_slug(slug: str) -> bool:
         or s.endswith("-total")
         or s.endswith("-totals")
         or "-ou-" in s
+        or "-set-handicap-" in s
+        or "-points-" in s
+        or "-rebounds-" in s
+        or "-assists-" in s
+        or "-1h-" in s
+        or s.endswith("-1h-moneyline")
+        or "-nrfi" in s
         or _PARTIAL_PERIOD_WINNER_RE.search(s) is not None
     )
 
@@ -1062,3 +1176,83 @@ def _gamma_series_from_tags(tags: Any) -> str | None:
         if isinstance(s, str) and s and s != "sports":
             sport_tags.append(s)
     return sport_tags[0] if sport_tags else None
+
+
+# Tag slugs gamma uses for the broad sport class (vs. league specificity like
+# `serie-a-2025`). Used to populate `sport_type` so the renderer's game-state
+# line can prefix `Game state (Polymarket, soccer):` regardless of which
+# league within that sport is showing.
+_GAMMA_SPORT_TAGS: frozenset[str] = frozenset(
+    {
+        "soccer",
+        "tennis",
+        "basketball",
+        "baseball",
+        "hockey",
+        "mma",
+        "ufc",
+        "cricket",
+        "golf",
+        "esports",
+        "boxing",
+        "rugby",
+        "football",
+    }
+)
+
+
+def _gamma_sport_from_tags(tags: Any) -> str | None:
+    """Pull the broad sport class from gamma's `tags` array (e.g. 'soccer',
+    'tennis'). Returns None when no recognized sport tag is present — the
+    renderer handles None by omitting the sport prefix.
+    """
+    if not isinstance(tags, list):
+        return None
+    for t in tags:
+        if not isinstance(t, dict):
+            continue
+        s = t.get("slug")
+        if isinstance(s, str) and s in _GAMMA_SPORT_TAGS:
+            return s
+    return None
+
+
+def _gamma_series_slug(payload: dict[str, Any]) -> str | None:
+    """Pull the league slug from gamma's `series[]` array when present.
+
+    Gamma populates this for major-league events (`serie-a-2025`,
+    `epl-2025`, etc.) but leaves it empty for niche tennis/UFC. Falls back
+    to the generic sport tag via `_gamma_series_from_tags` when absent.
+    """
+    series = payload.get("series")
+    if not isinstance(series, list):
+        return None
+    for s in series:
+        if not isinstance(s, dict):
+            continue
+        slug = s.get("slug")
+        if isinstance(slug, str) and slug:
+            return slug
+    return None
+
+
+def _gamma_market_state(accepting: Any, closed: Any) -> str:
+    """Collapse gamma's `acceptingOrders` + `closed` booleans into the same
+    `MARKET_STATE_*` string shape downstream renderers already read.
+
+    Lossy vs. the US enum (US had OPEN/HALTED/CLOSED/PAUSED), but the
+    actionable distinctions for ranking are preserved:
+    - `closed=True`           → MARKET_STATE_CLOSED  (settled / ended)
+    - `acceptingOrders=False` → MARKET_STATE_HALTED  (not tradable)
+    - otherwise               → MARKET_STATE_OPEN    (live tradable book)
+
+    The renderer at `agents/specialists.py:88` strips the `MARKET_STATE_`
+    prefix before display, and only surfaces the field when it isn't OPEN —
+    so the "OPEN" string is effectively a no-op tag that downstream code
+    already gates against.
+    """
+    if closed is True:
+        return "MARKET_STATE_CLOSED"
+    if accepting is False:
+        return "MARKET_STATE_HALTED"
+    return "MARKET_STATE_OPEN"

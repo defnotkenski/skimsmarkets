@@ -36,24 +36,18 @@ CLAUDE_MAX_OUTPUT_TOKENS = 16_000
 
 
 def _render_event_context_block(event: PolymarketEvent) -> str:
-    # Venue marker — important when prices come from gamma-api (offshore) vs
-    # polymarket-us (US). Different liquidity pools, different participants;
-    # the director should know where the numbers came from. Lives in the
-    # per-event user message (NOT the cached system prompt) so the prompt
-    # cache hit on DIRECTOR_SYSTEM is preserved.
-    venue_line = (
-        "Polymarket venue: OFFSHORE (gamma-api) — different liquidity pool from "
-        "polymarket-us; offshore-only signals like UW flow apply directly here."
-        if event.venue == "offshore"
-        else "Polymarket venue: US (polymarket-us)"
-    )
     lines = [
         f"Event: {event.id} — {event.title or '(untitled)'}",
         f"Series: {event.series_slug or '?'}",
-        venue_line,
         event.game_state_line(),
         f"Tradable sides ({len(event.markets)}):",
     ]
+    # Pre-match prose context — gamma's `eventMetadata.context_description`
+    # is an AI-generated paragraph (form, recent H2H, line motivation).
+    # Lives in the per-event user message (NOT the cached system prompt)
+    # so the prompt cache hit on DIRECTOR_SYSTEM is preserved.
+    if event.context_description:
+        lines.append(f"Pre-match context: {event.context_description}")
     for m in event.markets:
         implied = m.yes_implied_probability
         bid = f"${m.yes_bid_dollars:.3f}" if m.yes_bid_dollars is not None else "?"
@@ -179,7 +173,6 @@ def _project_to_market_prediction(
         market_slug=winner_market.slug,
         event_id=event.id,
         event_title=event.title,
-        venue=event.venue,
         predicted_winner=event_pred.predicted_winner,
         predicted_yes_probability=event_pred.predicted_winner_probability,
         polymarket_implied_probability=winner_market.yes_implied_probability,

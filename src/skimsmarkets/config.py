@@ -14,21 +14,17 @@ DEFAULT_HORIZON_HOURS = 12
 # Concurrency caps. See plan for rationale.
 SPECIALIST_SEM = 16
 DIRECTOR_SEM = 2
-# Per-event BBO fan-out against Polymarket. Each event can trigger N parallel
-# BBO lookups (one per tradable side); this caps aggregate concurrency.
-POLYMARKET_FETCH_SEM = 8
 # Per-event Unusual Whales detail fan-out. UW doesn't publish rate limits; a
 # conservative cap keeps us safely under whatever they enforce. Each event
 # triggers at most 1 gamma-api call + 1 UW detail call (YES side only).
 UW_FETCH_SEM = 8
-# Offshore-Polymarket fallback fetch (gamma-api `/events?slug=…`). Only fires
-# when the user passes `--gamma-slug` on the CLI; one call per requested slug.
-# Same conservative ceiling as UW since both ride the same public gamma host.
+# Gamma-api fan-out (event listing + per-slug detail). Same conservative
+# ceiling as UW since both ride the same public gamma host.
 GAMMA_FETCH_SEM = 8
-# CLOB price-history fetch (clob.polymarket.com `/prices-history?market=…`).
-# Fires once per unique slug when `CLOB_HISTORY_ENABLED` (below) is True;
-# same conservative ceiling as UW. Public, unauthed endpoint, but we hedge
-# against unannounced rate limits.
+# CLOB fetch concurrency (clob.polymarket.com `/book` + `/prices-history`).
+# Shared across both endpoints since they hit the same host. Public, unauthed,
+# but we hedge against unannounced rate limits. Fires once per unique slug
+# per enrichment stage.
 CLOB_FETCH_SEM = 8
 
 # Opt-in CLOB price-history enrichment toggle. When True, the pipeline

@@ -186,10 +186,6 @@ class MarketPrediction(BaseModel):
     )
     event_id: str
     event_title: str | None = None
-    # Carried over from `PolymarketEvent.venue` so the leaderboard can mark
-    # offshore rows (gamma-api fallback) — different liquidity pool from
-    # polymarket-us; not tradable on US.
-    venue: Literal["us", "offshore"] = "us"
     predicted_winner: str
     predicted_yes_probability: float = Field(ge=0.0, le=1.0)
     polymarket_implied_probability: float | None = Field(

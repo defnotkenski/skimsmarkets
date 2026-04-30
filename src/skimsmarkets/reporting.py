@@ -56,23 +56,24 @@ def _pick_favorite(event: PolymarketEvent) -> PolymarketMarket:
 
 def print_events_table(
     events: list[PolymarketEvent],
-    league: str | None,
+    leagues: list[str],
     horizon_hours: int | None = None,
 ) -> None:
     """One row per event: the favorite side. Sorted by Polymarket dollar
     volume so the busiest markets lead the list.
 
     The row count here is the slate the full pipeline will process — both
-    paths consume the same `fetch_polymarket_slate` output.
+    paths consume the same `fetch_slate` output.
     """
     pairs = [(ev, _pick_favorite(ev)) for ev in events]
     pairs.sort(key=lambda pair: pair[1].volume_dollars or 0.0, reverse=True)
 
     console = Console()
     horizon_note = f", within {horizon_hours}h" if horizon_hours is not None else ""
+    league_note = f" — leagues={','.join(leagues)}" if leagues else ""
     title = (
         "Live sports events (Polymarket)"
-        + (f" — league={league}" if league else "")
+        + league_note
         + horizon_note
         + f" ({len(events)} events)"
     )
@@ -110,10 +111,6 @@ def print_events_table(
             side_label += f" ({m.team_record})"
         if m.is_no_side:
             side_label += " [NO]"
-        # Mark offshore rows so the user doesn't mistake them for US-tradable
-        # markets — the prices come from a different liquidity pool.
-        if ev.venue == "offshore":
-            side_label += f" [{_PEACH}][OFFSHORE][/]"
         # Read the canonical `open_interest_dollars` field. The legacy
         # `liquidity_dollars` alias still exists on the model for any
         # external consumer that hasn't migrated, but in-tree readers
@@ -136,16 +133,11 @@ def print_events_table(
     if not events:
         console.print(
             f"[{_PEACH}]No live markets found"
-            + (f" for league={league}" if league else "")
+            + (f" for leagues={','.join(leagues)}" if leagues else "")
             + ".[/]"
         )
         return
     console.print(table)
-    if any(ev.venue == "offshore" for ev in events):
-        console.print(
-            f"[{_PEACH}]Note: [OFFSHORE] rows come from gamma-api (offshore Polymarket) "
-            "and are NOT tradable on polymarket-us.[/]"
-        )
 
 
 def print_run_summary(result: RunResult) -> None:
@@ -185,8 +177,6 @@ def print_run_summary(result: RunResult) -> None:
 
         for rank, p in enumerate(ranked, start=1):
             event_display = p.event_title or p.event_id
-            if p.venue == "offshore":
-                event_display = f"{event_display} [{_PEACH}][OFFSHORE][/]"
             poly_impl_str = (
                 f"{p.polymarket_implied_probability:.3f}"
                 if p.polymarket_implied_probability is not None

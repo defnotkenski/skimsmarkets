@@ -17,12 +17,13 @@ from skimsmarkets.agents.director import synthesize_prediction
 from skimsmarkets.agents.schemas import MarketPrediction, SpecialistReport
 from skimsmarkets.agents.specialists import SPECIALISTS
 from skimsmarkets.clob import (
+    fetch_book,
     fetch_price_history,
     invert_sparkline,
+    summarize_book,
     summarize_history,
 )
-from skimsmarkets.polymarket import PolymarketClient
-from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
+from skimsmarkets.polymarket.models import PolymarketEvent
 from skimsmarkets.unusual_whales import (
     GammaTokenResolver,
     UnusualWhalesClient,
@@ -31,13 +32,6 @@ from skimsmarkets.unusual_whales import (
 )
 
 log = logging.getLogger(__name__)
-
-# Only include sides that look like "which team/outcome wins this specific game" —
-# drop futures, spreads, totals, MVP markets. `None` is kept defensively in case
-# the SDK hasn't populated `sportsMarketType` for a given market.
-_ALLOWED_MARKET_TYPES: frozenset[str | None] = frozenset(
-    {"moneyline", "drawable_outcome", None}
-)
 
 
 @dataclass
@@ -63,96 +57,92 @@ class SlateOptions:
     callers can pass the same instance through multiple stages without
     worrying about mutation.
 
-    `gamma_slugs` and `gamma_leagues` default to empty lists rather than `None`
-    because every callsite already normalizes the "no offshore requested" case
-    to an empty iterable; one less branch downstream.
+    `leagues` and `slugs` default to empty lists rather than None because
+    every callsite already normalizes the "no filter" case to an empty
+    iterable; one less branch downstream. Empty `leagues` = no league
+    filter (browse all sports).
     """
 
-    league: str | None = None
-    gamma_slugs: list[str] = field(default_factory=list)
-    gamma_leagues: list[str] = field(default_factory=list)
-    skip_us: bool = False
+    leagues: list[str] = field(default_factory=list)
+    slugs: list[str] = field(default_factory=list)
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS
 
 
-async def fetch_polymarket_slate(
-    pm: PolymarketClient,
-    league: str | None,
+async def fetch_gamma_slate(
+    http: httpx.AsyncClient,
+    leagues: list[str],
     horizon_hours: int,
-    poly_sem: asyncio.Semaphore,
 ) -> list[PolymarketEvent]:
-    """Fetch the Polymarket sports slate, refresh BBO, and return the tradable
-    set.
+    """Fetch the Polymarket sports slate from gamma-api.
 
-    This is the single source of truth for "what's in today's slate" — both
-    the `skims fetch` display path and the full pipeline iterate exactly the
-    events returned here, with no further filtering. Filters layered
-    server→client:
+    Single source of truth for "what's in today's slate" — both the `skims
+    fetch` display path and the full pipeline iterate exactly the events
+    returned here. Filters layered top to bottom:
 
-    1. **Server-side time window.** The SDK's `events.list` accepts
-       `startTimeMin` / `startTimeMax`, so we never parse or BBO games outside
-       the window. `start_time_min` sits 6h in the past to catch overtime and
-       long-tail endings that haven't settled yet; `start_time_max` is
-       `now + horizon_hours` for the upcoming slate.
-    2. **Market-type filter.** Keep only moneyline / drawable_outcome markets
-       (head-to-head NO-side inversion is already baked in by
-       `PolymarketEvent`'s validator). Futures, spreads, totals are dropped —
-       predicting "will this team win" on a season-winner market poisons the
-       output.
-    3. **Book refresh.** Live bid/ask + ladders from `markets.book(slug)` overwrite the
-       events.list snapshot prices.
-    4. **Tradability filter.** Drop markets without a `yes_sub_title` label
-       (can't tell the LLM which side is which) or without bid/ask (no live
-       prices to reason about). This catches ended/settled games naturally —
-       once a market settles its BBO disappears. Drop the event entirely if no
-       markets survive.
+    1. **Bulk listing.** `list_gamma_events` pages through gamma's
+       `/events?tag_slug=sports&order=endDate&ascending=true` for upcoming
+       events soonest-first. Pagination is necessary because esports
+       (cs2, lol, dota2) and high-volume markets crowd out actual sports
+       leagues in page 1.
+    2. **Variant-bundle drop.** `PolymarketEvent.from_gamma` skips
+       `-more-markets` / `-halftime-result` / `-exact-score` /
+       `-total-corners` / `-player-props` event-level variants and
+       non-moneyline market slugs (`-spread-`, `-total-`, `-set-handicap-`,
+       `-points-`, `-1h-...`, etc.) inline.
+    3. **League prefix filter.** When `leagues` is non-empty, keep only
+       events whose slug starts with `<league>-` for any of them. Empty
+       list = no filter (browse all sports). Anchored on the dash so
+       `arg` doesn't accidentally swallow `argf-`.
+    4. **Horizon time window.** Keep events whose earliest market
+       `gameStartTime` falls within `[now - 6h, now + horizon_hours]`.
+       The 6h backstop catches long-tail endings (overtime, weather
+       delays) that haven't settled yet. **Critical:** filter on
+       per-market `gameStartTime`, NOT event `endDate` — `endDate` is
+       frozen at market creation and lags rescheduled fixtures by days.
+    5. **Tradability filter.** Drop markets without `yes_sub_title` or
+       bid/ask. `from_gamma` already pre-filters bid/ask presence, so
+       this is a belt-and-suspenders check that mostly catches
+       label-less futures placeholders.
 
-    Filtering tradability AFTER BBO refresh is load-bearing: the events.list
-    snapshot is often missing prices that the live BBO does provide, so we'd
-    drop too many events if we filtered before the refresh.
+    The CLOB book + price-history enrichment stages run on the unified
+    slate post-`fetch_slate`, not here — keeps `fetch_gamma_slate` a pure
+    fetch+filter without HTTP fan-out beyond the listing call.
     """
     now = datetime.now(tz=UTC)
-    start_time_min = now - timedelta(hours=6)
-    start_time_max = now + timedelta(hours=horizon_hours)
+    horizon_start = now - timedelta(hours=6)
+    horizon_end = now + timedelta(hours=horizon_hours)
 
-    events = await pm.list_sports_events(
-        series_prefix=league,
-        start_time_min=start_time_min,
-        start_time_max=start_time_max,
-    )
+    payloads = await list_gamma_events(http)
     log.info(
-        "fetched %d polymarket events (league=%s, horizon=%sh)",
-        len(events),
-        league or "all",
+        "fetched %d gamma payloads (leagues=%s, horizon=%sh)",
+        len(payloads),
+        leagues or "all",
         horizon_hours,
     )
 
-    type_filtered: list[PolymarketEvent] = []
-    for ev in events:
-        allowed_markets = [
-            m for m in ev.markets if m.sports_market_type in _ALLOWED_MARKET_TYPES
-        ]
-        if not allowed_markets:
+    # League prefixes are anchored on dash so `arg` doesn't swallow `argf-`.
+    league_prefixes = [f"{p}-" for p in leagues]
+
+    kept: list[PolymarketEvent] = []
+    for payload in payloads:
+        slug = payload.get("slug")
+        if not isinstance(slug, str) or not slug:
             continue
-        # Rebuild the event with the filtered market list so downstream stages
-        # don't have to re-filter. Pydantic model_copy is the cheapest way to
-        # get an updated copy without re-validating every other field.
-        type_filtered.append(ev.model_copy(update={"markets": allowed_markets}))
-
-    log.info(
-        "kept %d events after market-type filter (dropped %d)",
-        len(type_filtered),
-        len(events) - len(type_filtered),
-    )
-
-    await resolve_market_prices(pm, type_filtered, poly_sem)
-
-    # Tradability filter: a market is tradable when it has a labeled side AND a
-    # live bid/ask. After BBO refresh, settled/ended games and unpriced lines
-    # fail this and get dropped here so neither `skims fetch` nor the pipeline
-    # has to re-filter downstream.
-    tradable: list[PolymarketEvent] = []
-    for ev in type_filtered:
+        if league_prefixes and not any(slug.startswith(p) for p in league_prefixes):
+            continue
+        ev = PolymarketEvent.from_gamma(payload)
+        if ev is None:
+            # `from_gamma` already drops -more-markets variants, settled
+            # markets, etc. Silently skip those.
+            continue
+        starts = [t for m in ev.markets if (t := m.game_start_time) is not None]
+        if starts:
+            tipoff = min(starts)
+            if not (horizon_start <= tipoff <= horizon_end):
+                continue
+        # Belt-and-suspenders tradability filter — `from_gamma` already
+        # drops bid/ask=None markets, but a missing `yes_sub_title` would
+        # leave the LLM unable to identify which side is which.
         live_markets = [
             m
             for m in ev.markets
@@ -162,14 +152,15 @@ async def fetch_polymarket_slate(
         ]
         if not live_markets:
             continue
-        tradable.append(ev.model_copy(update={"markets": live_markets}))
+        if len(live_markets) != len(ev.markets):
+            ev = ev.model_copy(update={"markets": live_markets})
+        kept.append(ev)
 
     log.info(
-        "kept %d events with live tradable markets (dropped %d)",
-        len(tradable),
-        len(type_filtered) - len(tradable),
+        "kept %d gamma events after league + horizon + tradability filters",
+        len(kept),
     )
-    return tradable
+    return kept
 
 
 async def fetch_gamma_events(
@@ -178,19 +169,18 @@ async def fetch_gamma_events(
     horizon_hours: int,
     sem: asyncio.Semaphore,
 ) -> list[PolymarketEvent]:
-    """Fetch specific offshore-Polymarket events by slug from gamma-api.
+    """Fetch specific Polymarket events by slug from gamma-api.
 
-    Opt-in fallback for events that don't list on polymarket-us (mostly
-    international soccer, niche sports). Each slug fetched in parallel under
-    `sem`; failures degrade per-slug — bogus slugs log a warning and drop out.
+    Each slug fetched in parallel under `sem`; failures degrade per-slug —
+    bogus slugs log a warning and drop out.
 
-    No horizon filter is applied here, unlike `fetch_polymarket_slate` and
-    `fetch_gamma_league_slate`. Slugs reach this function only via explicit
-    `--gamma-slug` CLI args, so the user has already opted in to that specific
-    event — second-guessing with a horizon check produces surprising drops when
-    gamma's `endDate` is a settlement window (e.g. some ATP markets) rather
-    than a tipoff. `horizon_hours` is kept in the signature for symmetry with
-    the league-prefix path.
+    No horizon filter is applied here, unlike `fetch_gamma_slate`. Slugs
+    reach this function only via explicit `--slug` CLI args, so the user
+    has already opted in to that specific event — second-guessing with a
+    horizon check produces surprising drops when gamma's `endDate` is a
+    settlement window (e.g. some ATP markets) rather than a tipoff.
+    `horizon_hours` is kept in the signature for symmetry with the
+    default-browse path.
     """
     if not slugs:
         return []
@@ -211,241 +201,48 @@ async def fetch_gamma_events(
     raw_events = await asyncio.gather(*(_one(s) for s in slugs))
     kept = [ev for ev in raw_events if ev is not None]
 
-    log.info(
-        "fetched %d/%d offshore events from gamma-api",
-        len(kept),
-        len(slugs),
-    )
-    return kept
-
-
-async def fetch_gamma_league_slate(
-    http: httpx.AsyncClient,
-    prefixes: list[str],
-    horizon_hours: int,
-) -> list[PolymarketEvent]:
-    """Fetch all near-term offshore-Polymarket events whose slug starts with
-    any of `prefixes` (e.g. ['lib', 'ucl'] → Copa Libertadores + Champions
-    League). Mirrors the polymarket-us `--league` prefix-match pattern, but
-    matches on slug prefix rather than `seriesSlug` since gamma omits that
-    field.
-
-    One HTTP call lists up to 200 upcoming events ordered by soonest tipoff;
-    we filter client-side. Pagination isn't worth the complexity here —
-    single-league horizons rarely exceed 200 events. If a user wants more,
-    they can add `--gamma-slug` for specific stragglers.
-    """
-    if not prefixes:
-        return []
-
-    payloads = await list_gamma_events(http)
-    if not payloads:
-        return []
-
-    # Match against `<prefix>-` so `arg` doesn't accidentally swallow `argf-`
-    # or any other longer prefix that happens to share the leading letters.
-    match_prefixes = [f"{p}-" for p in prefixes]
-
-    now = datetime.now(tz=UTC)
-    horizon_start = now - timedelta(hours=6)
-    horizon_end = now + timedelta(hours=horizon_hours)
-
-    kept: list[PolymarketEvent] = []
-    for payload in payloads:
-        slug = payload.get("slug")
-        if not isinstance(slug, str) or not slug:
-            continue
-        if not any(slug.startswith(p) for p in match_prefixes):
-            continue
-        ev = PolymarketEvent.from_gamma(payload)
-        if ev is None:
-            # `from_gamma` already drops -more-markets variants, settled
-            # markets, etc. Silently skip those.
-            continue
-        starts = [t for m in ev.markets if (t := m.game_start_time) is not None]
-        if starts:
-            tipoff = min(starts)
-            if not (horizon_start <= tipoff <= horizon_end):
-                continue
-        kept.append(ev)
-
-    log.info(
-        "fetched %d offshore events matching prefixes %s",
-        len(kept),
-        prefixes,
-    )
+    log.info("fetched %d/%d events from gamma-api by slug", len(kept), len(slugs))
     return kept
 
 
 async def fetch_slate(
     opts: SlateOptions,
     *,
-    pm: PolymarketClient | None,
     http: httpx.AsyncClient,
-    poly_sem: asyncio.Semaphore,
     gamma_sem: asyncio.Semaphore,
 ) -> list[PolymarketEvent]:
-    """Build the unified US + offshore slate. Single source of truth used by
-    both `run_pipeline` and the `skims fetch` CLI path so they can never
-    drift.
+    """Build the unified Polymarket slate from gamma. Single source of truth
+    used by both `run_pipeline` and the `skims fetch` CLI path so they can
+    never drift.
 
-    Caller owns the lifetimes of `pm` and `http`. `run_pipeline` passes
-    `uw.http` (sharing the UW client's httpx for connection reuse); the
-    `skims fetch` path passes a standalone `httpx.AsyncClient` since it has
-    no UW context to piggyback on.
+    Caller owns the lifetime of `http`. `run_pipeline` passes `uw.http`
+    (sharing the UW client's httpx for connection reuse); the `skims fetch`
+    path passes a standalone `httpx.AsyncClient` since it has no UW
+    context to piggyback on.
 
-    `pm` may be `None` when `opts.skip_us` is set — the US fetch is bypassed
-    so opening a `PolymarketClient` would be a wasted connection. Required
-    otherwise; we raise rather than silently degrade so misuse fails loud.
+    Two composable inputs:
+    - `opts.leagues` filters the default browse by slug prefix(es). Empty
+      list = no filter (browse all sports).
+    - `opts.slugs` adds explicit one-off events by slug, bypassing the
+      horizon filter so the user can pull a specific event regardless of
+      when it starts.
 
-    `fetch_gamma_league_slate` deliberately takes no semaphore — it issues a
-    single bulk list call and filters client-side, so the per-slug fan-out
-    `gamma_sem` would gate doesn't apply.
+    Dedupe by `ev.id` — a slug supplied via both paths only lands once.
+    CLOB book + price-history enrichment runs in the caller after
+    `fetch_slate` returns, so the heavy HTTP fan-out happens once on the
+    deduped union rather than per-fetcher.
     """
-    if opts.skip_us:
-        events: list[PolymarketEvent] = []
-    else:
-        if pm is None:
-            raise ValueError("fetch_slate: pm is required when skip_us is False")
-        events = await fetch_polymarket_slate(
-            pm, opts.league, opts.horizon_hours, poly_sem
-        )
+    events = await fetch_gamma_slate(http, opts.leagues, opts.horizon_hours)
 
-    # Offshore fallback: gamma events arrive with bid/ask already populated
-    # and venue="offshore", so they bypass `resolve_market_prices`. Slugs
-    # and leagues compose — both lists union into the slate.
-    offshore: list[PolymarketEvent] = []
-    if opts.gamma_slugs:
-        offshore += await fetch_gamma_events(
-            http, opts.gamma_slugs, opts.horizon_hours, gamma_sem
-        )
-    if opts.gamma_leagues:
-        offshore += await fetch_gamma_league_slate(
-            http, opts.gamma_leagues, opts.horizon_hours
-        )
-    if offshore:
-        # Dedupe by event id so a slug supplied via both --gamma-slug and
-        # --gamma-league only lands once. Preserve first-seen order.
+    if opts.slugs:
+        extra = await fetch_gamma_events(http, opts.slugs, opts.horizon_hours, gamma_sem)
         seen: set[str] = {ev.id for ev in events}
-        for ev in offshore:
+        for ev in extra:
             if ev.id in seen:
                 continue
             seen.add(ev.id)
             events.append(ev)
     return events
-
-
-async def resolve_market_prices(
-    pm: PolymarketClient,
-    events: list[PolymarketEvent],
-    sem: asyncio.Semaphore,
-) -> None:
-    """Refresh each event's market prices with the live order book, in place.
-
-    Head-to-head events carry two records per slug after NO-side expansion
-    (YES + inverted NO). A single `get_book(slug)` call covers both: the
-    NO-side record's bid/ask is derived by inverting the YES book
-    (`no_bid = 1 − yes_ask`, `no_ask = 1 − yes_bid`); top-of-book size,
-    book-$, and price-level depth swap sides without flipping. Slugs with
-    an already-populated snapshot keep those prices when the book call
-    returns None — a fallback that matters in practice because the book
-    endpoint is the flakier of the two endpoints.
-
-    Offshore events (`venue == "offshore"`) are skipped — gamma-api populates
-    bid/ask on the `/events` payload directly, and there's no `markets.book()`
-    analog on the gamma side. Trying to call it via the polymarket-us SDK would
-    404 because gamma slugs don't exist on the US venue.
-    """
-    us_events = [ev for ev in events if ev.venue == "us"]
-    if not us_events:
-        return
-    unique_slugs: set[str] = {m.slug for ev in us_events for m in ev.markets}
-
-    async def _one(slug: str) -> tuple[str, PolymarketMarket | None]:
-        async with sem:
-            return slug, await pm.get_book(slug)
-
-    book_results = await asyncio.gather(*(_one(s) for s in sorted(unique_slugs)))
-    # Explicit comprehension instead of `dict(...)` so the checker keeps the
-    # PolymarketMarket|None value type through to the lookup site below.
-    book_by_slug: dict[str, PolymarketMarket | None] = {
-        slug: bk for slug, bk in book_results
-    }
-
-    for ev in us_events:
-        for i, m in enumerate(ev.markets):
-            book = book_by_slug.get(m.slug)
-            if book is None:
-                continue
-            yes_bid = book.yes_bid_dollars
-            yes_ask = book.yes_ask_dollars
-            if yes_bid is None and yes_ask is None:
-                continue
-            if m.is_no_side:
-                new_bid = 1.0 - yes_ask if yes_ask is not None else None
-                new_ask = 1.0 - yes_bid if yes_bid is not None else None
-                # All depth/size fields swap sides — the YES bid book IS the
-                # implied NO ask book. Intraday range fields are session-level
-                # YES-trajectory metrics; drop on the NO clone rather than
-                # try to invert (high/low were set at different timestamps,
-                # so `1 - x` is meaningless).
-                new_bid_depth = book.yes_ask_depth
-                new_ask_depth = book.yes_bid_depth
-                new_bid_size_top = book.yes_ask_size_top
-                new_ask_size_top = book.yes_bid_size_top
-                new_bid_book_dollars = book.yes_ask_book_dollars
-                new_ask_book_dollars = book.yes_bid_book_dollars
-                new_high = None
-                new_low = None
-                new_open = None
-                new_close = None
-                new_last_qty = None
-            else:
-                new_bid = yes_bid
-                new_ask = yes_ask
-                new_bid_depth = book.yes_bid_depth
-                new_ask_depth = book.yes_ask_depth
-                new_bid_size_top = book.yes_bid_size_top
-                new_ask_size_top = book.yes_ask_size_top
-                new_bid_book_dollars = book.yes_bid_book_dollars
-                new_ask_book_dollars = book.yes_ask_book_dollars
-                new_high = book.high_px_dollars
-                new_low = book.low_px_dollars
-                new_open = book.open_px_dollars
-                new_close = book.close_px_dollars
-                new_last_qty = book.last_trade_qty
-            ev.markets[i] = m.model_copy(
-                update={
-                    "yes_bid_dollars": new_bid,
-                    "yes_ask_dollars": new_ask,
-                    "yes_bid_depth": new_bid_depth,
-                    "yes_ask_depth": new_ask_depth,
-                    "yes_bid_size_top": new_bid_size_top,
-                    "yes_ask_size_top": new_ask_size_top,
-                    "yes_bid_book_dollars": new_bid_book_dollars,
-                    "yes_ask_book_dollars": new_ask_book_dollars,
-                    "market_state": book.market_state,
-                    "high_px_dollars": new_high,
-                    "low_px_dollars": new_low,
-                    "open_px_dollars": new_open,
-                    "close_px_dollars": new_close,
-                    "last_trade_qty": new_last_qty,
-                    "notional_traded_dollars": book.notional_traded_dollars,
-                    # last_trade is YES-directional — drop on the NO clone to avoid
-                    # misleading the reader.
-                    "last_trade_price_dollars": (
-                        None
-                        if m.is_no_side
-                        else book.last_trade_price_dollars
-                        or m.last_trade_price_dollars
-                    ),
-                    "volume_dollars": book.volume_dollars or m.volume_dollars,
-                    "open_interest_dollars": (
-                        book.open_interest_dollars or m.open_interest_dollars
-                    ),
-                    "liquidity_dollars": book.liquidity_dollars or m.liquidity_dollars,
-                }
-            )
 
 
 async def resolve_unusual_whales(
@@ -458,17 +255,11 @@ async def resolve_unusual_whales(
     """Fetch Unusual Whales flow context per event and attach to `event.uw_context`.
 
     For each event: resolve `event.slug` → YES-side ERC-1155 `asset_id` via
-    Polymarket's gamma-api (the polymarket-us SDK and gamma-api are two distinct
-    venues, but `PolymarketEvent.slug` is the gamma-api market slug verbatim —
-    polymarket-us `market.slug` adds a category prefix like `aec-`, so the
-    event-level slug is what we need), then GET UW's
-    `/predictions/market/{asset_id}` for the compact flow snapshot. Failures at
-    any step leave `uw_context=None` and don't abort the run — this is an
-    enrichment stage, not a dependency.
+    Polymarket's gamma-api, then GET UW's `/predictions/market/{asset_id}` for
+    the compact flow snapshot. Failures at any step leave `uw_context=None`
+    and don't abort the run — this is an enrichment stage, not a dependency.
 
-    Events with no valid slug or no gamma-api match are silently skipped; UW
-    only indexes the public/gamma Polymarket, so cross-venue matching is
-    best-effort.
+    Events with no valid slug or no gamma-api match are silently skipped.
     """
     if not uw.enabled:
         return
@@ -533,6 +324,86 @@ async def resolve_unusual_whales(
     log.info("attached unusual-whales context to %d/%d events", attached, len(events))
 
 
+async def enrich_clob_book(
+    events: list[PolymarketEvent],
+    resolver: GammaTokenResolver,
+    http: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+) -> None:
+    """Attach CLOB order-book size + depth + book-$ fields to each market.
+
+    Same iteration shape as `enrich_price_history` (per unique market slug,
+    NO clones swap sides without flipping values), and same posture: an
+    enrichment stage that degrades silently per slug. Replaces the depth
+    fields that the legacy `markets.book(...)` SDK call used to populate.
+
+    The CLOB `/book` endpoint returns the **full global book** (bids +
+    asks, multi-level), so the depth/size/book-$ numbers we land here are
+    significantly larger than the US SDK's slice — that's expected and
+    intentional. The unauthenticated endpoint is the same provider as
+    `/prices-history`; concurrency is shared via `CLOB_FETCH_SEM`.
+
+    NO-side clones receive the same shape with bid/ask swapped (the YES
+    bid book IS the implied NO ask book and vice versa) — no value flip,
+    just side label swap. Mirrors the in-place inversion at
+    `PolymarketMarket.inverted_no_side` lines 502–507.
+    """
+    by_market_slug: dict[str, list[tuple[PolymarketEvent, int]]] = {}
+    for ev in events:
+        for i, m in enumerate(ev.markets):
+            if m.slug:
+                by_market_slug.setdefault(m.slug, []).append((ev, i))
+    if not by_market_slug:
+        return
+
+    async def _one(market_slug: str, refs: list[tuple[PolymarketEvent, int]]) -> None:
+        async with sem:
+            snap = await resolver.resolve_snapshot(market_slug)
+            if snap is None or snap.clob_token_ids is None:
+                return
+            yes_token_id, _no_token_id = snap.clob_token_ids
+            book = await fetch_book(http, yes_token_id)
+            summary = summarize_book(book)
+            if summary is None:
+                return
+            for ev, i in refs:
+                m = ev.markets[i]
+                if m.is_no_side:
+                    # NO clone: bid/ask sides swap (YES bid book = implied
+                    # NO ask book) but values themselves don't flip.
+                    ev.markets[i] = m.model_copy(
+                        update={
+                            "yes_bid_size_top": summary.ask_top_size,
+                            "yes_ask_size_top": summary.bid_top_size,
+                            "yes_bid_book_dollars": summary.ask_book_dollars,
+                            "yes_ask_book_dollars": summary.bid_book_dollars,
+                            "yes_bid_depth": summary.ask_depth,
+                            "yes_ask_depth": summary.bid_depth,
+                        }
+                    )
+                else:
+                    ev.markets[i] = m.model_copy(
+                        update={
+                            "yes_bid_size_top": summary.bid_top_size,
+                            "yes_ask_size_top": summary.ask_top_size,
+                            "yes_bid_book_dollars": summary.bid_book_dollars,
+                            "yes_ask_book_dollars": summary.ask_book_dollars,
+                            "yes_bid_depth": summary.bid_depth,
+                            "yes_ask_depth": summary.ask_depth,
+                        }
+                    )
+
+    await asyncio.gather(*(_one(s, refs) for s, refs in by_market_slug.items()))
+    enriched = sum(
+        1
+        for ev in events
+        for m in ev.markets
+        if m.yes_bid_book_dollars is not None or m.yes_ask_book_dollars is not None
+    )
+    total = sum(len(ev.markets) for ev in events)
+    log.info("attached clob book to %d/%d markets", enriched, total)
+
+
 async def enrich_price_history(
     events: list[PolymarketEvent],
     resolver: GammaTokenResolver,
@@ -542,20 +413,15 @@ async def enrich_price_history(
     """Attach a CLOB price-history sparkline + recency scalars to each market.
 
     Iteration is per **market slug** (deduplicated across events), not per
-    event slug, because the two venues differ:
-
-    - **US (head-to-head)**: events expand into YES + inverted-NO clones that
-      both share the underlying market slug. Iterating per market slug picks
-      up both clones; the NO record carries the inverted summary.
-    - **Offshore (gamma)**: events split each outcome into its own market
-      with its own slug (e.g. `j1100-ngr-fag-2026-04-29-{ngr,fag,draw}`),
-      and gamma's `/markets?slug=` only resolves on the per-outcome slug,
-      not the event slug. Per-market iteration handles each outcome
-      directly. Offshore markets are all `is_no_side=False`, so the inverted
-      branch never fires for them.
+    event slug. Soccer-style 3-way events split each outcome into its own
+    market slug (e.g. `epl-lee-bur-2026-05-01-{lee,bur,draw}`), and gamma's
+    `/markets?slug=` only resolves on the per-outcome slug. Tennis/UFC
+    binary head-to-heads share one slug across YES + inverted-NO clones;
+    per-market iteration picks up both clones, and the NO record carries
+    the inverted summary.
 
     Per unique market slug: get the YES `clobTokenId` from the gamma
-    resolver (same cache the UW path populates), fetch ~24h of mid prices
+    resolver (shared with the UW + book stages), fetch ~24h of mid prices
     from `clob.polymarket.com/prices-history`, summarize, and attach.
 
     Failures are silent per-slug (logged at WARNING by the core fetcher);
@@ -564,8 +430,9 @@ async def enrich_price_history(
     not a dependency.
 
     Concurrency is capped by the caller-supplied `sem`. The token IDs
-    already cached by the UW path are free re-hits; cold slugs fire one
-    gamma `/markets?slug=` call followed by one CLOB `/prices-history` call.
+    already cached by the UW + book stages are free re-hits; cold slugs
+    fire one gamma `/markets?slug=` call followed by one CLOB
+    `/prices-history` call.
     """
     by_market_slug: dict[str, list[tuple[PolymarketEvent, int]]] = {}
     for ev in events:
@@ -710,7 +577,6 @@ def _persist_run(result: RunResult) -> None:
                     "event_id": p.event_id,
                     "event_title": p.event_title,
                     "market_slug": p.market_slug,
-                    "venue": p.venue,
                     "predicted_winner": p.predicted_winner,
                     "predicted_yes_probability": p.predicted_yes_probability,
                     "polymarket_implied_probability": p.polymarket_implied_probability,
@@ -752,27 +618,21 @@ async def process_event(
 
 async def run_pipeline(
     *,
-    league: str | None = None,
+    leagues: list[str] | None = None,
     dry_run: bool = False,
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
-    gamma_slugs: list[str] | None = None,
-    gamma_leagues: list[str] | None = None,
-    skip_us: bool = False,
+    slugs: list[str] | None = None,
 ) -> RunResult:
-    """End-to-end: fetch the Polymarket sports slate inside the horizon, refresh
-    each event's BBO, then run 4 specialists + director per event. Returns a
-    leaderboard-ready `RunResult` sorted downstream by predicted probability.
+    """End-to-end: fetch the Polymarket sports slate inside the horizon,
+    enrich with CLOB book + price history, then run 4 specialists + director
+    per event. Returns a leaderboard-ready `RunResult` sorted downstream by
+    predicted probability.
 
-    Offshore fallback (gamma-api):
-    - `gamma_slugs`: explicit list of offshore event slugs to include.
-    - `gamma_leagues`: list of slug prefixes (e.g. 'lib', 'ucl') to bulk-pull
-      all near-term offshore events for that league. Independent of `--league`
-      because US and offshore use different naming conventions for league codes.
-    Both add events tagged `venue="offshore"` to the slate.
-
-    `skip_us=True` bypasses the polymarket-us fetch entirely — only the
-    offshore events from `gamma_slugs`/`gamma_leagues` will reach the slate.
-    `league` is silently ignored under `skip_us=True` (it's a US-only filter).
+    Slate composition:
+    - default browse: tag-listed sports events filtered by `leagues` prefix(es)
+      and the horizon time window. Empty `leagues` = browse all sports.
+    - `slugs`: explicit list of event slugs to include (bypasses the horizon
+      filter so a specific event always lands).
     """
     config = cfg.Config.from_env()
     run_id = uuid.uuid4().hex[:8]
@@ -780,40 +640,29 @@ async def run_pipeline(
 
     specialist_sem = asyncio.Semaphore(cfg.SPECIALIST_SEM)
     director_sem = asyncio.Semaphore(cfg.DIRECTOR_SEM)
-    poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
     uw_sem = asyncio.Semaphore(cfg.UW_FETCH_SEM)
     gamma_sem = asyncio.Semaphore(cfg.GAMMA_FETCH_SEM)
     clob_sem = asyncio.Semaphore(cfg.CLOB_FETCH_SEM)
 
     # `public_http` is a shared httpx client for any public, unauthed
-    # Polymarket-host call: gamma `/markets?slug=` (token IDs + supplementary
-    # market fields) and CLOB `/prices-history` (price-history sparkline).
-    # Lifted out of UW so the gamma resolver works even when UW is disabled
-    # (the CLOB enrichment stage still wants token-ID resolution).
+    # Polymarket-host call: gamma `/events` (slate + token IDs +
+    # supplementary fields) and CLOB `/book` + `/prices-history`. Shared
+    # so the connection pool is reused across enrichment stages.
     async with (
-        PolymarketClient() as pm,
         UnusualWhalesClient(config.unusual_whales_api_key) as uw,
         httpx.AsyncClient(timeout=20.0) as public_http,
     ):
         gamma_resolver = GammaTokenResolver(public_http)
-        # `fetch_slate` is the single source of truth for the slate (US +
-        # offshore + dedup) — same call shape as the `skims fetch` CLI path
-        # so the two can never drift. We pass `uw.http` so gamma calls share
-        # the UW client's httpx connection pool.
+        # `fetch_slate` is the single source of truth (default browse +
+        # explicit slugs, deduped) — same call shape as the `skims fetch`
+        # CLI path so the two can never drift. UW's http is reused for
+        # connection pooling on the gamma calls.
         slate_opts = SlateOptions(
-            league=league,
-            gamma_slugs=gamma_slugs or [],
-            gamma_leagues=gamma_leagues or [],
-            skip_us=skip_us,
+            leagues=leagues or [],
+            slugs=slugs or [],
             horizon_hours=horizon_hours,
         )
-        events = await fetch_slate(
-            slate_opts,
-            pm=pm,
-            http=uw.http,
-            poly_sem=poly_sem,
-            gamma_sem=gamma_sem,
-        )
+        events = await fetch_slate(slate_opts, http=uw.http, gamma_sem=gamma_sem)
         result.fetched_events = len(events)
 
         if dry_run:
@@ -824,15 +673,20 @@ async def run_pipeline(
         if not events:
             return result
 
-        # UW enrichment runs after the slate is finalized (post dry-run trim)
-        # so we don't waste API budget on events we're going to drop. The
-        # gamma resolver is shared with the CLOB stage below so token-ID
-        # lookups are paid for at most once per slug across the whole run.
+        # Enrichment stages all share the same `gamma_resolver` so token-ID
+        # lookups are paid for at most once per slug across UW + CLOB book +
+        # CLOB price-history. UW runs first because it can drop events with
+        # no actionable signal; book/history then enrich whatever remains.
         await resolve_unusual_whales(uw, events, uw_sem, resolver=gamma_resolver)
+        # CLOB book — top-of-book size, depth, full-book $ totals. Adds
+        # one HTTP per unique market slug (deduplicated). Replaces the
+        # legacy US `markets.book(...)` BBO refresh; the CLOB endpoint
+        # exposes the full global book so book-$ totals here are 5–20×
+        # what the legacy US slice used to show.
+        await enrich_clob_book(events, gamma_resolver, public_http, clob_sem)
         # Optional CLOB price-history enrichment — opt-in via the
         # `CLOB_HISTORY_ENABLED` constant in `config.py`. Adds 1 HTTP per
-        # unique slug (deduplicated). When off, this is a no-op (zero CLOB
-        # calls).
+        # unique slug. When off, this is a no-op (zero CLOB calls).
         if cfg.CLOB_HISTORY_ENABLED:
             await enrich_price_history(events, gamma_resolver, public_http, clob_sem)
         else:

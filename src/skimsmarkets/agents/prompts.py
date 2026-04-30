@@ -186,9 +186,9 @@ Rules for synthesis:
   'market_context', and the values should approximately sum to 1.
 
 If a "Flow signals (Unusual Whales, side='<team>'...)" block appears in the event context, it
-is raw on-chain flow data from the offshore Polymarket venue (NOT Polymarket US where our
-prices come from — same underlying game, different liquidity pool, so treat it as directional
-signal rather than price-level truth). The block header explicitly names which team the flow
+is raw on-chain flow data from Polymarket — wallet behavior reads on the same orderbook the
+prices come from, so treat it as a directional signal that complements bid/ask rather than
+a separate venue's prices. The block header explicitly names which team the flow
 is about via `side='<team_name>'` — that name comes directly from the UW API's outcome label,
 no inference needed. The specialists did NOT see this data — it reaches you as background
 alongside bid/ask, not mediated through any specialist's opinion.

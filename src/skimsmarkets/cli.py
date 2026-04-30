@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 import sys
 
@@ -11,7 +10,6 @@ import httpx
 from skimsmarkets import config as cfg
 from skimsmarkets.backtest.dataset import build_dataset
 from skimsmarkets.pipeline import SlateOptions, fetch_slate, run_pipeline
-from skimsmarkets.polymarket import PolymarketClient
 from skimsmarkets.reporting import print_events_table, print_run_summary
 
 
@@ -66,10 +64,8 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
     `cfg` and is not currently exposed on the CLI.
     """
     return SlateOptions(
-        league=args.league,
-        gamma_slugs=args.gamma_slug,
-        gamma_leagues=args.gamma_league,
-        skip_us=args.skip_us,
+        leagues=args.league,
+        slugs=args.slug,
         horizon_hours=cfg.DEFAULT_HORIZON_HOURS,
     )
 
@@ -80,12 +76,10 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
     """
     opts = _slate_opts_from_args(args)
     result = await run_pipeline(
-        league=opts.league,
+        leagues=opts.leagues or None,
         dry_run=args.dry_run,
         horizon_hours=opts.horizon_hours,
-        gamma_slugs=opts.gamma_slugs or None,
-        gamma_leagues=opts.gamma_leagues or None,
-        skip_us=opts.skip_us,
+        slugs=opts.slugs or None,
     )
     print_run_summary(result)
     return 0
@@ -98,25 +92,12 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
 
     Gamma is unauthenticated, so we open a standalone `httpx.AsyncClient`
     rather than reusing the UW one — fetch has no UW context.
-
-    Skip the `PolymarketClient` setup entirely under `--skip-us` — it'd be a
-    wasted connection (the SDK opens its own httpx pool on entry).
-    `AsyncExitStack` lets us keep one happy-path `async with` regardless.
     """
     opts = _slate_opts_from_args(args)
-    poly_sem = asyncio.Semaphore(cfg.POLYMARKET_FETCH_SEM)
     gamma_sem = asyncio.Semaphore(cfg.GAMMA_FETCH_SEM)
-    async with contextlib.AsyncExitStack() as stack:
-        pm = (
-            None
-            if opts.skip_us
-            else await stack.enter_async_context(PolymarketClient())
-        )
-        http = await stack.enter_async_context(httpx.AsyncClient(timeout=20.0))
-        events = await fetch_slate(
-            opts, pm=pm, http=http, poly_sem=poly_sem, gamma_sem=gamma_sem
-        )
-    print_events_table(events, opts.league, horizon_hours=opts.horizon_hours)
+    async with httpx.AsyncClient(timeout=20.0) as http:
+        events = await fetch_slate(opts, http=http, gamma_sem=gamma_sem)
+    print_events_table(events, opts.leagues, horizon_hours=opts.horizon_hours)
     return 0
 
 
@@ -154,46 +135,24 @@ def _build_slate_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument(
         "--league",
-        default=None,
-        help=(
-            "Restrict to a single Polymarket league by series-slug prefix "
-            "(e.g. 'nba' matches 'nba-2025'). Default: all live sports."
-        ),
-    )
-    p.add_argument(
-        "--gamma-slug",
-        action="append",
-        default=[],
-        metavar="SLUG",
-        help=(
-            "Add a specific offshore-Polymarket event by slug (gamma-api fallback). "
-            "Use for matches not listed on polymarket-us — typically international "
-            "soccer (e.g. 'lib-lan-lqu-2026-04-28'). Repeatable. Offshore rows are "
-            "tagged [OFFSHORE] in the leaderboard and are NOT tradable on US."
-        ),
-    )
-    p.add_argument(
-        "--gamma-league",
         action="append",
         default=[],
         metavar="PREFIX",
         help=(
-            "Bulk-pull offshore-Polymarket events by slug prefix (gamma-api). "
-            "Mirrors --league but on the offshore venue, where leagues are "
-            "encoded as slug prefixes: 'lib' = Copa Libertadores, 'ucl' = "
-            "Champions League, 'arg' = Argentina Primera, 'epl' = EPL, 'spl' = "
-            "Saudi Pro League, etc. Repeatable. Independent of --league because "
-            "US and offshore use different league code conventions."
+            "Filter the slate by league slug prefix (e.g. 'epl' matches "
+            "'epl-lee-bur-2026-05-01'). Repeatable: `--league epl --league nba` "
+            "unions both. Empty = all live sports."
         ),
     )
     p.add_argument(
-        "--skip-us",
-        action="store_true",
+        "--slug",
+        action="append",
+        default=[],
+        metavar="SLUG",
         help=(
-            "Bypass the polymarket-us fetch entirely. Useful with --gamma-slug "
-            "or --gamma-league when you only want offshore events (e.g. "
-            "'--skip-us --gamma-league lib' for Copa Libertadores only). "
-            "Silently ignores --league when set (it's a US-only filter)."
+            "Add a specific event by slug, bypassing the horizon filter. "
+            "Repeatable. Useful for events outside the standard horizon window "
+            "or matches the default browse hasn't picked up yet."
         ),
     )
     p.add_argument(
