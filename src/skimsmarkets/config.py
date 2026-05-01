@@ -12,7 +12,13 @@ from dotenv import load_dotenv
 DEFAULT_HORIZON_HOURS = 12
 
 # Concurrency caps. See plan for rationale.
-SPECIALIST_SEM = 16
+# Each event runs through 4 Grok fetchers (Stage A) → 4 Claude reasoners
+# (Stage B) → 1 Claude director, all parallel where possible. The fetcher
+# semaphore caps concurrent Grok calls across all events; the reasoner
+# semaphore caps concurrent Claude reasoner calls (4 per event vs 1 director
+# per event, so reasoner sem is roughly 4× director sem).
+FETCHER_SEM = 16
+REASONER_SEM = 8
 DIRECTOR_SEM = 2
 # Per-event Unusual Whales detail fan-out. UW doesn't publish rate limits; a
 # conservative cap keeps us safely under whatever they enforce. Each event

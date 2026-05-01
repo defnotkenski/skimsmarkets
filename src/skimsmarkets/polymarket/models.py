@@ -1246,7 +1246,7 @@ def _gamma_market_state(accepting: Any, closed: Any) -> str:
     - `acceptingOrders=False` → MARKET_STATE_HALTED  (not tradable)
     - otherwise               → MARKET_STATE_OPEN    (live tradable book)
 
-    The renderer at `agents/specialists.py:88` strips the `MARKET_STATE_`
+    The renderer at `agents/fetchers.py` strips the `MARKET_STATE_`
     prefix before display, and only surfaces the field when it isn't OPEN —
     so the "OPEN" string is effectively a no-op tag that downstream code
     already gates against.

@@ -14,8 +14,13 @@ from xai_sdk import AsyncClient as XAIAsyncClient
 
 from skimsmarkets import config as cfg
 from skimsmarkets.agents.director import synthesize_prediction
-from skimsmarkets.agents.schemas import MarketPrediction, SpecialistReport
-from skimsmarkets.agents.specialists import SPECIALISTS
+from skimsmarkets.agents.fetchers import FETCHERS
+from skimsmarkets.agents.reasoners import REASONERS
+from skimsmarkets.agents.schemas import (
+    LensNotebook,
+    MarketPrediction,
+    SpecialistReport,
+)
 from skimsmarkets.clob import (
     fetch_book,
     fetch_price_history,
@@ -37,7 +42,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class ErrorRecord:
     event_id: str
-    stage: str  # "specialist:<name>" or "director"
+    stage: str  # "fetcher:<lens>" / "reasoner:<lens>" / "director"
     error: str
 
 
@@ -48,6 +53,24 @@ class RunResult:
     errors: list[ErrorRecord] = field(default_factory=list)
     fetched_events: int = 0
     considered_events: int = 0
+    # Per-event notebooks (Stage A — Grok) and reasoner reports (Stage B —
+    # Claude) keyed event_id → lens_name → object. Persisted alongside the
+    # final MarketPrediction to JSONL so retrospective grading can ask
+    # "did Grok find the right facts?" and "did Claude reason correctly?"
+    # as separate questions.
+    notebooks: dict[str, dict[str, LensNotebook]] = field(default_factory=dict)
+    reports: dict[str, dict[str, SpecialistReport]] = field(default_factory=dict)
+
+
+@dataclass
+class _LensOutcome:
+    """Internal: per-lens result of one event's two-stage chain."""
+
+    lens: str
+    notebook: LensNotebook | None = None
+    report: SpecialistReport | None = None
+    error_stage: str | None = None  # "fetcher" or "reasoner"
+    error: BaseException | None = None
 
 
 @dataclass(frozen=True)
@@ -522,40 +545,61 @@ async def enrich_price_history(
     log.info("attached clob price history to %d/%d markets", enriched, total)
 
 
-async def _run_specialists(
+async def _run_lenses(
     xai: XAIAsyncClient,
+    anthropic: AsyncAnthropic,
     event: PolymarketEvent,
-    sem: asyncio.Semaphore,
+    fetcher_sem: asyncio.Semaphore,
+    reasoner_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
-) -> dict[str, SpecialistReport] | None:
-    """Run all specialists for one event. Return None if any specialist failed
-    (the event then skips director)."""
+) -> tuple[dict[str, LensNotebook], dict[str, SpecialistReport]] | None:
+    """Run all four lenses for one event. Each lens is a Grok fetcher
+    (Stage A) → Claude reasoner (Stage B) chain; lenses run in parallel,
+    Grok→Claude is sequential within a lens.
 
-    async def _one(specialist: str) -> tuple[str, "SpecialistReport | Exception"]:
-        async with sem:
-            try:
-                return specialist, await SPECIALISTS[specialist](xai, event)
-            except Exception as e:  # noqa: BLE001
-                return specialist, e
+    `fetcher_sem` is released between stages so a slow Grok search loop
+    doesn't tie up a fetcher slot through the (typically faster) Claude
+    reasoner call. Per-event failure posture matches the legacy specialists
+    pipeline: any failure at either stage of any lens drops the event so
+    the director never receives a partial set of reports.
+    """
 
-    results = await asyncio.gather(*(_one(n) for n in SPECIALISTS))
+    async def _one(lens: str) -> _LensOutcome:
+        try:
+            async with fetcher_sem:
+                notebook = await FETCHERS[lens](xai, event)
+        except Exception as e:  # noqa: BLE001
+            return _LensOutcome(lens=lens, error_stage="fetcher", error=e)
+        try:
+            async with reasoner_sem:
+                report = await REASONERS[lens](anthropic, event, notebook)
+        except Exception as e:  # noqa: BLE001
+            return _LensOutcome(
+                lens=lens, notebook=notebook, error_stage="reasoner", error=e
+            )
+        return _LensOutcome(lens=lens, notebook=notebook, report=report)
+
+    outcomes = await asyncio.gather(*(_one(n) for n in FETCHERS))
+    notebooks: dict[str, LensNotebook] = {}
     reports: dict[str, SpecialistReport] = {}
     failed = False
-    for name, result in results:
-        if isinstance(result, Exception):
+    for o in outcomes:
+        if o.error is not None:
             errors.append(
                 ErrorRecord(
                     event_id=event.id,
-                    stage=f"specialist:{name}",
-                    error=f"{type(result).__name__}: {result}",
+                    stage=f"{o.error_stage}:{o.lens}",
+                    error=f"{type(o.error).__name__}: {o.error}",
                 )
             )
             failed = True
         else:
-            reports[name] = result
+            assert o.notebook is not None and o.report is not None
+            notebooks[o.lens] = o.notebook
+            reports[o.lens] = o.report
     if failed:
         return None
-    return reports
+    return notebooks, reports
 
 
 # Logs live at <repo-root>/logs/runs/<run_id>.jsonl. Resolved at module-load
@@ -581,6 +625,19 @@ def _persist_run(result: RunResult) -> None:
         logged_at = datetime.now(UTC).isoformat()
         with path.open("w") as f:
             for p in result.predictions:
+                # Notebooks + reports come from the two-stage agent chain
+                # (Grok fetcher → Claude reasoner). Persisting both lets a
+                # grading script ask "was the evidence right?" and "was the
+                # reasoning right?" as separate questions. mode="json" so
+                # any datetime/Decimal fields serialize cleanly.
+                notebooks_for_event = {
+                    lens: nb.model_dump(mode="json")
+                    for lens, nb in result.notebooks.get(p.event_id, {}).items()
+                }
+                reports_for_event = {
+                    lens: r.model_dump(mode="json")
+                    for lens, r in result.reports.get(p.event_id, {}).items()
+                }
                 payload = {
                     "run_id": result.run_id,
                     "logged_at_utc": logged_at,
@@ -592,6 +649,8 @@ def _persist_run(result: RunResult) -> None:
                     "polymarket_implied_probability": p.polymarket_implied_probability,
                     "confidence": p.confidence,
                     "headline": p.headline,
+                    "notebooks": notebooks_for_event,
+                    "specialist_reports": reports_for_event,
                 }
                 f.write(json.dumps(payload, separators=(",", ":")) + "\n")
         log.info("persisted %d predictions to %s", len(result.predictions), path)
@@ -603,18 +662,30 @@ async def process_event(
     xai: XAIAsyncClient,
     anthropic: AsyncAnthropic,
     event: PolymarketEvent,
-    specialist_sem: asyncio.Semaphore,
+    fetcher_sem: asyncio.Semaphore,
+    reasoner_sem: asyncio.Semaphore,
     director_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
-) -> MarketPrediction | None:
+) -> tuple[
+    MarketPrediction, dict[str, LensNotebook], dict[str, SpecialistReport]
+] | None:
+    """Run the full agent chain for one event.
+
+    Returns the prediction alongside the per-lens notebooks and reasoner
+    reports so the caller can persist them to the run JSONL. Returns None
+    when the event was dropped (any lens stage failure or director failure).
+    """
     log.info("processing event %s (%s)", event.id, event.title)
-    reports = await _run_specialists(xai, event, specialist_sem, errors)
-    if reports is None:
+    pairs = await _run_lenses(
+        xai, anthropic, event, fetcher_sem, reasoner_sem, errors
+    )
+    if pairs is None:
         return None
+    notebooks, reports = pairs
 
     async with director_sem:
         try:
-            return await synthesize_prediction(anthropic, event, reports)
+            prediction = await synthesize_prediction(anthropic, event, reports)
         except Exception as e:  # noqa: BLE001
             errors.append(
                 ErrorRecord(
@@ -624,6 +695,7 @@ async def process_event(
                 )
             )
             return None
+    return prediction, notebooks, reports
 
 
 async def run_pipeline(
@@ -648,7 +720,8 @@ async def run_pipeline(
     run_id = uuid.uuid4().hex[:8]
     result = RunResult(run_id=run_id)
 
-    specialist_sem = asyncio.Semaphore(cfg.SPECIALIST_SEM)
+    fetcher_sem = asyncio.Semaphore(cfg.FETCHER_SEM)
+    reasoner_sem = asyncio.Semaphore(cfg.REASONER_SEM)
     director_sem = asyncio.Semaphore(cfg.DIRECTOR_SEM)
     uw_sem = asyncio.Semaphore(cfg.UW_FETCH_SEM)
     gamma_sem = asyncio.Semaphore(cfg.GAMMA_FETCH_SEM)
@@ -705,13 +778,14 @@ async def run_pipeline(
         xai = XAIAsyncClient(api_key=config.xai_api_key)
         anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
         try:
-            predictions = await asyncio.gather(
+            outcomes = await asyncio.gather(
                 *(
                     process_event(
                         xai,
                         anthropic,
                         e,
-                        specialist_sem,
+                        fetcher_sem,
+                        reasoner_sem,
                         director_sem,
                         result.errors,
                     )
@@ -721,9 +795,13 @@ async def run_pipeline(
         finally:
             await xai.close()
 
-        for p in predictions:
-            if p is not None:
-                result.predictions.append(p)
+        for outcome in outcomes:
+            if outcome is None:
+                continue
+            prediction, notebooks, reports = outcome
+            result.predictions.append(prediction)
+            result.notebooks[prediction.event_id] = notebooks
+            result.reports[prediction.event_id] = reports
 
     if result.predictions:
         _persist_run(result)

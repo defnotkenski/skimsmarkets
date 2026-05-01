@@ -2,9 +2,86 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Confidence = Literal["low", "medium", "high"]
+
+LensName = Literal["statistics", "injury", "narrative", "market_context"]
+
+
+class Citation(BaseModel):
+    """A single primary-source pull from web_search / x_search.
+
+    `retrieved_value` is the concrete fact lifted from the page (a stat line, a
+    line move, an injury status), not a paraphrase — the reasoner should be
+    able to use it without re-fetching. URLs MUST be ones the fetcher actually
+    retrieved; never fabricated.
+    """
+
+    url: str
+    claim: str = Field(description="One-line summary of what this source supports.")
+    retrieved_value: str | None = Field(
+        default=None,
+        description="Concrete value pulled (e.g. '28-6 record', 'Out — knee').",
+    )
+
+
+class ComputedNumber(BaseModel):
+    """A number derived via the fetcher's `code_execution` tool.
+
+    Fetchers MUST surface every numeric derivation here (de-vig, log5, on/off
+    splits, rating differentials) so the reasoner can use the value as-is
+    rather than recomputing. `method` is a one-line note on the math; the
+    reasoner trusts it without re-deriving.
+    """
+
+    label: str = Field(
+        description="What was computed (e.g. 'devig_pinnacle_team_a', 'log5_team_a_baseline').",
+    )
+    value: float
+    method: str = Field(
+        description="One-line method note (e.g. 'log5 from team_a 0.62 vs team_b 0.55, neutral 0.50').",
+    )
+
+
+class LensNotebook(BaseModel):
+    """Free-form research notebook emitted by a Grok fetcher for one lens.
+
+    The fetcher's job is evidence capture, not judgment — so this schema has
+    NO probability, NO signed shift, NO directional verdict. Those land in the
+    typed report a downstream Claude reasoner emits from this notebook plus
+    the same event context the fetcher saw.
+
+    `research_notes` is intentionally free-form prose (sectioned by the
+    fetcher) so Grok's adaptive search loop ("found X, now look up Y") can
+    capture whatever it stumbles on without the schema predicting structure
+    upfront. Structured citation + computed-number lists ride alongside so
+    URLs and numbers stay machine-extractable.
+
+    `coverage` is the fetcher's self-assessment of how thin/rich the evidence
+    is — the reasoner downgrades `confidence` to `low` when this is `thin`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    lens: LensName
+    team_a_name: str = Field(
+        description="Echoed verbatim from the event context's team_a_name.",
+    )
+    team_b_name: str = Field(
+        description="Echoed verbatim from the event context's team_b_name.",
+    )
+    research_notes: str = Field(
+        description=(
+            "Free-form prose. Bullet what was found and what's missing. "
+            "Do NOT include a probability, signed shift, or directional verdict."
+        ),
+    )
+    citations: list[Citation] = Field(default_factory=list)
+    computed_numbers: list[ComputedNumber] = Field(default_factory=list)
+    coverage: Literal["thin", "adequate", "rich"] = Field(
+        description="'thin' when primary sources were unavailable.",
+    )
 
 
 class StatisticsReport(BaseModel):

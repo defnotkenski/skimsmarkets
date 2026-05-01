@@ -1,37 +1,42 @@
+"""Per-lens Grok fetchers — Stage A of the two-stage agent chain.
+
+Each fetcher gets the same event-context user message (rendered once via
+`render_context`) plus its lens-specific system prompt, calls the
+`web_search` / `x_search` / `code_execution` tools adaptively, and emits a
+`LensNotebook` of evidence (prose + citations + computed numbers). It does
+NOT commit to a probability, signed shift, or directional verdict — that's
+the reasoner's job in Stage B (see `agents/reasoners.py`).
+
+`agent_count=4` is preserved on every fetcher: when the only job is
+evidence-gathering, multi-agent ensemble adds search-path diversity, which
+is exactly the win we want from this split.
+"""
+
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable
 
-from pydantic import BaseModel
 from xai_sdk import AsyncClient as XAIAsyncClient
 from xai_sdk.chat import system, user
 from xai_sdk.tools import code_execution, web_search, x_search
 
 from skimsmarkets.agents.prompts import (
-    INJURY_SYSTEM,
-    MARKET_CONTEXT_SYSTEM,
-    NARRATIVE_SYSTEM,
-    STATISTICS_SYSTEM,
+    INJURY_NOTEBOOK_SYSTEM,
+    MARKET_CONTEXT_NOTEBOOK_SYSTEM,
+    NARRATIVE_NOTEBOOK_SYSTEM,
+    STATISTICS_NOTEBOOK_SYSTEM,
 )
-from skimsmarkets.agents.schemas import (
-    InjuryReport,
-    MarketContextReport,
-    NarrativeReport,
-    SpecialistReport,
-    StatisticsReport,
-)
+from skimsmarkets.agents.schemas import LensName, LensNotebook
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
 log = logging.getLogger(__name__)
 
 GROK_MODEL = "grok-4.20-multi-agent-0309"
 
-_ReportT = TypeVar("_ReportT", bound=BaseModel)
-
-SpecialistFn = Callable[
+FetcherFn = Callable[
     [XAIAsyncClient, PolymarketEvent],
-    Awaitable[SpecialistReport],
+    Awaitable[LensNotebook],
 ]
 
 
@@ -234,12 +239,12 @@ def _tools() -> list:
     return [web_search(), x_search(), code_execution()]
 
 
-async def _run_specialist(
+async def _run_fetcher(
     xai: XAIAsyncClient,
     event: PolymarketEvent,
     system_prompt: str,
-    shape: type[_ReportT],
-) -> _ReportT:
+    lens: LensName,
+) -> LensNotebook:
     chat = xai.chat.create(
         model=GROK_MODEL,
         agent_count=4,
@@ -247,42 +252,57 @@ async def _run_specialist(
         tools=_tools(),
     )
     chat.append(user(render_context(event)))
-    response, parsed = await chat.parse(shape)
+    response, parsed = await chat.parse(LensNotebook)
+    # Fail loud if the fetcher returned the wrong discriminator — catches
+    # prompt-mixup bugs at fetch time rather than letting them break the
+    # downstream reasoner dispatch silently.
+    if parsed.lens != lens:
+        raise RuntimeError(
+            f"fetcher lens mismatch for event {event.id}: expected {lens!r}, "
+            f"got {parsed.lens!r}"
+        )
     log.debug(
-        "specialist=%s event=%s tokens in/out=%s/%s",
-        shape.__name__,
+        "fetcher=%s event=%s coverage=%s citations=%d computed=%d tokens in/out=%s/%s",
+        lens,
         event.id,
+        parsed.coverage,
+        len(parsed.citations),
+        len(parsed.computed_numbers),
         getattr(response.usage, "prompt_tokens", None),
         getattr(response.usage, "completion_tokens", None),
     )
     return parsed
 
 
-async def run_statistics(
+async def fetch_statistics_notebook(
     xai: XAIAsyncClient, event: PolymarketEvent
-) -> StatisticsReport:
-    return await _run_specialist(xai, event, STATISTICS_SYSTEM, StatisticsReport)
+) -> LensNotebook:
+    return await _run_fetcher(xai, event, STATISTICS_NOTEBOOK_SYSTEM, "statistics")
 
 
-async def run_injury(xai: XAIAsyncClient, event: PolymarketEvent) -> InjuryReport:
-    return await _run_specialist(xai, event, INJURY_SYSTEM, InjuryReport)
-
-
-async def run_narrative(
+async def fetch_injury_notebook(
     xai: XAIAsyncClient, event: PolymarketEvent
-) -> NarrativeReport:
-    return await _run_specialist(xai, event, NARRATIVE_SYSTEM, NarrativeReport)
+) -> LensNotebook:
+    return await _run_fetcher(xai, event, INJURY_NOTEBOOK_SYSTEM, "injury")
 
 
-async def run_market_context(
+async def fetch_narrative_notebook(
     xai: XAIAsyncClient, event: PolymarketEvent
-) -> MarketContextReport:
-    return await _run_specialist(xai, event, MARKET_CONTEXT_SYSTEM, MarketContextReport)
+) -> LensNotebook:
+    return await _run_fetcher(xai, event, NARRATIVE_NOTEBOOK_SYSTEM, "narrative")
 
 
-SPECIALISTS: dict[str, SpecialistFn] = {
-    "statistics": run_statistics,
-    "injury": run_injury,
-    "narrative": run_narrative,
-    "market_context": run_market_context,
+async def fetch_market_context_notebook(
+    xai: XAIAsyncClient, event: PolymarketEvent
+) -> LensNotebook:
+    return await _run_fetcher(
+        xai, event, MARKET_CONTEXT_NOTEBOOK_SYSTEM, "market_context"
+    )
+
+
+FETCHERS: dict[str, FetcherFn] = {
+    "statistics": fetch_statistics_notebook,
+    "injury": fetch_injury_notebook,
+    "narrative": fetch_narrative_notebook,
+    "market_context": fetch_market_context_notebook,
 }
