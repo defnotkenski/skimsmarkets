@@ -48,6 +48,18 @@ def _coerce_float(value: Any) -> float | None:
     return None
 
 
+def _coerce_str(value: Any) -> str | None:
+    """Stringify gamma scalars (id fields arrive as either int or str depending
+    on endpoint). Returns None for absent / non-scalar inputs so callers don't
+    end up with `<memory at 0x…>` from accidental Buffer / object stringify.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int)):
+        return str(value)
+    return None
+
+
 # Candidate field names, in preference order, for the Polymarket settlement
 # timestamp. Probed in order during model validation; first non-None wins.
 # Expand as real data reveals more.
@@ -934,7 +946,7 @@ class PolymarketEvent(BaseModel):
             yes_record = team_record_by_name.get(yes_label.lower())
             yes_market = PolymarketMarket(
                 slug=m_slug,
-                id=str(raw.get("id")) if raw.get("id") is not None else None,
+                id=_coerce_str(raw.get("id")),
                 title=raw.get("question"),
                 yes_sub_title=yes_label,
                 team_aliases=[yes_label],

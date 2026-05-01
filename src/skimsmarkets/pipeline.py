@@ -186,10 +186,11 @@ async def fetch_gamma_slate(
     return kept
 
 
+# noinspection PyUnusedLocal
 async def fetch_gamma_events(
     http: httpx.AsyncClient,
     slugs: list[str],
-    horizon_hours: int,
+    horizon_hours: int,  # noqa: ARG001 — kept for signature symmetry with fetch_gamma_slate
     sem: asyncio.Semaphore,
 ) -> list[PolymarketEvent]:
     """Fetch specific Polymarket events by slug from gamma-api.
@@ -399,12 +400,12 @@ async def enrich_clob_book(
             summary = summarize_book(book)
             if summary is None:
                 return
-            for ev, i in refs:
-                m = ev.markets[i]
-                if m.is_no_side:
+            for evt, idx in refs:
+                mkt = evt.markets[idx]
+                if mkt.is_no_side:
                     # NO clone: bid/ask sides swap (YES bid book = implied
                     # NO ask book) but values themselves don't flip.
-                    ev.markets[i] = m.model_copy(
+                    evt.markets[idx] = mkt.model_copy(
                         update={
                             "yes_bid_size_top": summary.ask_top_size,
                             "yes_ask_size_top": summary.bid_top_size,
@@ -415,7 +416,7 @@ async def enrich_clob_book(
                         }
                     )
                 else:
-                    ev.markets[i] = m.model_copy(
+                    evt.markets[idx] = mkt.model_copy(
                         update={
                             "yes_bid_size_top": summary.bid_top_size,
                             "yes_ask_size_top": summary.ask_top_size,
@@ -487,10 +488,10 @@ async def enrich_price_history(
             summary = summarize_history(history)
             if summary is None:
                 return
-            for ev, i in refs:
-                m = ev.markets[i]
-                if m.is_no_side:
-                    ev.markets[i] = m.model_copy(
+            for evt, idx in refs:
+                mkt = evt.markets[idx]
+                if mkt.is_no_side:
+                    evt.markets[idx] = mkt.model_copy(
                         update={
                             "clob_price_change_30m": (
                                 -summary.change_30m
@@ -521,7 +522,7 @@ async def enrich_price_history(
                         }
                     )
                 else:
-                    ev.markets[i] = m.model_copy(
+                    evt.markets[idx] = mkt.model_copy(
                         update={
                             "clob_price_change_30m": summary.change_30m,
                             "clob_price_change_1h": summary.change_1h,

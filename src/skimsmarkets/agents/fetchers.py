@@ -28,6 +28,7 @@ from skimsmarkets.agents.prompts import (
     STATISTICS_NOTEBOOK_SYSTEM,
 )
 from skimsmarkets.agents.schemas import LensName, LensNotebook
+from skimsmarkets.agents.sport_hints import render_sport_hint
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
 log = logging.getLogger(__name__)
@@ -251,7 +252,14 @@ async def _run_fetcher(
         messages=[system(system_prompt)],
         tools=_tools(),
     )
-    chat.append(user(render_context(event)))
+    # Sport-specific guidance rides on the user message (NOT the cached system
+    # block) so the cached system prompt stays warm across all events. Returns
+    # None for sports we don't specialize, in which case we send the bare
+    # context.
+    user_msg = render_context(event)
+    if (sport_hint := render_sport_hint(lens, event)) is not None:
+        user_msg += "\n\n" + sport_hint
+    chat.append(user(user_msg))
     response, parsed = await chat.parse(LensNotebook)
     # Fail loud if the fetcher returned the wrong discriminator — catches
     # prompt-mixup bugs at fetch time rather than letting them break the

@@ -112,7 +112,7 @@ async def _cmd_backtest(args: argparse.Namespace) -> int:
         print(df.head())
         print()
         print("by league:")
-        print(df.groupby("league").size().sort_values(ascending=False).head(15))
+        print(df.groupby("league").size().nlargest(15))
     return 0
 
 
