@@ -66,6 +66,7 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
     return SlateOptions(
         leagues=args.league,
         slugs=args.slug,
+        sports=args.sport,
         horizon_hours=cfg.DEFAULT_HORIZON_HOURS,
     )
 
@@ -80,6 +81,7 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         horizon_hours=opts.horizon_hours,
         slugs=opts.slugs or None,
+        sports=opts.sports or None,
     )
     print_run_summary(result)
     return 0
@@ -151,9 +153,26 @@ def _build_slate_parser() -> argparse.ArgumentParser:
         metavar="SLUG",
         help=(
             "Show a specific event by slug, bypassing the horizon filter. "
-            "Repeatable. When passed alone (no --league), the default browse "
-            "is skipped and ONLY the requested slugs land in the slate. "
-            "Combine with --league to union: default browse + explicit slugs."
+            "Repeatable. When passed alone (no --league / --sport), the "
+            "default browse is skipped and ONLY the requested slugs land "
+            "in the slate. Combine with --league or --sport to union: "
+            "filtered default browse + explicit slugs."
+        ),
+    )
+    p.add_argument(
+        "--sport",
+        action="append",
+        default=[],
+        metavar="TAG",
+        help=(
+            "Filter the slate at the gamma API level via tag_slug "
+            "(e.g. 'tennis', 'soccer', 'nba', 'mma', 'ufc', 'mlb', 'wnba', "
+            "'ice-hockey'). Repeatable: each tag is queried separately and "
+            "the results unioned. Different mechanic from --league, which "
+            "is a client-side slug-prefix filter applied after the listing "
+            "call. Combine the two to narrow further: e.g. "
+            "`--sport tennis --league atp` keeps only ATP-prefixed slugs "
+            "from the tennis listing. Empty = umbrella tag_slug=sports."
         ),
     )
     p.add_argument(

@@ -80,14 +80,22 @@ class SlateOptions:
     callers can pass the same instance through multiple stages without
     worrying about mutation.
 
-    `leagues` and `slugs` default to empty lists rather than None because
-    every callsite already normalizes the "no filter" case to an empty
-    iterable; one less branch downstream. Empty `leagues` = no league
-    filter (browse all sports).
+    `leagues`, `slugs`, and `sports` default to empty lists rather than
+    None because every callsite already normalizes the "no filter" case
+    to an empty iterable; one less branch downstream. Empty `leagues` =
+    no league filter (browse all sports). Empty `sports` = use gamma's
+    umbrella `tag_slug=sports` (current default).
+
+    `sports` filters at the gamma API layer via `tag_slug=<sport>` — one
+    gamma query per sport, fanned out and unioned. Common values:
+    `tennis`, `soccer`, `nba`, `mma`, `ufc`, `mlb`, `wnba`, `ice-hockey`.
+    Different mechanic from `leagues`, which is a client-side slug-
+    prefix filter applied AFTER the listing call.
     """
 
     leagues: list[str] = field(default_factory=list)
     slugs: list[str] = field(default_factory=list)
+    sports: list[str] = field(default_factory=list)
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS
 
 
@@ -95,6 +103,8 @@ async def fetch_gamma_slate(
     http: httpx.AsyncClient,
     leagues: list[str],
     horizon_hours: int,
+    *,
+    sports: list[str] | None = None,
 ) -> list[PolymarketEvent]:
     """Fetch the Polymarket sports slate from gamma-api.
 
@@ -103,10 +113,14 @@ async def fetch_gamma_slate(
     returned here. Filters layered top to bottom:
 
     1. **Bulk listing.** `list_gamma_events` pages through gamma's
-       `/events?tag_slug=sports&order=endDate&ascending=true` for upcoming
+       `/events?tag_slug=<tag>&order=endDate&ascending=true` for upcoming
        events soonest-first. Pagination is necessary because esports
        (cs2, lol, dota2) and high-volume markets crowd out actual sports
-       leagues in page 1.
+       leagues in page 1. When `sports` is non-empty, one listing call
+       fans out per sport tag (gamma's `tag_slug` query param accepts
+       only a single value), and the per-sport payloads are unioned and
+       deduped by event slug. Empty `sports` falls back to gamma's
+       umbrella `tag_slug=sports`.
     2. **Variant-bundle drop.** `PolymarketEvent.from_gamma` skips
        `-more-markets` / `-halftime-result` / `-exact-score` /
        `-total-corners` / `-player-props` event-level variants and
@@ -135,18 +149,46 @@ async def fetch_gamma_slate(
     horizon_start = now - timedelta(hours=6)
     horizon_end = now + timedelta(hours=horizon_hours)
 
-    payloads = await list_gamma_events(http)
-    log.info(
-        "fetched %d gamma payloads (leagues=%s, horizon=%sh)",
-        len(payloads),
-        leagues or "all",
-        horizon_hours,
-    )
+    sports = sports or []
+    if sports:
+        # Gamma's `tag_slug` query param is single-valued — fan out one
+        # listing per sport tag and union the payloads. Dedupe by event
+        # slug because tags overlap (e.g. `ufc` ⊂ `mma`).
+        page_lists = await asyncio.gather(
+            *(list_gamma_events(http, tag_slug=s) for s in sports)
+        )
+        seen: set[str] = set()
+        payloads: list[dict] = []
+        for plist in page_lists:
+            for p in plist:
+                slug = p.get("slug")
+                if not isinstance(slug, str) or slug in seen:
+                    continue
+                seen.add(slug)
+                payloads.append(p)
+        log.info(
+            "fetched %d gamma payloads across %d sport tag(s) [%s] "
+            "(leagues=%s, horizon=%sh)",
+            len(payloads),
+            len(sports),
+            ",".join(sports),
+            leagues or "all",
+            horizon_hours,
+        )
+    else:
+        payloads = await list_gamma_events(http)
+        log.info(
+            "fetched %d gamma payloads (leagues=%s, horizon=%sh)",
+            len(payloads),
+            leagues or "all",
+            horizon_hours,
+        )
 
     # League prefixes are anchored on dash so `arg` doesn't swallow `argf-`.
     league_prefixes = [f"{p}-" for p in leagues]
 
     kept: list[PolymarketEvent] = []
+    dropped_blowout = 0
     for payload in payloads:
         slug = payload.get("slug")
         if not isinstance(slug, str) or not slug:
@@ -175,14 +217,53 @@ async def fetch_gamma_slate(
         ]
         if not live_markets:
             continue
+        # Blowout filter — drop events whose favorite is priced at or above
+        # `MAX_IMPLIED_PROBABILITY` on the YES mid. Mid is the cleanest
+        # consensus implied prob; `max` across markets identifies the
+        # favorite uniformly across binary head-to-heads (max of YES + NO
+        # clone) and 3-way soccer (max of home/draw/away). No ranking
+        # signal at 99% — pure LLM-spend waste.
+        favorite_mid = max(
+            (m.yes_bid_dollars + m.yes_ask_dollars) / 2.0  # type: ignore[operator]
+            for m in live_markets
+        )
+        if favorite_mid >= cfg.MAX_IMPLIED_PROBABILITY:
+            dropped_blowout += 1
+            continue
         if len(live_markets) != len(ev.markets):
             ev = ev.model_copy(update={"markets": live_markets})
         kept.append(ev)
 
     log.info(
-        "kept %d gamma events after league + horizon + tradability filters",
+        "kept %d gamma events after league + horizon + tradability + "
+        "blowout (>=%.2f) filters; dropped %d as blowouts",
         len(kept),
+        cfg.MAX_IMPLIED_PROBABILITY,
+        dropped_blowout,
     )
+
+    # Sort by earliest market tipoff ascending, then cap to
+    # `MAX_SLATE_EVENTS`. Sort is unconditional because gamma's listing is
+    # ordered by `endDate` (settlement window), not tipoff — the two
+    # diverge on tours like ATP where settlement lags match end by days,
+    # so a naive head-slice would pick an arbitrary subset rather than
+    # "the soonest games." Events without any market `game_start_time`
+    # sort last so they don't displace tradable events at the head.
+    _far_future = datetime.max.replace(tzinfo=UTC)
+
+    def _tipoff(ev: PolymarketEvent) -> datetime:
+        starts = [t for m in ev.markets if (t := m.game_start_time) is not None]
+        return min(starts) if starts else _far_future
+
+    kept.sort(key=_tipoff)
+    if len(kept) > cfg.MAX_SLATE_EVENTS:
+        truncated = len(kept) - cfg.MAX_SLATE_EVENTS
+        kept = kept[: cfg.MAX_SLATE_EVENTS]
+        log.info(
+            "capped slate to %d soonest-tipoff events (truncated %d)",
+            cfg.MAX_SLATE_EVENTS,
+            truncated,
+        )
     return kept
 
 
@@ -247,11 +328,13 @@ async def fetch_slate(
     Composition rules — chosen so each flag matches its instinctive read:
     - bare (no flags): default browse, all sports within horizon.
     - `--league` only: default browse filtered by those league prefixes.
+    - `--sport` only: gamma listing scoped to those sport tags
+      (server-side `tag_slug=<sport>`).
     - `--slug` only: those events specifically. The default browse is
       SKIPPED — `skims fetch --slug X` means "show me X", not "show me X
       plus today's whole slate".
-    - `--league` + `--slug`: union (default browse filtered by leagues,
-      plus the explicit slugs added on top, deduped by event id).
+    - `--league` and/or `--sport` + `--slug`: union (filtered default
+      browse plus the explicit slugs added on top, deduped by event id).
 
     `--slug` always bypasses the horizon filter so the user can pull a
     specific event regardless of when it starts. CLOB book + price-history
@@ -260,13 +343,16 @@ async def fetch_slate(
     per-fetcher.
     """
     # Skip the default browse when the user gave only `--slug` and no
-    # `--league` — they're asking for those events specifically, not "those
-    # events plus today's full slate". When both flags are present, the
-    # default browse runs (filtered by leagues) and slugs add on top.
-    if opts.slugs and not opts.leagues:
+    # `--league` / `--sport` — they're asking for those events
+    # specifically, not "those events plus today's full slate". When any
+    # filter flag is present alongside `--slug`, the default browse
+    # runs (scoped by those filters) and slugs add on top.
+    if opts.slugs and not opts.leagues and not opts.sports:
         events: list[PolymarketEvent] = []
     else:
-        events = await fetch_gamma_slate(http, opts.leagues, opts.horizon_hours)
+        events = await fetch_gamma_slate(
+            http, opts.leagues, opts.horizon_hours, sports=opts.sports
+        )
 
     if opts.slugs:
         extra = await fetch_gamma_events(http, opts.slugs, opts.horizon_hours, gamma_sem)
@@ -705,6 +791,7 @@ async def run_pipeline(
     dry_run: bool = False,
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
     slugs: list[str] | None = None,
+    sports: list[str] | None = None,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon,
     enrich with CLOB book + price history, then run 4 specialists + director
@@ -713,7 +800,11 @@ async def run_pipeline(
 
     Slate composition:
     - default browse: tag-listed sports events filtered by `leagues` prefix(es)
-      and the horizon time window. Empty `leagues` = browse all sports.
+      and the horizon time window. Empty `leagues` = no client-side league
+      filter.
+    - `sports`: gamma `tag_slug=<sport>` server-side filter (e.g. `tennis`,
+      `nba`). Repeatable: each tag is queried separately and unioned.
+      Empty = umbrella `tag_slug=sports` (current default).
     - `slugs`: explicit list of event slugs to include (bypasses the horizon
       filter so a specific event always lands).
     """
@@ -744,6 +835,7 @@ async def run_pipeline(
         slate_opts = SlateOptions(
             leagues=leagues or [],
             slugs=slugs or [],
+            sports=sports or [],
             horizon_hours=horizon_hours,
         )
         events = await fetch_slate(slate_opts, http=uw.http, gamma_sem=gamma_sem)

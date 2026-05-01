@@ -9,7 +9,28 @@ from dotenv import load_dotenv
 # this are left out of the slate. 24h catches "today's slate"; use 48-72 on the
 # CLI to pull in tomorrow. Enforced server-side via Polymarket's startTimeMax,
 # so events outside the window never hit the matcher/LLM path.
-DEFAULT_HORIZON_HOURS = 12
+DEFAULT_HORIZON_HOURS = 8
+
+# Max implied probability for the event's favorite. Events whose favorite
+# is priced at or above this on the YES mid (`(bid+ask)/2`) are dropped
+# from the slate before the LLM path — there's no ranking signal to
+# extract from a 99% lock and the LLM spend is wasted. The check picks
+# `max` across all markets in the event so it works uniformly: for binary
+# head-to-heads `max(YES_mid, NO_mid)` IS the favorite's mid; for 3-way
+# soccer `max(home_mid, draw_mid, away_mid)` IS the favorite's mid.
+# `--slug X` requests bypass this filter, same posture as the horizon
+# filter — explicit slug fetches are user-driven.
+MAX_IMPLIED_PROBABILITY = 0.70
+
+# Cap on the number of events sent through the LLM chain from the default
+# browse. Survivors of all upstream filters (league + horizon + tradability
+# + blowout) are sorted by earliest market tipoff ascending and the top N
+# are kept; the rest are dropped before enrichment and LLM spend. Tuned
+# for cost containment on heavy days — the umbrella `tag_slug=sports`
+# browse can return 150+ events post-filter, which is ~$45 of LLM spend
+# at ~$0.30/event. `--slug X` fetches bypass the cap (added on top after
+# truncation), same posture as the horizon + blowout filters.
+MAX_SLATE_EVENTS = 5
 
 # Concurrency caps. See plan for rationale.
 # Each event runs through 4 Grok fetchers (Stage A) → 4 Claude reasoners
