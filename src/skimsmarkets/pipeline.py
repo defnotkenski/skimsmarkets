@@ -15,8 +15,10 @@ from xai_sdk import AsyncClient as XAIAsyncClient
 from skimsmarkets import config as cfg
 from skimsmarkets.agents.director import synthesize_prediction
 from skimsmarkets.agents.fetchers import FETCHERS
+from skimsmarkets.agents.judge import judge_slate
 from skimsmarkets.agents.reasoners import REASONERS
 from skimsmarkets.agents.schemas import (
+    DefensibilityAssessment,
     LensNotebook,
     MarketPrediction,
     SpecialistReport,
@@ -60,6 +62,14 @@ class RunResult:
     # as separate questions.
     notebooks: dict[str, dict[str, LensNotebook]] = field(default_factory=dict)
     reports: dict[str, dict[str, SpecialistReport]] = field(default_factory=dict)
+    # Slate-level judge output keyed event_id → DefensibilityAssessment.
+    # Populated by `judge_slate` after all per-event directors finish; left
+    # empty when the judge call fails (leaderboard then falls back to the
+    # legacy predicted-probability sort). Same persistence posture as
+    # `notebooks` / `reports` — best-effort, never aborts a run.
+    defensibility_assessments: dict[str, DefensibilityAssessment] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -725,6 +735,12 @@ def _persist_run(result: RunResult) -> None:
                     lens: r.model_dump(mode="json")
                     for lens, r in result.reports.get(p.event_id, {}).items()
                 }
+                # Judge output: persisted alongside the prediction so
+                # retrospective grading can correlate the judge's score
+                # against actual hit-rate as a separate question from the
+                # director's predicted probability. Null/empty when the
+                # judge call failed or didn't cover this event.
+                da = result.defensibility_assessments.get(p.event_id)
                 payload = {
                     "run_id": result.run_id,
                     "logged_at_utc": logged_at,
@@ -736,6 +752,15 @@ def _persist_run(result: RunResult) -> None:
                     "polymarket_implied_probability": p.polymarket_implied_probability,
                     "confidence": p.confidence,
                     "headline": p.headline,
+                    "defensibility_score": (
+                        da.defensibility_score if da is not None else None
+                    ),
+                    "defensibility_rationale": (
+                        da.defensibility_rationale if da is not None else None
+                    ),
+                    "defensibility_flags": (
+                        da.defensibility_flags if da is not None else []
+                    ),
                     "notebooks": notebooks_for_event,
                     "specialist_reports": reports_for_event,
                 }
@@ -895,6 +920,35 @@ async def run_pipeline(
             result.predictions.append(prediction)
             result.notebooks[prediction.event_id] = notebooks
             result.reports[prediction.event_id] = reports
+
+        # Slate-level judge — one Anthropic call after all per-event
+        # directors finish. Reads each MarketPrediction's reasoning + flags
+        # + UW note and emits a DefensibilityAssessment per event; the
+        # leaderboard then sorts by `defensibility_score` desc with
+        # `predicted_yes_probability` as a tiebreak. Failure here is
+        # silent-degrade: log a warning, record one slate-level
+        # ErrorRecord, and let the leaderboard fall back to
+        # predicted-probability sort. Skipped when the slate is empty (the
+        # existing `if result.predictions:` guard below would catch that,
+        # but skipping the call avoids spending a token on a known no-op).
+        if result.predictions:
+            try:
+                judgment = await judge_slate(anthropic, result.predictions)
+                for a in judgment.assessments:
+                    result.defensibility_assessments[a.event_id] = a
+            except Exception as e:  # noqa: BLE001
+                result.errors.append(
+                    ErrorRecord(
+                        event_id="*",
+                        stage="judge",
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                )
+                log.warning(
+                    "judge failed; falling back to "
+                    "predicted_probability sort: %s",
+                    e,
+                )
 
     if result.predictions:
         _persist_run(result)

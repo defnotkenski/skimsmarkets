@@ -8,6 +8,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from skimsmarkets.agents.schemas import MarketPrediction
 from skimsmarkets.pipeline import RunResult
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
@@ -40,6 +41,29 @@ def _rel_time(ts: datetime | None) -> str:
 
 def _confidence_style(c: str) -> str:
     return {"high": _MINT, "medium": _PEACH, "low": _ROSE}.get(c, "")
+
+
+def _defensibility_stars(score: float) -> str:
+    """Render a [0,1] defensibility score as a 1-5 star rating, color-graded
+    with the existing pastel palette (mint = strong case, peach = mid,
+    rose = weak). Empty stars stay dim. Bucket boundaries are 0.85 / 0.65
+    / 0.45 / 0.25 — chosen so a typical 0.74 lands at ★★★★ and 0.30 at
+    ★★, which matches the "Yelp rating" mental model the user expects at
+    a glance. The numeric score is still surfaced verbatim in the
+    rationale table for when precision matters; the stars are the
+    glanceable form.
+    """
+    if score >= 0.85:
+        filled, color = 5, _MINT
+    elif score >= 0.65:
+        filled, color = 4, _MINT
+    elif score >= 0.45:
+        filled, color = 3, _PEACH
+    elif score >= 0.25:
+        filled, color = 2, _ROSE
+    else:
+        filled, color = 1, _ROSE
+    return f"[{color}]{'★' * filled}[/][{_DIM}]{'☆' * (5 - filled)}[/]"
 
 
 def _pick_favorite(event: PolymarketEvent) -> PolymarketMarket:
@@ -151,16 +175,29 @@ def print_run_summary(result: RunResult) -> None:
     )
 
     if result.predictions:
-        # Leaderboard ranks events by the director's confidence in the winner —
-        # highest predicted probability first.
-        ranked = sorted(
-            result.predictions,
-            key=lambda p: p.predicted_yes_probability,
-            reverse=True,
+        # Leaderboard primary sort: judge `defensibility_score` descending
+        # (higher = stronger case). Tiebreak: predicted probability
+        # descending. Un-scored events (judge failed or didn't cover them)
+        # sort to the bottom via the -1.0 sentinel — outside the [0,1]
+        # valid range so they always lose to real scores. When the entire
+        # judge call failed, every event hits the sentinel and the tuple
+        # sort collapses to predicted-probability order, which is the
+        # legacy behavior we're falling back to.
+        def _sort_key(p: MarketPrediction) -> tuple[float, float]:
+            da = result.defensibility_assessments.get(p.event_id)
+            score = da.defensibility_score if da is not None else -1.0
+            return (score, p.predicted_yes_probability)
+
+        ranked = sorted(result.predictions, key=_sort_key, reverse=True)
+        any_judged = bool(result.defensibility_assessments)
+        title_text = (
+            "Defensibility leaderboard (most defensible case first)"
+            if any_judged
+            else "Confidence leaderboard (highest predicted probability first)"
         )
 
         leaderboard = Table(
-            title=f"[{_CREAM}]Confidence leaderboard (highest predicted probability first)[/]",
+            title=f"[{_CREAM}]{title_text}[/]",
             title_justify="left",
             box=box.SIMPLE_HEAVY,
             show_lines=False,
@@ -171,6 +208,7 @@ def print_run_summary(result: RunResult) -> None:
         leaderboard.add_column(
             "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
         )
+        leaderboard.add_column("Case", justify="center")
         leaderboard.add_column("Pred", justify="right")
         leaderboard.add_column("Poly impl", justify="right")
         leaderboard.add_column("Conf", justify="center")
@@ -182,10 +220,25 @@ def print_run_summary(result: RunResult) -> None:
                 if p.polymarket_implied_probability is not None
                 else "—"
             )
+            da = result.defensibility_assessments.get(p.event_id)
+            if da is not None:
+                # Stars on top, comma-joined flags dimly underneath. Empty
+                # flags = clean case; render just the stars. Numeric score
+                # lives in the rationale table for when precision matters.
+                if da.defensibility_flags:
+                    case_cell = (
+                        f"{_defensibility_stars(da.defensibility_score)}\n"
+                        f"[{_DIM}]{','.join(da.defensibility_flags)}[/]"
+                    )
+                else:
+                    case_cell = _defensibility_stars(da.defensibility_score)
+            else:
+                case_cell = "—"
             leaderboard.add_row(
                 str(rank),
                 event_display,
                 p.predicted_winner,
+                case_cell,
                 f"{p.predicted_yes_probability:.3f}",
                 poly_impl_str,
                 f"[{_confidence_style(p.confidence)}]{p.confidence}[/]",
@@ -214,6 +267,37 @@ def print_run_summary(result: RunResult) -> None:
                 p.headline,
             )
         console.print(headline_table)
+
+        # Defensibility-rationale detail table — same row order as the
+        # leaderboard. The leaderboard's Case column shows the stars +
+        # flags glanceably; the rationale (1-2 sentences) is too wide to
+        # fit there without squishing other columns, so it gets its own
+        # narrow table. Skipped entirely when the judge call failed (no
+        # assessments at all) so the user sees a clean fallback rather
+        # than a table of em-dashes.
+        if any_judged:
+            rationale_table = Table(
+                title=f"[{_CREAM}]Defensibility rationale (same order)[/]",
+                title_justify="left",
+                box=box.SIMPLE_HEAVY,
+                show_lines=False,
+                header_style=_LAVENDER,
+            )
+            rationale_table.add_column(
+                "Event", style=_SKY, overflow="fold", min_width=20
+            )
+            rationale_table.add_column("Case", justify="right")
+            rationale_table.add_column("Rationale", overflow="fold")
+            for p in ranked:
+                da = result.defensibility_assessments.get(p.event_id)
+                if da is None:
+                    continue
+                rationale_table.add_row(
+                    p.event_title or p.event_id,
+                    f"{da.defensibility_score:.2f}",
+                    da.defensibility_rationale,
+                )
+            console.print(rationale_table)
 
         # UW flow notes get their own table (rather than a column on the
         # reasoning table) — the 2-4 sentence notes are too wide to share a

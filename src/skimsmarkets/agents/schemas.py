@@ -284,3 +284,57 @@ class MarketPrediction(BaseModel):
         description="Empty when specialists aligned.",
     )
     uw_flow_note: str | None = None
+
+
+class DefensibilityAssessment(BaseModel):
+    """Per-event judgment from the slate-level judge.
+
+    Emitted by `judge_slate` (one LLM call per run that reads ALL events'
+    director outputs). Replaces `predicted_yes_probability` as the
+    leaderboard's primary sort key. Confidence-ranker framing: this scores
+    **case defensibility**, not edge or expected value — a high score
+    means the director's reasoning is coherent, the lenses agreed, and the
+    UW flow (when present) aligns with the prediction. The field name
+    intentionally measures the *absence* of risk (defensibility) rather
+    than the presence of it, so "higher = better" matches the leaderboard's
+    descending-sort direction without inversion.
+    """
+
+    event_id: str = Field(
+        description="Polymarket event id this assessment applies to. "
+        "Must match a MarketPrediction.event_id from the same run.",
+    )
+    defensibility_score: float = Field(
+        ge=0.0, le=1.0,
+        description=(
+            "Defensibility score in [0,1]. 1.0 = strongest case "
+            "(coherent reasoning, lens alignment, UW flow alignment); "
+            "0.0 = weakest. Sort direction matches predicted_yes_probability "
+            "(descending = better) so the leaderboard mental model is "
+            "preserved."
+        ),
+    )
+    defensibility_rationale: str = Field(
+        description="≤2 sentences explaining the score in plain English.",
+    )
+    defensibility_flags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Up to 3 short slugs naming the load-bearing weaknesses, e.g. "
+            "'thin_reasoning', 'lens_disagreement', 'uw_contra', "
+            "'concentrated_weights', 'unexplained_gap'. Empty when the case "
+            "is clean."
+        ),
+    )
+
+
+class SlateDefensibilityJudgment(BaseModel):
+    """Wrapper for the structured-output parse of the slate-level judge.
+
+    One per `judge_slate` call. `assessments` should contain one
+    `DefensibilityAssessment` per event in the input slate, but downstream
+    tolerates partial coverage (un-scored events sort to the bottom of the
+    leaderboard via a sentinel score).
+    """
+
+    assessments: list[DefensibilityAssessment]
