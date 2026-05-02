@@ -1,44 +1,100 @@
-"""Per-lens Grok fetchers — Stage A of the two-stage agent chain.
+"""Provider-agnostic fetcher core — the Protocol every provider implements,
+plus the user-message rendering and lens-dispatch helpers shared across
+providers.
 
-Each fetcher gets the same event-context user message (rendered once via
-`render_context`) plus its lens-specific system prompt, calls the
-`web_search` / `x_search` / `code_execution` tools adaptively, and emits a
-`LensNotebook` of evidence (prose + citations + computed numbers). It does
-NOT commit to a probability, signed shift, or directional verdict — that's
-the reasoner's job in Stage B (see `agents/reasoners.py`).
-
-`agent_count=4` is preserved on every fetcher: when the only job is
-evidence-gathering, multi-agent ensemble adds search-path diversity, which
-is exactly the win we want from this split.
+The fetcher's job is evidence capture, not judgment — it emits a
+`LensNotebook` (free-form prose + citations + computed numbers) and never
+commits to a probability or directional verdict. The verdict lives in the
+downstream Claude reasoner (see `agents/reasoners.py`). Provider files
+(`grok.py`, `gemini.py`) implement `FetcherProvider` by wiring their SDK
+to the prebuilt per-lens system prompts that `LENS_PROMPT_BUILDERS` exposes.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable
-
-from xai_sdk import AsyncClient as XAIAsyncClient
-from xai_sdk.chat import system, user
-from xai_sdk.tools import code_execution, web_search, x_search
+from typing import Awaitable, Callable, Protocol
 
 from skimsmarkets.agents.prompts import (
-    INJURY_NOTEBOOK_SYSTEM,
-    MARKET_CONTEXT_NOTEBOOK_SYSTEM,
-    NARRATIVE_NOTEBOOK_SYSTEM,
-    STATISTICS_NOTEBOOK_SYSTEM,
+    injury_notebook_system,
+    market_context_notebook_system,
+    narrative_notebook_system,
+    statistics_notebook_system,
 )
 from skimsmarkets.agents.schemas import LensName, LensNotebook
-from skimsmarkets.agents.sport_hints import render_sport_hint
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
 log = logging.getLogger(__name__)
 
-GROK_MODEL = "grok-4.20-multi-agent-0309"
 
-FetcherFn = Callable[
-    [XAIAsyncClient, PolymarketEvent],
-    Awaitable[LensNotebook],
-]
+# Lens → (tools_section, notebook_tail) → system_prompt builder.
+# Providers call `build_lens_prompts` with their own per-lens tool prose
+# and shared notebook tail to pre-build the four lens-specific system
+# prompts at construction time. Centralised here so both providers stay
+# in sync on the lens-preamble bodies (which describe the lens's *job*,
+# not the provider's tools).
+LENS_PROMPT_BUILDERS: dict[LensName, Callable[[str, str], str]] = {
+    "statistics": statistics_notebook_system,
+    "injury": injury_notebook_system,
+    "narrative": narrative_notebook_system,
+    "market_context": market_context_notebook_system,
+}
+
+
+def build_lens_prompts(
+    tools_by_lens: dict[LensName, str], notebook_tail: str
+) -> dict[LensName, str]:
+    """Pre-build the four lens system prompts for one provider.
+
+    `tools_by_lens` is the provider's per-lens "What each tool can give
+    you here" prose; `notebook_tail` is the provider's generic tool list
+    + output rules. The lens-preamble bodies (the load-bearing prose
+    describing each lens's job) come from `LENS_PROMPT_BUILDERS` so both
+    providers stay in lockstep on what each lens actually does.
+
+    Iterates `LENS_PROMPT_BUILDERS` keys directly (rather than `.items()`)
+    so the loop variable retains its `LensName` literal type — PyCharm's
+    type narrowing widens through tuple-unpacked comprehensions.
+    """
+    return {
+        lens: LENS_PROMPT_BUILDERS[lens](tools_by_lens[lens], notebook_tail)
+        for lens in LENS_PROMPT_BUILDERS
+    }
+
+
+class FetcherProvider(Protocol):
+    """A provider that runs the per-lens fetch stage.
+
+    `name` and `model` are persisted to the per-run JSONL (top-level row
+    metadata) so retrospective grading can group hit-rate by provider /
+    model version. `fetch` runs one lens for one event and returns the
+    parsed `LensNotebook`; lens-mismatch validation happens inside the
+    provider via `assert_lens_match` so prompt-mixup bugs fail loud at
+    fetch time.
+    """
+
+    name: str
+    model: str
+
+    async def fetch(
+        self, event: PolymarketEvent, lens: LensName
+    ) -> LensNotebook: ...
+
+    async def aclose(self) -> None: ...
+
+
+def assert_lens_match(parsed: LensNotebook, expected: LensName, event_id: str) -> None:
+    """Fail loud when a fetcher returns the wrong `lens` discriminator.
+
+    Catches prompt-mixup bugs at fetch time rather than letting them
+    silently break downstream reasoner dispatch. Both providers call this
+    immediately after parsing.
+    """
+    if parsed.lens != expected:
+        raise RuntimeError(
+            f"fetcher lens mismatch for event {event_id}: expected {expected!r}, "
+            f"got {parsed.lens!r}"
+        )
 
 
 def pick_team_a_market(event: PolymarketEvent) -> PolymarketMarket | None:
@@ -235,82 +291,6 @@ def render_context(event: PolymarketEvent) -> str:
     )
 
 
-def _tools() -> list:
-    """Fresh per-call list of server-side tools. Every specialist gets the full loadout."""
-    return [web_search(), x_search(), code_execution()]
-
-
-async def _run_fetcher(
-    xai: XAIAsyncClient,
-    event: PolymarketEvent,
-    system_prompt: str,
-    lens: LensName,
-) -> LensNotebook:
-    chat = xai.chat.create(
-        model=GROK_MODEL,
-        agent_count=4,
-        messages=[system(system_prompt)],
-        tools=_tools(),
-    )
-    # Sport-specific guidance rides on the user message (NOT the cached system
-    # block) so the cached system prompt stays warm across all events. Returns
-    # None for sports we don't specialize, in which case we send the bare
-    # context.
-    user_msg = render_context(event)
-    if (sport_hint := render_sport_hint(lens, event)) is not None:
-        user_msg += "\n\n" + sport_hint
-    chat.append(user(user_msg))
-    response, parsed = await chat.parse(LensNotebook)
-    # Fail loud if the fetcher returned the wrong discriminator — catches
-    # prompt-mixup bugs at fetch time rather than letting them break the
-    # downstream reasoner dispatch silently.
-    if parsed.lens != lens:
-        raise RuntimeError(
-            f"fetcher lens mismatch for event {event.id}: expected {lens!r}, "
-            f"got {parsed.lens!r}"
-        )
-    log.debug(
-        "fetcher=%s event=%s coverage=%s citations=%d computed=%d tokens in/out=%s/%s",
-        lens,
-        event.id,
-        parsed.coverage,
-        len(parsed.citations),
-        len(parsed.computed_numbers),
-        getattr(response.usage, "prompt_tokens", None),
-        getattr(response.usage, "completion_tokens", None),
-    )
-    return parsed
-
-
-async def fetch_statistics_notebook(
-    xai: XAIAsyncClient, event: PolymarketEvent
-) -> LensNotebook:
-    return await _run_fetcher(xai, event, STATISTICS_NOTEBOOK_SYSTEM, "statistics")
-
-
-async def fetch_injury_notebook(
-    xai: XAIAsyncClient, event: PolymarketEvent
-) -> LensNotebook:
-    return await _run_fetcher(xai, event, INJURY_NOTEBOOK_SYSTEM, "injury")
-
-
-async def fetch_narrative_notebook(
-    xai: XAIAsyncClient, event: PolymarketEvent
-) -> LensNotebook:
-    return await _run_fetcher(xai, event, NARRATIVE_NOTEBOOK_SYSTEM, "narrative")
-
-
-async def fetch_market_context_notebook(
-    xai: XAIAsyncClient, event: PolymarketEvent
-) -> LensNotebook:
-    return await _run_fetcher(
-        xai, event, MARKET_CONTEXT_NOTEBOOK_SYSTEM, "market_context"
-    )
-
-
-FETCHERS: dict[str, FetcherFn] = {
-    "statistics": fetch_statistics_notebook,
-    "injury": fetch_injury_notebook,
-    "narrative": fetch_narrative_notebook,
-    "market_context": fetch_market_context_notebook,
-}
+# Type alias retained for readability at the protocol boundary; providers
+# don't strictly need it but keeping it documents the per-lens fetch shape.
+FetcherFn = Callable[[PolymarketEvent], Awaitable[LensNotebook]]

@@ -1,7 +1,8 @@
 """Per-lens Claude reasoners — Stage B of the two-stage agent chain.
 
-Each reasoner takes the `LensNotebook` produced by its lens's Grok fetcher
-plus the same event context the fetcher saw, and emits the typed report
+Each reasoner takes the `LensNotebook` produced by its lens's fetcher
+(Grok or Gemini, transparent to the reasoner) plus the same event context
+the fetcher saw, and emits the typed report
 (`StatisticsReport`, `InjuryReport`, `NarrativeReport`, `MarketContextReport`)
 that the director consumes. Verdicts (probability, signed shift,
 motivation_edge, sharp_money_signal) live here, not in the notebook.
@@ -17,7 +18,6 @@ lost.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Awaitable, Callable
 
@@ -32,7 +32,7 @@ from anthropic.types import (
 from pydantic import BaseModel
 
 from skimsmarkets.agents.director import CLAUDE_MAX_OUTPUT_TOKENS, CLAUDE_MODEL
-from skimsmarkets.agents.fetchers import FETCHERS, render_context
+from skimsmarkets.agents.fetchers import render_context
 from skimsmarkets.agents.prompts import (
     INJURY_REASONER_SYSTEM,
     MARKET_CONTEXT_REASONER_SYSTEM,
@@ -164,24 +164,3 @@ REASONERS: dict[str, ReasonerFn] = {
     "narrative": reason_narrative,
     "market_context": reason_market_context,
 }
-
-
-async def run_lens(
-    xai,
-    anthropic: AsyncAnthropic,
-    event: PolymarketEvent,
-    lens: str,
-    fetcher_sem: asyncio.Semaphore,
-    reasoner_sem: asyncio.Semaphore,
-) -> tuple[LensNotebook, SpecialistReport]:
-    """Run the full Grok→Claude chain for one lens on one event.
-
-    Releases `fetcher_sem` BEFORE acquiring `reasoner_sem` — Grok's search
-    loop can take 60s+, and holding the fetcher slot through the reasoner
-    call would starve other lenses' fetchers unnecessarily.
-    """
-    async with fetcher_sem:
-        notebook = await FETCHERS[lens](xai, event)
-    async with reasoner_sem:
-        report = await REASONERS[lens](anthropic, event, notebook)
-    return notebook, report

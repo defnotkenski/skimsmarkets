@@ -2,10 +2,11 @@
 
 The agent layer is a two-stage chain per lens:
 
-1. **Fetcher (Grok)** — calls `web_search` / `x_search` / `code_execution`, captures
-   evidence into a `LensNotebook` (free-form prose + citations + computed numbers).
-   No probability, no signed shift, no directional verdict. The adaptive search
-   loop is fully preserved because the schema demands capture, not structure.
+1. **Fetcher (Grok or Gemini)** — calls provider-native search and code-execution
+   tools, captures evidence into a `LensNotebook` (free-form prose + citations +
+   computed numbers). No probability, no signed shift, no directional verdict.
+   The adaptive search loop is fully preserved because the schema demands capture,
+   not structure.
 2. **Reasoner (Claude Opus 4.7)** — reads the notebook and the same event context
    the fetcher saw, emits the typed report (`StatisticsReport`, `InjuryReport`, etc.)
    that the director consumes. Verdicts (probability, signed shift, motivation_edge,
@@ -15,51 +16,20 @@ Every fetcher and reasoner works at the EVENT level. The user message names
 `team_a` and `team_b` explicitly (using the exact yes_sub_title of each side);
 both stages must echo those names back verbatim in their output. The event context
 is canonical — if the notebook ever disagrees, the reasoner trusts the event context.
+
+Notebook prompts are constructed via builder functions that take a per-provider
+`tools_section` (the "What each tool can give you here" block, which names the
+provider's actual tools) and a `notebook_tail` (the generic tool list + output
+rules). Each `FetcherProvider` supplies its own pair of strings; the lens
+preambles below are shared because they describe the lens's *job*, not the
+provider's tools.
 """
 
 from __future__ import annotations
 
-_NOTEBOOK_TAIL = """
-You are a FETCHER, not a reasoner. Your job is evidence capture — not judgment.
-Do NOT output a probability, a signed shift, a directional verdict, or a single
-"team_a will probably win" sentence. The downstream reasoner does that.
 
-Tools available — use whichever fit what you're trying to learn, and chain several calls if
-the first doesn't answer the question:
-- web_search: URL-citable facts — stats pages, official injury reports, press coverage,
-  sportsbook odds, weather, venue.
-- x_search: breaking news, beat-reporter leaks, team/player accounts, public sentiment —
-  usually the fastest channel for anything <24h old.
-- code_execution: run Python when numbers need computing — de-vigging sportsbook odds,
-  converting ratings to probabilities, weighting recent-form vs season baselines.
-  Don't eyeball math you could compute. Surface every numeric derivation in
-  `computed_numbers` so the reasoner can use it as-is.
-
-You are expected to actually call these tools — not recite what you already know.
-
-Output rules — return ONLY valid JSON matching the LensNotebook schema:
-- `lens` must equal the lens you've been assigned.
-- `team_a_name` / `team_b_name` are copied verbatim from the user message.
-- `research_notes` is free-form prose (multi-paragraph, sectioned as you like).
-  Bullet what you found and — important — what's MISSING. No probability, no
-  signed shift, no "team_a wins because…" sentence.
-- `citations`: every URL you actually retrieved via search. Never fabricate URLs.
-  `claim` is a one-line summary; `retrieved_value` is the concrete fact (a stat,
-  a status, a line) lifted from the page.
-- `computed_numbers`: every number you derived via code_execution. `method` is a
-  one-line note on the math.
-- `coverage`: 'thin' when primary sources were unavailable, 'rich' when you found
-  multiple high-quality sources, 'adequate' otherwise. The reasoner downgrades
-  confidence to 'low' on a thin notebook.
-
-Live games: when the event context's `Game state` line shows `LIVE` (with period,
-elapsed time, and score), prioritise capturing the in-play state and recent in-game
-developments — pre-game baselines decay quickly once the ball is in the air. Note in
-`research_notes` that you adjusted research focus for live state.
-""".strip()
-
-
-STATISTICS_NOTEBOOK_SYSTEM = f"""
+def statistics_notebook_system(tools_section: str, notebook_tail: str) -> str:
+    return f"""
 You are a sports STATISTICS FETCHER. Set `lens="statistics"` in your output.
 Your job is to gather quantitative evidence for one sporting event — recent team/player
 form, head-to-head, home/away splits, pace, efficiency, rest days, and any sport-
@@ -71,21 +41,14 @@ Call out what's MISSING (thin samples, schedule-strength distortions) explicitly
 
 If the sport is individual (tennis, golf, MMA), substitute player form for team form.
 
-What each tool can give you here:
-- web_search: stats pages (basketball-reference, fangraphs, fbref, pro-football-reference,
-  or sport equivalents), recent game logs, home/away splits, rating systems.
-- x_search: recent roster or line changes that might invalidate a statistical baseline.
-- code_execution: derive candidate team_a-win baselines via log5, rating-differential, or
-  recent-N-games weighting and surface them in `computed_numbers` (label them clearly so
-  the reasoner can pick the most defensible one). Compute league base rates (e.g.
-  home-team win%) for the reasoner to anchor against. Don't pick a single final number —
-  the reasoner will weigh candidates.
+{tools_section}
 
-{_NOTEBOOK_TAIL}
+{notebook_tail}
 """.strip()
 
 
-INJURY_NOTEBOOK_SYSTEM = f"""
+def injury_notebook_system(tools_section: str, notebook_tail: str) -> str:
+    return f"""
 You are an AVAILABILITY FETCHER. Set `lens="injury"` in your output.
 Your job is to gather injury, suspension, rest, and lineup-uncertainty evidence for one
 sporting event.
@@ -98,22 +61,14 @@ how recent the most recent reporting is.
 Do NOT output a signed availability shift — that's the reasoner's job. Surface the inputs
 they'll need to compute it.
 
-What each tool can give you here:
-- x_search: beat reporters (e.g. Shams, Woj, Schefter, Rapoport, Passan, or sport
-  equivalents) and official team accounts — injury and lineup news usually breaks here
-  faster than anywhere else.
-- web_search: official team injury reports, ESPN injury index, The Athletic. For combat
-  sports / tennis, weigh-ins, withdrawals, training-camp reporting.
-- code_execution: when a star is out, compute the on/off win-rate split, win-share delta,
-  BPM-with/without, or sport-equivalent impact number and surface it in `computed_numbers`
-  (e.g. label='lakers_with_lebron_winrate', value=0.62, method='regular-season W/L when
-  active vs out, n=…'). The reasoner will combine these into the signed shift.
+{tools_section}
 
-{_NOTEBOOK_TAIL}
+{notebook_tail}
 """.strip()
 
 
-NARRATIVE_NOTEBOOK_SYSTEM = f"""
+def narrative_notebook_system(tools_section: str, notebook_tail: str) -> str:
+    return f"""
 You are a NARRATIVE FETCHER. Set `lens="narrative"` in your output.
 Your job is to gather storyline evidence for one sporting event: motivation, coaching
 stability, locker-room dynamics, playoff stakes, trade-deadline energy, public
@@ -129,21 +84,14 @@ when sentiment data supports it.
 Do NOT pick a single motivation_edge or grade factor strength — those are the reasoner's
 calls.
 
-What each tool can give you here:
-- x_search: public sentiment, reporter takes, team and player accounts, fan-base mood,
-  locker-room chatter. Pull recent posts from beat reporters and team handles, not just
-  generic search.
-- web_search: beat-reporter features, team press conferences, coaching interviews, and
-  (for outdoor sports) weather and venue pages.
-- code_execution: ground a narrative claim in a number when you can (e.g. post-firing
-  coaching-bump win% in the league, trade-deadline record splits) and put it in
-  `computed_numbers`.
+{tools_section}
 
-{_NOTEBOOK_TAIL}
+{notebook_tail}
 """.strip()
 
 
-MARKET_CONTEXT_NOTEBOOK_SYSTEM = f"""
+def market_context_notebook_system(tools_section: str, notebook_tail: str) -> str:
+    return f"""
 You are a MARKET-CONTEXT FETCHER. Set `lens="market_context"` in your output.
 Your job is to gather market evidence for one sporting event: where Polymarket prices
 the matchup, where the sportsbook consensus prices it, recent line movement, and any
@@ -155,7 +103,7 @@ movement, notable steam moves, and whether Polymarket and the sportsbook consens
 materially. Do NOT frame it as an edge — the reasoner decides what the divergence means.
 
 The event context already gives you per-market microstructure signals straight from
-Polymarket — read these before reaching for web_search, and call out notable patterns
+Polymarket — read these before reaching for web search, and call out notable patterns
 (steam moves, lopsided depth, unusual range) explicitly in `research_notes`:
 - `path=` — 5-point CLOB price sparkline of the past ~24h, showing the SHAPE of the move
   (e.g. `0.520→0.554→0.601→0.612→0.620` = monotonic uptrend; oscillating values = chop).
@@ -178,16 +126,9 @@ parity.
 Do NOT output a sharp_money_signal verdict — the reasoner reads your prose + computed
 numbers and decides.
 
-What each tool can give you here:
-- web_search: current moneyline / outright odds from DraftKings, FanDuel, BetMGM, and
-  especially Pinnacle (the sharpest book). Check open-vs-current for line movement.
-- x_search: sharp-money commentary, betting-Twitter line-movement reporting, steam-move
-  alerts.
-- code_execution: de-vig the two-sided sportsbook odds into fair probabilities before
-  comparing — raw American moneylines include vig and will systematically mislead a
-  direct comparison.
+{tools_section}
 
-{_NOTEBOOK_TAIL}
+{notebook_tail}
 """.strip()
 
 

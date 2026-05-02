@@ -10,11 +10,10 @@ from pathlib import Path
 
 import httpx
 from anthropic import AsyncAnthropic
-from xai_sdk import AsyncClient as XAIAsyncClient
 
 from skimsmarkets import config as cfg
 from skimsmarkets.agents.director import synthesize_prediction
-from skimsmarkets.agents.fetchers import FETCHERS
+from skimsmarkets.agents.fetchers import FetcherProvider, build_provider
 from skimsmarkets.agents.judge import judge_slate
 from skimsmarkets.agents.reasoners import REASONERS
 from skimsmarkets.agents.schemas import (
@@ -51,15 +50,22 @@ class ErrorRecord:
 @dataclass
 class RunResult:
     run_id: str
+    # Fetcher provider name + model id captured at run start. Persisted
+    # to every JSONL row so retrospective A/B grading can group hit-rate
+    # by provider / model version with a one-line jq filter. Defaults so
+    # callers / tests that build RunResult directly don't need to set
+    # them; `run_pipeline` always overwrites both.
+    fetcher_provider: str = ""
+    fetcher_model: str = ""
     predictions: list[MarketPrediction] = field(default_factory=list)
     errors: list[ErrorRecord] = field(default_factory=list)
     fetched_events: int = 0
     considered_events: int = 0
-    # Per-event notebooks (Stage A — Grok) and reasoner reports (Stage B —
-    # Claude) keyed event_id → lens_name → object. Persisted alongside the
-    # final MarketPrediction to JSONL so retrospective grading can ask
-    # "did Grok find the right facts?" and "did Claude reason correctly?"
-    # as separate questions.
+    # Per-event notebooks (Stage A — fetcher) and reasoner reports
+    # (Stage B — Claude) keyed event_id → lens_name → object. Persisted
+    # alongside the final MarketPrediction to JSONL so retrospective
+    # grading can ask "did the fetcher find the right facts?" and "did
+    # Claude reason correctly?" as separate questions.
     notebooks: dict[str, dict[str, LensNotebook]] = field(default_factory=dict)
     reports: dict[str, dict[str, SpecialistReport]] = field(default_factory=dict)
     # Slate-level judge output keyed event_id → DefensibilityAssessment.
@@ -643,18 +649,18 @@ async def enrich_price_history(
 
 
 async def _run_lenses(
-    xai: XAIAsyncClient,
+    provider: FetcherProvider,
     anthropic: AsyncAnthropic,
     event: PolymarketEvent,
     fetcher_sem: asyncio.Semaphore,
     reasoner_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
 ) -> tuple[dict[str, LensNotebook], dict[str, SpecialistReport]] | None:
-    """Run all four lenses for one event. Each lens is a Grok fetcher
+    """Run all four lenses for one event. Each lens is a provider fetcher
     (Stage A) → Claude reasoner (Stage B) chain; lenses run in parallel,
-    Grok→Claude is sequential within a lens.
+    fetcher→reasoner is sequential within a lens.
 
-    `fetcher_sem` is released between stages so a slow Grok search loop
+    `fetcher_sem` is released between stages so a slow fetcher search loop
     doesn't tie up a fetcher slot through the (typically faster) Claude
     reasoner call. Per-event failure posture matches the legacy specialists
     pipeline: any failure at either stage of any lens drops the event so
@@ -664,7 +670,7 @@ async def _run_lenses(
     async def _one(lens: str) -> _LensOutcome:
         try:
             async with fetcher_sem:
-                notebook = await FETCHERS[lens](xai, event)
+                notebook = await provider.fetch(event, lens)  # type: ignore[arg-type]
         except Exception as e:  # noqa: BLE001
             return _LensOutcome(lens=lens, error_stage="fetcher", error=e)
         try:
@@ -676,7 +682,7 @@ async def _run_lenses(
             )
         return _LensOutcome(lens=lens, notebook=notebook, report=report)
 
-    outcomes = await asyncio.gather(*(_one(n) for n in FETCHERS))
+    outcomes = await asyncio.gather(*(_one(n) for n in REASONERS))
     notebooks: dict[str, LensNotebook] = {}
     reports: dict[str, SpecialistReport] = {}
     failed = False
@@ -744,6 +750,11 @@ def _persist_run(result: RunResult) -> None:
                 payload = {
                     "run_id": result.run_id,
                     "logged_at_utc": logged_at,
+                    # Run-level fetcher metadata — top-level (not nested in
+                    # `notebooks`) so retrospective A/B grading can group
+                    # rows by provider via `jq '.fetcher_provider'`.
+                    "fetcher_provider": result.fetcher_provider,
+                    "fetcher_model": result.fetcher_model,
                     "event_id": p.event_id,
                     "event_title": p.event_title,
                     "market_slug": p.market_slug,
@@ -771,7 +782,7 @@ def _persist_run(result: RunResult) -> None:
 
 
 async def process_event(
-    xai: XAIAsyncClient,
+    provider: FetcherProvider,
     anthropic: AsyncAnthropic,
     event: PolymarketEvent,
     fetcher_sem: asyncio.Semaphore,
@@ -789,7 +800,7 @@ async def process_event(
     """
     log.info("processing event %s (%s)", event.id, event.title)
     pairs = await _run_lenses(
-        xai, anthropic, event, fetcher_sem, reasoner_sem, errors
+        provider, anthropic, event, fetcher_sem, reasoner_sem, errors
     )
     if pairs is None:
         return None
@@ -817,6 +828,7 @@ async def run_pipeline(
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
+    fetcher_provider: str | None = None,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon,
     enrich with CLOB book + price history, then run 4 specialists + director
@@ -832,8 +844,12 @@ async def run_pipeline(
       Empty = umbrella `tag_slug=sports` (current default).
     - `slugs`: explicit list of event slugs to include (bypasses the horizon
       filter so a specific event always lands).
+    - `fetcher_provider`: 'grok' or 'gemini'. None = use FETCHER_PROVIDER env
+      var, defaulting to 'grok'. The provider runs the per-lens Stage A
+      (fetcher) for every event in the slate; reasoner / director / judge
+      are always Claude regardless.
     """
-    config = cfg.Config.from_env()
+    config = cfg.Config.from_env(fetcher_provider=fetcher_provider)
     run_id = uuid.uuid4().hex[:8]
     result = RunResult(run_id=run_id)
 
@@ -893,13 +909,18 @@ async def run_pipeline(
         else:
             log.info("clob price history disabled (cfg.CLOB_HISTORY_ENABLED=False)")
 
-        xai = XAIAsyncClient(api_key=config.xai_api_key)
+        provider = build_provider(config.fetcher_provider, config)
+        result.fetcher_provider = provider.name
+        result.fetcher_model = provider.model
+        log.info(
+            "fetcher provider=%s model=%s", provider.name, provider.model
+        )
         anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
         try:
             outcomes = await asyncio.gather(
                 *(
                     process_event(
-                        xai,
+                        provider,
                         anthropic,
                         e,
                         fetcher_sem,
@@ -911,7 +932,7 @@ async def run_pipeline(
                 )
             )
         finally:
-            await xai.close()
+            await provider.aclose()
 
         for outcome in outcomes:
             if outcome is None:
