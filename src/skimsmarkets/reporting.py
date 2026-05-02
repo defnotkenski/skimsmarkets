@@ -245,106 +245,12 @@ def print_run_summary(result: RunResult) -> None:
             )
         console.print(leaderboard)
 
-        # At-a-glance: one sentence per event so the table fits on screen during a
-        # time crunch. The director's full multi-sentence `reasoning` is still on
-        # the model — print it from the detail/debug path when needed.
-        headline_table = Table(
-            title=f"[{_CREAM}]Director headline (same order)[/]",
-            title_justify="left",
-            box=box.SIMPLE_HEAVY,
-            show_lines=False,
-            header_style=_LAVENDER,
-        )
-        headline_table.add_column("Event", style=_SKY, overflow="fold", min_width=20)
-        headline_table.add_column(
-            "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
-        )
-        headline_table.add_column("Headline", overflow="fold")
-        for p in ranked:
-            headline_table.add_row(
-                p.event_title or p.event_id,
-                p.predicted_winner,
-                p.headline,
-            )
-        console.print(headline_table)
-
-        # Defensibility-rationale detail table — same row order as the
-        # leaderboard. The leaderboard's Case column shows the stars +
-        # flags glanceably; the rationale (1-2 sentences) is too wide to
-        # fit there without squishing other columns, so it gets its own
-        # narrow table. Skipped entirely when the judge call failed (no
-        # assessments at all) so the user sees a clean fallback rather
-        # than a table of em-dashes.
-        if any_judged:
-            rationale_table = Table(
-                title=f"[{_CREAM}]Defensibility rationale (same order)[/]",
-                title_justify="left",
-                box=box.SIMPLE_HEAVY,
-                show_lines=False,
-                header_style=_LAVENDER,
-            )
-            rationale_table.add_column(
-                "Event", style=_SKY, overflow="fold", min_width=20
-            )
-            rationale_table.add_column("Case", justify="right")
-            rationale_table.add_column("Rationale", overflow="fold")
-            for p in ranked:
-                da = result.defensibility_assessments.get(p.event_id)
-                if da is None:
-                    continue
-                rationale_table.add_row(
-                    p.event_title or p.event_id,
-                    f"{da.defensibility_score:.2f}",
-                    da.defensibility_rationale,
-                )
-            console.print(rationale_table)
-
-        # UW flow notes get their own table (rather than a column on the
-        # reasoning table) — the 2-4 sentence notes are too wide to share a
-        # row with the reasoning text without squishing both. Only events
-        # with a non-null `uw_flow_note` appear here; everything else is
-        # silently omitted, including events with no UW coverage at all.
-        uw_rows = [p for p in ranked if p.uw_flow_note]
-        if uw_rows:
-            uw_table = Table(
-                title=f"[{_CREAM}]Unusual Whales flow (where UW had coverage)[/]",
-                title_justify="left",
-                box=box.SIMPLE_HEAVY,
-                show_lines=True,
-                header_style=_LAVENDER,
-            )
-            uw_table.add_column("Event", style=_SKY, overflow="fold", min_width=20)
-            uw_table.add_column(
-                "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
-            )
-            uw_table.add_column("UW flow", overflow="fold")
-            for p in uw_rows:
-                uw_table.add_row(
-                    p.event_title or p.event_id,
-                    p.predicted_winner,
-                    p.uw_flow_note or "",
-                )
-            console.print(uw_table)
-
-        # Flags get their own table so long notes don't break the leaderboard rows.
-        flag_rows: list[tuple[str, str]] = []
-        for p in ranked:
-            label = p.event_title or p.event_id
-            for disagreement in p.disagreements_flagged:
-                flag_rows.append((label, disagreement))
-        if flag_rows:
-            flag_table = Table(
-                title=f"[{_CREAM}]Flags[/]",
-                title_justify="left",
-                box=box.SIMPLE,
-                show_lines=False,
-                header_style=_LAVENDER,
-            )
-            flag_table.add_column("Event", style=_SKY)
-            flag_table.add_column("Note")
-            for label, note in flag_rows:
-                flag_table.add_row(label, note)
-            console.print(flag_table)
+    # Detail tables (headline / defensibility rationale / UW flow notes /
+    # disagreement flags) used to print here. They moved to the JSONL
+    # row's top level (see `_persist_run`) so retrospective grading and
+    # ad-hoc inspection can `jq '.headline' / '.uw_flow_note'` etc.
+    # without re-running. Errors stay terminal-only because they aren't
+    # persisted to JSONL — losing them would silence dropped events.
 
     if result.errors:
         err_table = Table(

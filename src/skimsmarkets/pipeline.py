@@ -763,6 +763,18 @@ def _persist_run(result: RunResult) -> None:
                     "polymarket_implied_probability": p.polymarket_implied_probability,
                     "confidence": p.confidence,
                     "headline": p.headline,
+                    # Director synthesis fields — `reasoning` is the 3-6
+                    # sentence rationale, `specialist_weights` shows how
+                    # the four lenses were weighted, `disagreements_flagged`
+                    # surfaces material directional disagreements between
+                    # specialists, and `uw_flow_note` captures the director's
+                    # read on Unusual Whales flow when present (null
+                    # otherwise). All four feed retrospective grading of
+                    # synthesis quality and UW alignment over time.
+                    "reasoning": p.reasoning,
+                    "specialist_weights": p.specialist_weights,
+                    "disagreements_flagged": p.disagreements_flagged,
+                    "uw_flow_note": p.uw_flow_note,
                     "defensibility_score": (
                         da.defensibility_score if da is not None else None
                     ),

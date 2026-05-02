@@ -44,6 +44,13 @@ from skimsmarkets.polymarket.models import PolymarketEvent
 log = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3.1-pro-preview"
+# Output ceiling for the structured JSON response (does NOT include thinking
+# tokens — those are billed separately on Gemini 3.x). Matches the
+# Claude reasoner / director ceiling (16k) so a wordy LensNotebook with
+# rich `research_notes` + a dozen citations + computed_numbers fits with
+# headroom. Default Gemini caps are model-dependent and have truncated
+# real notebooks mid-JSON in practice — set this explicitly.
+GEMINI_MAX_OUTPUT_TOKENS = 16_000
 
 
 # Generic notebook tail — output rules + tool list naming Gemini's actual
@@ -222,6 +229,7 @@ class GeminiProvider:
             thinking_config=genai_types.ThinkingConfig(
                 thinking_level=genai_types.ThinkingLevel.HIGH
             ),
+            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         )
 
         response = await self._client.aio.models.generate_content(
@@ -231,9 +239,18 @@ class GeminiProvider:
         )
 
         raw = _strip_code_fence(response.text or "")
+        # `finish_reason=MAX_TOKENS` is the canonical signal that the
+        # response was truncated mid-output — surfacing it in the error
+        # lets a future operator distinguish "schema/format problem" from
+        # "bump the budget" without re-running.
+        finish_reason = None
+        candidates = getattr(response, "candidates", None) or []
+        if candidates:
+            finish_reason = getattr(candidates[0], "finish_reason", None)
         if not raw:
             raise RuntimeError(
-                f"Gemini returned empty response for lens={lens} event={event.id}"
+                f"Gemini returned empty response for lens={lens} "
+                f"event={event.id} finish_reason={finish_reason}"
             )
         try:
             parsed = LensNotebook.model_validate_json(raw)
@@ -244,7 +261,8 @@ class GeminiProvider:
             preview = raw[:400].replace("\n", " ")
             raise RuntimeError(
                 f"Gemini response failed LensNotebook parse for lens={lens} "
-                f"event={event.id}: {e}. preview={preview!r}"
+                f"event={event.id} finish_reason={finish_reason}: {e}. "
+                f"preview={preview!r}"
             ) from e
         assert_lens_match(parsed, lens, event.id)
 
