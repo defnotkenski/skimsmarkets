@@ -836,7 +836,6 @@ async def process_event(
 async def run_pipeline(
     *,
     leagues: list[str] | None = None,
-    dry_run: bool = False,
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
@@ -894,10 +893,8 @@ async def run_pipeline(
         events = await fetch_slate(slate_opts, http=uw.http, gamma_sem=gamma_sem)
         result.fetched_events = len(events)
 
-        if dry_run:
-            events = events[:1]
         result.considered_events = len(events)
-        log.info("considering %d events (dry_run=%s)", len(events), dry_run)
+        log.info("considering %d events", len(events))
 
         if not events:
             return result

@@ -183,41 +183,39 @@ class UnusualWhalesContext(BaseModel):
         return _coerce_float(v)
 
     def has_actionable_signal(self) -> bool:
-        """True iff this context carries any flow signal beyond raw liquidity.
+        """True iff this context carries flow signal worth surfacing.
 
-        UW's index covers more markets than its smart-money / insider / tag
-        pipelines do — offshore (gamma) events in particular often resolve on
-        the detail endpoint with a 200 but no enrichment: empty trade arrays,
-        all tag weights null, volume=0, MCI absent. The only field UW still
-        returns in that case is `liquidity`, which is just the gamma book
-        and duplicates our main bid/ask block.
+        Threshold logic matches the director prompt's "notable / material"
+        bar: `unusual_score >= 5.0` is the prompt-defined cutoff for a
+        notable composite signal. Below that, individual tag values are
+        baseline noise (UW returns ~0.30 for tags that haven't fired
+        rather than nulls), and pulling the UW block into the director's
+        context just earns a verbose "effectively no flow" `uw_flow_note`
+        while burning tokens.
 
-        Caller (pipeline) drops these signal-less contexts so the director
-        doesn't see a UW block whose every field reads `?`. `liquidity`
-        alone is intentionally NOT enough to count as a signal — it adds no
-        information beyond what the per-market microstructure block carries.
+        Three things make a context actionable:
+          - Real fills (smart_trades / contrarian_whale_trades) or top
+            insiders. UW filters these server-side to wallets that
+            actually triggered a tag pipeline, so presence alone is a
+            signal regardless of composite score.
+          - `unusual_score >= 5.0` — the prompt's "notable" threshold.
+          - MCI `delta` of meaningful magnitude (`abs(delta) >= 5.0`).
+            Static MCI values without a delta carry no directional info.
+
+        Liquidity / volume / individual tag values / static MCI do NOT
+        count: they either duplicate the per-market microstructure block
+        we already render (liquidity, volume) or are sub-threshold noise
+        (a momentum tag at 0.30 means "the price moved at all").
         """
         if self.smart_trades or self.contrarian_whale_trades or self.insiders:
             return True
-        tags = self.tag_scores
-        if any(
-            getattr(tags, n) is not None
-            for n in (
-                "smart_money",
-                "contrarian_whales",
-                "insider_trades",
-                "momentum",
-                "closing_soon",
-            )
+        if self.unusual_score is not None and self.unusual_score >= 5.0:
+            return True
+        if (
+            self.mci is not None
+            and self.mci.delta is not None
+            and abs(self.mci.delta) >= 5.0
         ):
-            return True
-        if self.mci is not None and (
-            self.mci.value is not None or self.mci.delta is not None
-        ):
-            return True
-        if self.unusual_score is not None and self.unusual_score > 0:
-            return True
-        if self.volume is not None and self.volume > 0:
             return True
         return False
 

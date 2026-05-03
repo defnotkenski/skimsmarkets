@@ -13,6 +13,7 @@ Polymarket BBO.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import TracebackType
 from typing import Any, Self
@@ -37,6 +38,31 @@ _BASE_URL = "https://api.unusualwhales.com/api/predictions"
 _SMART_TRADE_LIMIT = 5
 _CONTRARIAN_TRADE_LIMIT = 5
 _INSIDER_LIMIT = 3
+
+# Retry configuration for HTTP 429 (rate limited) responses. UW doesn't
+# publish rate limits, but empirically the gamma fan-out can hit a
+# per-second cap when multiple events resolve their detail endpoints in
+# the same millisecond. Three total attempts with exponential backoff
+# (1s → 2s) puts us at ~3s worst case before giving up — short enough
+# that the enrichment stage doesn't block the run, long enough to outlast
+# a typical sliding-window rate limiter.
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_S = 1.0
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse an HTTP `Retry-After` header value to seconds.
+
+    Only handles the integer-seconds form (UW's known shape); HTTP-date
+    form returns None and we fall back to exponential backoff. Negative
+    values clamp to 0.
+    """
+    if not value:
+        return None
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        return None
 
 
 class UnusualWhalesClient:
@@ -89,30 +115,53 @@ class UnusualWhalesClient:
     async def get_market_detail(self, asset_id: str) -> UnusualWhalesContext | None:
         """GET /predictions/market/{asset_id} → compact `UnusualWhalesContext`.
 
-        Returns None if UW is disabled, the request fails, or the response
-        is missing the expected `data` envelope.
+        Retries up to `_RETRY_ATTEMPTS` times on HTTP 429 with exponential
+        backoff (honoring `Retry-After` when present). Returns None if UW
+        is disabled, the request fails after retries, or the response is
+        missing the expected `data` envelope.
         """
         if not self.enabled or self._client is None:
             return None
         url = f"{_BASE_URL}/market/{asset_id}"
-        try:
-            resp = await self._client.get(url)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            # 404 on an asset we haven't seen in UW yet is normal; log quietly.
-            if e.response.status_code == 404:
-                log.debug("uw market %s: 404 (not tracked)", asset_id)
-            else:
+
+        resp: httpx.Response | None = None
+        for attempt in range(_RETRY_ATTEMPTS):
+            try:
+                resp = await self._client.get(url)
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                # 404 on an asset we haven't seen in UW yet is normal; log
+                # quietly and don't retry — the asset isn't going to appear.
+                if status == 404:
+                    log.debug("uw market %s: 404 (not tracked)", asset_id)
+                    return None
+                if status == 429 and attempt + 1 < _RETRY_ATTEMPTS:
+                    wait = _parse_retry_after(
+                        e.response.headers.get("Retry-After")
+                    ) or _RETRY_BASE_S * (2 ** attempt)
+                    log.debug(
+                        "uw market %s: 429, sleeping %.1fs (attempt %d/%d)",
+                        asset_id, wait, attempt + 1, _RETRY_ATTEMPTS,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 # Avoid logging Authorization header contents by never including
                 # the request object — httpx's str(response) is body-only.
-                log.warning(
-                    "uw market %s: HTTP %s",
-                    asset_id,
-                    e.response.status_code,
-                )
-            return None
-        except Exception as e:  # noqa: BLE001
-            log.warning("uw market %s: %s", asset_id, type(e).__name__)
+                if status == 429:
+                    log.warning(
+                        "uw market %s: HTTP 429 after %d attempts",
+                        asset_id, _RETRY_ATTEMPTS,
+                    )
+                else:
+                    log.warning("uw market %s: HTTP %s", asset_id, status)
+                return None
+            except Exception as e:  # noqa: BLE001
+                log.warning("uw market %s: %s", asset_id, type(e).__name__)
+                return None
+
+        if resp is None:
             return None
 
         try:

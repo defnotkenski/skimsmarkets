@@ -75,6 +75,17 @@ the first doesn't answer the question:
 
 You are expected to actually call these tools — not recite what you already know.
 
+Paraphrase, do NOT quote verbatim. When summarizing what you found in
+`research_notes` or `citations.claim`, restate findings in your own words rather
+than copying sentences from search results, tweets, or news articles. Numbers,
+stat lines, player names, scores, and dates should be transcribed accurately —
+those are facts, not prose — but the surrounding sentences must be original.
+Near-verbatim copying of grounded source text triggers content-similarity
+filters and will cause the model to return an empty response, dropping the
+event from the slate. This applies especially to social-media content
+(beat-reporter posts via `site:x.com`) where source phrasing is short and
+distinctive: extract the fact, then write your own sentence about it.
+
 Output rules — return ONLY valid JSON matching the LensNotebook schema, with no
 prose before or after the JSON object and no markdown code fences:
 - `lens` must equal the lens you've been assigned.

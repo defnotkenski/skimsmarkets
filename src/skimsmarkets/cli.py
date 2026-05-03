@@ -18,8 +18,16 @@ from skimsmarkets.reporting import print_events_table, print_run_summary
 # ---------------------------------------------------------------------------
 
 
-class _HttpxMinLevelFilter(logging.Filter):
-    """Hide sub-threshold httpx / httpcore records from the terminal handler.
+# Third-party SDK loggers that emit one INFO line per request (or per
+# tool-loop entry) and drown out our own pipeline INFO logs during a
+# normal run. Keep the list narrow — anything added here is silenced
+# from the terminal in non-verbose mode.
+_NOISY_SDK_LOGGER_PREFIXES = ("httpx", "httpcore", "google_genai")
+
+
+class _NoisySDKMinLevelFilter(logging.Filter):
+    """Hide sub-threshold records from known-noisy SDK loggers on the
+    terminal handler.
 
     Attached to the stream handler (not the logger itself) so the records
     keep their original INFO severity and any additional handler — e.g. a
@@ -31,7 +39,7 @@ class _HttpxMinLevelFilter(logging.Filter):
         self.min_level = min_level
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name.startswith(("httpx", "httpcore")):
+        if record.name.startswith(_NOISY_SDK_LOGGER_PREFIXES):
             return record.levelno >= self.min_level
         return True
 
@@ -42,11 +50,12 @@ def _setup_logging(verbose: bool) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
     )
-    # httpx / httpcore emit one INFO line per request, which drowns out the
-    # pipeline's own INFO logs during a normal run. In normal mode, hide
-    # anything below WARNING from the terminal; in verbose mode, show everything.
+    # In normal mode, hide INFO chatter from third-party SDKs (httpx
+    # request lines, google_genai's per-call "AFC enabled" notice) so
+    # our own pipeline INFO logs stay readable. Verbose (`-v`) shows
+    # everything for debugging.
     if not verbose:
-        handler_filter = _HttpxMinLevelFilter(logging.WARNING)
+        handler_filter = _NoisySDKMinLevelFilter(logging.WARNING)
         for handler in logging.getLogger().handlers:
             handler.addFilter(handler_filter)
 
@@ -78,7 +87,6 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
     opts = _slate_opts_from_args(args)
     result = await run_pipeline(
         leagues=opts.leagues or None,
-        dry_run=args.dry_run,
         horizon_hours=opts.horizon_hours,
         slugs=opts.slugs or None,
         sports=opts.sports or None,
@@ -198,11 +206,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "rank",
         parents=[slate],
         help="Build the slate and run the full ranking pipeline (default).",
-    )
-    p_rank.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run the full pipeline against a single event only (~$0.30 of LLM spend).",
     )
     p_rank.add_argument(
         "--fetcher-provider",
