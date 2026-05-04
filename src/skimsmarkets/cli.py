@@ -91,6 +91,7 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
         slugs=opts.slugs or None,
         sports=opts.sports or None,
         fetcher_provider=args.fetcher_provider,
+        tennis_stats_disabled=args.no_tennis_stats,
     )
     print_run_summary(result)
     return 0
@@ -218,6 +219,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "single-pass (no x_search — Twitter lookups go through site:x.com on "
             "google_search). Overrides the FETCHER_PROVIDER env var; falls back to "
             f"'{cfg.DEFAULT_FETCHER_PROVIDER}' when neither is set."
+        ),
+    )
+    p_rank.add_argument(
+        "--no-tennis-stats",
+        action="store_true",
+        help=(
+            "Force the stub tennis-stats provider even when TENNIS_STATS_API_KEY "
+            "is set. Useful for token-cost A/B comparisons or when the vendor is "
+            "down. No-op when no key is configured (already running the stub)."
         ),
     )
 

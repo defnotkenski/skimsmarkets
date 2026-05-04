@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skimsmarkets.clob import invert_sparkline as _invert_sparkline
+from skimsmarkets.tennis.models import TennisStatsContext
 from skimsmarkets.unusual_whales.models import UnusualWhalesContext
 
 
@@ -619,6 +620,13 @@ class PolymarketEvent(BaseModel):
     # and this event's YES-side asset_id resolved to an UW-tracked market.
     # Always None when the event comes straight off the SDK response.
     uw_context: UnusualWhalesContext | None = None
+    # Attached post-validation by `enrich_tennis_stats()` for ATP/WTA singles
+    # head-to-heads when a `TennisStatsProvider` returns an actionable
+    # context. Always None for non-tennis events, doubles markets, and
+    # whenever the provider had no record / failed. Consumed only by the
+    # statistics fetcher / reasoner — director and other lenses don't see
+    # it (lens-silo posture; see CLAUDE.md and the tennis package docstring).
+    tennis_stats: TennisStatsContext | None = None
 
     @field_validator("id", mode="before")
     @classmethod

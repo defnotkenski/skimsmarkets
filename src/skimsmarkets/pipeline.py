@@ -30,6 +30,12 @@ from skimsmarkets.clob import (
     summarize_history,
 )
 from skimsmarkets.polymarket.models import PolymarketEvent
+from skimsmarkets.tennis import TennisStatsContext
+from skimsmarkets.tennis.identity import tennis_match_identity
+from skimsmarkets.tennis.provider import (
+    TennisStatsProvider,
+    build_tennis_provider,
+)
 from skimsmarkets.unusual_whales import (
     GammaTokenResolver,
     UnusualWhalesClient,
@@ -68,6 +74,14 @@ class RunResult:
     # Claude reason correctly?" as separate questions.
     notebooks: dict[str, dict[str, LensNotebook]] = field(default_factory=dict)
     reports: dict[str, dict[str, SpecialistReport]] = field(default_factory=dict)
+    # Per-event tennis stats vendor payload (when present). Keyed
+    # event_id → TennisStatsContext. Populated in `enrich_tennis_stats`
+    # for ATP/WTA singles head-to-heads only; non-tennis / no-key runs
+    # leave this empty. Persisted as a top-level JSONL field next to
+    # `notebooks` / `specialist_reports` so retro grading can ask "did
+    # the API have the right facts?" separately from "did the fetcher
+    # use them?".
+    tennis_stats: dict[str, TennisStatsContext] = field(default_factory=dict)
     # Slate-level judge output keyed event_id → DefensibilityAssessment.
     # Populated by `judge_slate` after all per-event directors finish; left
     # empty when the judge call fails (leaderboard then falls back to the
@@ -648,6 +662,75 @@ async def enrich_price_history(
     log.info("attached clob price history to %d/%d markets", enriched, total)
 
 
+async def enrich_tennis_stats(
+    provider: TennisStatsProvider,
+    events: list[PolymarketEvent],
+    sem: asyncio.Semaphore,
+    errors: list[ErrorRecord],
+) -> None:
+    """Attach `event.tennis_stats` for ATP/WTA singles head-to-heads.
+
+    Iterates per event (not per market slug) — tennis stats are
+    match-level data, not side-directional, so a NO clone shares the
+    parent event's context naturally. Same fail-silent posture as the
+    other enrichment stages: vendor errors record one ErrorRecord with
+    `stage="tennis_stats"`, leave `tennis_stats=None`, and let the rest
+    of the pipeline continue.
+
+    Runs LAST among enrichers because (a) the sport gate consumes
+    `event.sport_type` populated upstream by `from_gamma`, and (b) it's
+    the only enricher that can be skipped per-event by sport — every
+    non-tennis event short-circuits at `tennis_match_identity` without
+    touching the vendor.
+
+    The `provider` is always non-None — the factory returns the stub
+    when no key is configured rather than `None`, so this stage doesn't
+    need an `if enabled` branch. The stub returns `None` for every
+    event, which leaves the pipeline behaving identically to a run
+    where this enrichment didn't exist.
+    """
+    if not events:
+        return
+
+    async def _one(event: PolymarketEvent) -> None:
+        identity = tennis_match_identity(event)
+        if identity is None:
+            return
+        async with sem:
+            try:
+                ctx = await provider.fetch(identity)
+            except Exception as e:  # noqa: BLE001
+                errors.append(
+                    ErrorRecord(
+                        event_id=event.id,
+                        stage="tennis_stats",
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                )
+                log.warning(
+                    "tennis_stats fetch failed for %s (%s vs %s): %s",
+                    event.id,
+                    identity.player_a,
+                    identity.player_b,
+                    type(e).__name__,
+                )
+                return
+        # `has_actionable_signal` matches UW's posture — drop empty
+        # contexts (every numeric field None, no H2H) so the renderer
+        # doesn't waste prompt tokens on a header with no body.
+        if ctx is not None and ctx.has_actionable_signal():
+            event.tennis_stats = ctx
+
+    await asyncio.gather(*(_one(ev) for ev in events))
+    attached = sum(1 for ev in events if ev.tennis_stats is not None)
+    log.info(
+        "attached tennis stats to %d/%d events (provider=%s)",
+        attached,
+        len(events),
+        provider.name,
+    )
+
+
 async def _run_lenses(
     provider: FetcherProvider,
     anthropic: AsyncAnthropic,
@@ -747,6 +830,12 @@ def _persist_run(result: RunResult) -> None:
                 # director's predicted probability. Null/empty when the
                 # judge call failed or didn't cover this event.
                 da = result.defensibility_assessments.get(p.event_id)
+                # Tennis stats vendor payload — top-level (not nested in
+                # notebooks) so retrospective grading can ask "did the
+                # API have the right facts?" separately from "did the
+                # fetcher use them?". Null on non-tennis events and on
+                # tennis events the stub / vendor failed to populate.
+                ts = result.tennis_stats.get(p.event_id)
                 payload = {
                     "run_id": result.run_id,
                     "logged_at_utc": logged_at,
@@ -783,6 +872,9 @@ def _persist_run(result: RunResult) -> None:
                     ),
                     "defensibility_flags": (
                         da.defensibility_flags if da is not None else []
+                    ),
+                    "tennis_stats": (
+                        ts.model_dump(mode="json") if ts is not None else None
                     ),
                     "notebooks": notebooks_for_event,
                     "specialist_reports": reports_for_event,
@@ -840,6 +932,7 @@ async def run_pipeline(
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
     fetcher_provider: str | None = None,
+    tennis_stats_disabled: bool = False,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon,
     enrich with CLOB book + price history, then run 4 specialists + director
@@ -860,7 +953,10 @@ async def run_pipeline(
       (fetcher) for every event in the slate; reasoner / director / judge
       are always Claude regardless.
     """
-    config = cfg.Config.from_env(fetcher_provider=fetcher_provider)
+    config = cfg.Config.from_env(
+        fetcher_provider=fetcher_provider,
+        tennis_stats_disabled=tennis_stats_disabled,
+    )
     run_id = uuid.uuid4().hex[:8]
     result = RunResult(run_id=run_id)
 
@@ -870,6 +966,7 @@ async def run_pipeline(
     uw_sem = asyncio.Semaphore(cfg.UW_FETCH_SEM)
     gamma_sem = asyncio.Semaphore(cfg.GAMMA_FETCH_SEM)
     clob_sem = asyncio.Semaphore(cfg.CLOB_FETCH_SEM)
+    tennis_sem = asyncio.Semaphore(cfg.TENNIS_STATS_FETCH_SEM)
 
     # `public_http` is a shared httpx client for any public, unauthed
     # Polymarket-host call: gamma `/events` (slate + token IDs +
@@ -878,6 +975,7 @@ async def run_pipeline(
     async with (
         UnusualWhalesClient(config.unusual_whales_api_key) as uw,
         httpx.AsyncClient(timeout=20.0) as public_http,
+        build_tennis_provider(config) as tennis_provider,
     ):
         gamma_resolver = GammaTokenResolver(public_http)
         # `fetch_slate` is the single source of truth (default browse +
@@ -917,6 +1015,20 @@ async def run_pipeline(
             await enrich_price_history(events, gamma_resolver, public_http, clob_sem)
         else:
             log.info("clob price history disabled (cfg.CLOB_HISTORY_ENABLED=False)")
+        # Tennis stats run LAST among enrichers — gated per-event by sport,
+        # so deferring its work means non-tennis events have already paid
+        # all the upstream gamma/CLOB enrichment costs we want anyway.
+        # The provider is always non-None (factory returns the stub when no
+        # key is configured), so this is safe without an `if enabled` branch.
+        await enrich_tennis_stats(tennis_provider, events, tennis_sem, result.errors)
+        # Snapshot the per-event tennis context onto the RunResult so
+        # `_persist_run` can write it to the JSONL row even though the
+        # event itself isn't carried into persistence (only the resulting
+        # `MarketPrediction` is). Keyed by event id to match how
+        # `notebooks` / `reports` line up against `predictions`.
+        for ev in events:
+            if ev.tennis_stats is not None:
+                result.tennis_stats[ev.id] = ev.tennis_stats
 
         provider = build_provider(config.fetcher_provider, config)
         result.fetcher_provider = provider.name

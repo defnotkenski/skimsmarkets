@@ -23,6 +23,7 @@ from skimsmarkets.agents.prompts import (
 )
 from skimsmarkets.agents.schemas import LensName, LensNotebook
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
+from skimsmarkets.tennis import render_tennis_stats_block
 
 log = logging.getLogger(__name__)
 
@@ -289,6 +290,24 @@ def render_context(event: PolymarketEvent) -> str:
         + "Produce your report now, per the schema. "
         "Use the exact team_a_name / team_b_name strings above in your output."
     )
+
+
+def render_lens_extras(lens: LensName, event: PolymarketEvent) -> str | None:
+    """Lens-specific user-message append, or None when nothing applies.
+
+    Mirrors the `render_sport_hint(...)` injection point — content rides
+    on the per-event user message (NOT the cached system prompt) so the
+    cache hit on the system block is preserved. The block is restricted
+    to a specific lens to keep the lens-silo posture intact: tennis
+    player stats feed only the statistics specialist; the other three
+    lenses go through this helper unchanged.
+
+    Adding more lens-specific blocks later means editing this function,
+    not every provider's `fetch` body.
+    """
+    if lens == "statistics" and event.tennis_stats is not None:
+        return render_tennis_stats_block(event.tennis_stats)
+    return None
 
 
 # Type alias retained for readability at the protocol boundary; providers

@@ -53,6 +53,12 @@ GAMMA_FETCH_SEM = 8
 # but we hedge against unannounced rate limits. Fires once per unique slug
 # per enrichment stage.
 CLOB_FETCH_SEM = 8
+# Tennis stats provider fan-out. Fires at most once per ATP/WTA singles
+# event after the sport-gate filters out everything else, so the cap is
+# loose — most slates carry only a handful of tennis matches. Conservative
+# default mirrors UW_FETCH_SEM since both ride third-party APIs whose
+# rate limits we'd rather not probe.
+TENNIS_STATS_FETCH_SEM = 8
 
 # Opt-in CLOB price-history enrichment toggle. When True, the pipeline
 # fetches ~24h of mid-price points per unique slug from `clob.polymarket.com`
@@ -85,9 +91,24 @@ class Config:
     # unset, `resolve_unusual_whales()` is skipped and the pipeline behaves
     # exactly as it did pre-integration.
     unusual_whales_api_key: str | None = None
+    # Optional — third-party tennis stats vendor key. Mirrors UW posture:
+    # silently absent → the stub provider runs, every event ends up with
+    # `tennis_stats=None`, and the rest of the pipeline behaves as before.
+    # Concrete provider adapter keyed off this lands in a follow-up.
+    tennis_stats_api_key: str | None = None
+    # Runtime opt-out from the CLI's `--no-tennis-stats` flag. Kept on the
+    # config so the pipeline stage and the provider factory can both see
+    # it without the CLI threading a separate argument through every call
+    # site. Defaults False so env-only runs still pick up the key.
+    tennis_stats_disabled: bool = False
 
     @classmethod
-    def from_env(cls, fetcher_provider: str | None = None) -> "Config":
+    def from_env(
+        cls,
+        fetcher_provider: str | None = None,
+        *,
+        tennis_stats_disabled: bool = False,
+    ) -> "Config":
         # Reads .env from the current directory (and parents) if present. Does not
         # override vars that are already set in the shell, so explicit exports win.
         # `fetcher_provider` arg lets the CLI flag win over the env var without
@@ -107,6 +128,7 @@ class Config:
         google = os.environ.get("GOOGLE_API_KEY", "").strip() or None
         anth = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         uw = os.environ.get("UNUSUAL_WHALES_API_KEY", "").strip() or None
+        tennis_key = os.environ.get("TENNIS_STATS_API_KEY", "").strip() or None
         missing: list[str] = []
         if not anth:
             missing.append("ANTHROPIC_API_KEY")
@@ -125,4 +147,6 @@ class Config:
             xai_api_key=xai,
             google_api_key=google,
             unusual_whales_api_key=uw,
+            tennis_stats_api_key=tennis_key,
+            tennis_stats_disabled=tennis_stats_disabled,
         )

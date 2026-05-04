@@ -36,6 +36,7 @@ from skimsmarkets.agents.fetchers.base import (
     assert_lens_match,
     build_lens_prompts,
     render_context,
+    render_lens_extras,
 )
 from skimsmarkets.agents.schemas import LensName, LensNotebook
 from skimsmarkets.agents.sport_hints import render_sport_hint
@@ -211,6 +212,11 @@ class GeminiProvider:
         user_msg = render_context(event)
         if (sport_hint := render_sport_hint(lens, event)) is not None:
             user_msg += "\n\n" + sport_hint
+        # Lens-specific extras — currently the tennis player-stats block
+        # for the statistics lens, no-op for everything else. Mirrors the
+        # Grok provider; both stay in lockstep on what each lens sees.
+        if (extras := render_lens_extras(lens, event)) is not None:
+            user_msg += "\n\n" + extras
 
         # Tools are passed per-call (the SDK's Tool wrappers are lightweight
         # config objects, not stateful primitives). google_search +

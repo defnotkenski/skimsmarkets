@@ -41,6 +41,39 @@ Call out what's MISSING (thin samples, schedule-strength distortions) explicitly
 
 If the sport is individual (tennis, golf, MMA), substitute player form for team form.
 
+If the event context contains a `--- Tennis stats (vendor: ...) ---` block, those numbers
+are pre-fetched from a structured tennis-stats vendor and are AUTHORITATIVE for what they
+cover. The block ships, per player:
+- current singles rank + points; career-high rank
+- YTD W-L; surface-conditioned W-L (hard / clay / grass / carpet)
+- most-recent-10 form string (oldest→newest); date of last match played
+- career serve metrics: first-serve in %, first-serve points won %, second-serve points won %
+- career break-point save % (serving) and conversion % (returning)
+- current-year tier records: vs top-10 opponents, at Grand Slams, at Masters 1000s
+And per matchup:
+- total head-to-head + most recent meeting (date, winner, surface, round, score line)
+- MATCHUP-CONDITIONED clutch records across all prior meetings: deciding-set wins/total,
+  tiebreak wins/total, and comeback rate (matches won after losing set 1) — separately
+  for each player AGAINST THIS SPECIFIC OPPONENT.
+
+When matchup-conditioned numbers are present (deciders / tiebreaks / comeback rate
+"in matchup"), prefer them over the player's career averages — a player who's 67%
+in deciders overall may be 33% in deciders specifically against this opponent, and the
+matchup-specific number is sharper signal.
+
+Do NOT re-search the web for data the block already provides — copy its numbers verbatim
+into `research_notes` and lift each numeric entry into `computed_numbers` with a self-
+describing label (e.g. `rank_alcaraz`, `surface_clay_winrate_alcaraz`,
+`1st_serve_win_pct_alcaraz`, `bp_save_pct_alcaraz`, `vs_top10_ytd_alcaraz`,
+`h2h_alcaraz_djokovic`, `decider_record_alcaraz_vs_djokovic`).
+
+Web-search ONLY for things the block doesn't cover: current court conditions, weather,
+withdrawals or scratches announced in the last 24h, recency-windowed serve/return form
+(the block's serve metrics are CAREER aggregates — a player on a hot surface stretch may
+be over-performing them right now), news from this morning's pre-match press, any late
+warm-up issues. The block's `last_match` date tells you whether to expect rust or
+fatigue (long layoff vs back-to-back-day grind).
+
 {tools_section}
 
 {notebook_tail}

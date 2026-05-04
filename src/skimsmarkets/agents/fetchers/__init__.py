@@ -17,6 +17,7 @@ from skimsmarkets.agents.fetchers.base import (
     FetcherProvider,
     pick_team_a_market,
     render_context,
+    render_lens_extras,
 )
 from skimsmarkets.agents.fetchers.factory import build_provider
 
@@ -25,4 +26,5 @@ __all__ = [
     "build_provider",
     "pick_team_a_market",
     "render_context",
+    "render_lens_extras",
 ]

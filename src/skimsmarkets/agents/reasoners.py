@@ -32,7 +32,7 @@ from anthropic.types import (
 from pydantic import BaseModel
 
 from skimsmarkets.agents.director import CLAUDE_MAX_OUTPUT_TOKENS, CLAUDE_MODEL
-from skimsmarkets.agents.fetchers import render_context
+from skimsmarkets.agents.fetchers import render_context, render_lens_extras
 from skimsmarkets.agents.prompts import (
     INJURY_REASONER_SYSTEM,
     MARKET_CONTEXT_REASONER_SYSTEM,
@@ -74,8 +74,16 @@ async def _run_reasoner(
     indented JSON. Reasoner prompts are explicit that
     `notebook.computed_numbers` are pre-derived and should be used as-is.
     """
+    # Lens-specific extras (currently: tennis player stats for the
+    # statistics lens). Threaded into BOTH the fetcher and the reasoner so
+    # the reasoner can lift the vendor's numbers into its output the same
+    # way it does notebook.computed_numbers — without us having to also
+    # serialize them through the notebook itself.
+    extras = render_lens_extras(lens, event)
+    extras_block = f"\n\n{extras}" if extras else ""
     user_msg = (
         render_context(event)
+        + extras_block
         + "\n\n--- LensNotebook ---\n"
         + notebook.model_dump_json(indent=2)
         + "\n\nReturn the typed report per the schema. "

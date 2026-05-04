@@ -22,6 +22,7 @@ from skimsmarkets.agents.fetchers.base import (
     assert_lens_match,
     build_lens_prompts,
     render_context,
+    render_lens_extras,
 )
 from skimsmarkets.agents.schemas import LensName, LensNotebook
 from skimsmarkets.agents.sport_hints import render_sport_hint
@@ -175,6 +176,11 @@ class GrokProvider:
         user_msg = render_context(event)
         if (sport_hint := render_sport_hint(lens, event)) is not None:
             user_msg += "\n\n" + sport_hint
+        # Lens-specific extras (currently: tennis player stats for the
+        # statistics lens). Same posture as `render_sport_hint` — appended
+        # to the per-event user message, never to the cached system block.
+        if (extras := render_lens_extras(lens, event)) is not None:
+            user_msg += "\n\n" + extras
         chat.append(user(user_msg))
         response, parsed = await chat.parse(LensNotebook)
         assert_lens_match(parsed, lens, event.id)
