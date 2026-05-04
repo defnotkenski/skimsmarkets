@@ -4,8 +4,8 @@ The UW `/api/predictions/market/{asset_id}` detail endpoint returns a large
 payload (50 trades × 3 arrays, full outcome pair with daily price series,
 etc). We squash it into a small, render-friendly shape that:
 
-- keeps only the signals the market_context specialist can actually use
-  (tag weights, MCI, liquidity, handful of top trades, top insiders);
+- keeps only the signals the director can actually use (tag weights, MCI,
+  liquidity, handful of top trades, top insiders);
 - is JSON-serialisable and Pydantic-validated so we never render garbage into
   a prompt;
 - is cheap to attach to every `PolymarketEvent` in memory.
@@ -156,8 +156,8 @@ class UnusualWhalesContext(BaseModel):
 
     Built from the YES-side asset_id. The NO-side context is mostly the
     mirror image (inverted price, same flow) so we don't duplicate it —
-    the market_context specialist reasons about the game from the YES lens,
-    and the `is_no_side` rendering convention already handles direction.
+    the director reasons about the game from the YES lens, and the
+    `is_no_side` rendering convention already handles direction.
     """
 
     model_config = ConfigDict(extra="ignore")

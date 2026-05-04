@@ -4,8 +4,9 @@
 liquidity, recent smart/contrarian/insider activity) and
 `GammaTokenResolver` bridges our Polymarket slug to the ERC-1155
 `asset_id` UW is keyed by. Data attaches to each `PolymarketEvent` as
-`uw_context` and is rendered only into the `market_context` specialist's
-prompt.
+`uw_context` and is rendered only into the director's prompt — the per-lens
+specialists do not see it, on the rationale that flow is sharper signal than
+the LLM should second-guess at the lens layer.
 """
 
 from skimsmarkets.unusual_whales.client import UnusualWhalesClient

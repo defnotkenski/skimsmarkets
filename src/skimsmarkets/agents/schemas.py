@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 Confidence = Literal["low", "medium", "high"]
 
-LensName = Literal["statistics", "injury", "narrative", "market_context"]
+LensName = Literal["statistics", "injury", "narrative"]
 
 
 class Citation(BaseModel):
@@ -152,38 +152,7 @@ class NarrativeReport(BaseModel):
     sentiment_sources: list[str] = Field(default_factory=list)
 
 
-class MarketContextReport(BaseModel):
-    """Market-context lens: what Polymarket and sportsbook consensus are pricing,
-    plus sharp-money signals. NOT an edge-hunting report — just a read of where
-    the market stands so the director has context alongside the other specialists.
-    """
-
-    team_a_name: str
-    team_b_name: str
-    polymarket_implied_team_a_probability: float = Field(
-        ge=0.0, le=1.0,
-        description="Polymarket's implied probability for team_a winning (midpoint of yes bid/ask on team_a's market).",
-    )
-    consensus_team_a_probability: float | None = Field(
-        default=None,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Fair probability team_a wins, implied by consensus sportsbooks / betting "
-            "exchanges (de-vigged). Null when no comparable sportsbook market was found."
-        ),
-    )
-    line_movement_note: str = Field(
-        description="Short note on recent line movement, open-vs-current, or notable steam moves.",
-    )
-    sharp_money_signal: Literal["on_team_a", "on_team_b", "unclear", "no_data"]
-    comparable_markets: list[str] = Field(
-        default_factory=list,
-        description="URLs or identifiers of the comparable markets consulted.",
-    )
-
-
-SpecialistReport = StatisticsReport | InjuryReport | NarrativeReport | MarketContextReport
+SpecialistReport = StatisticsReport | InjuryReport | NarrativeReport
 
 
 class EventPrediction(BaseModel):
@@ -212,7 +181,7 @@ class EventPrediction(BaseModel):
             "removing any one input leaves the winner unchanged; medium = most agree "
             "but one is load-bearing; low = predicted_winner flips if a single input "
             "is wrong, or specialists themselves mostly reported confidence='low'. "
-            "A 52-48 call with all four lenses agreeing directionally IS high "
+            "A 52-48 call with all three lenses agreeing directionally IS high "
             "confidence; an 80-20 call resting entirely on one late injury report "
             "is low confidence."
         ),

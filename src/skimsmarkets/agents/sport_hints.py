@@ -1,20 +1,27 @@
-"""Sport-specific guidance injected into fetcher user messages.
+"""Sport-specific guidance injected into per-event user messages.
 
 The system prompts in `prompts.py` are sport-agnostic and stay cached
 (`CacheControlEphemeralParam` requires fixed strings). Sport-specific
-search-shaping guidance lives here and rides on the per-event user message,
-so the cache hit on the system block is preserved.
+guidance lives here and rides on the per-event user message, so the cache
+hit on the system block is preserved.
+
+Two parallel dicts, both keyed by (lens, sport):
+- `SPORT_HINTS` shapes the fetcher's search loop ("what to look up, which
+  sources, which code_execution recipes"). Consumed by `render_sport_hint`
+  and appended to the fetcher's user message.
+- `REASONER_SPORT_HINTS` shapes the reasoner's calibration ("how to size
+  the signed shift / probability now that the facts are in the notebook").
+  Consumed by `render_reasoner_sport_hint` and appended to the reasoner's
+  user message. Currently populated for the injury lens only — the key
+  shape leaves room for statistics / narrative reasoner specializations
+  later without an API change.
 
 Scope is intentionally narrow:
-- Fetchers only. Reasoners structure what's already in the notebook, so the
-  fetcher's specialization is what determines whether the right facts get
-  captured at all. (Future: the injury reasoner has a sport-conditioned
-  status→impact calibration that warrants its own specialization, but that
-  is left for a follow-up.)
 - Tennis and soccer only. These two have the most distinctive search patterns
-  (surface splits + serve stats; xG + 3-way pricing + predicted XI) and
-  enough Polymarket volume to validate. Other sports fall through to the
-  generic prompt.
+  (surface splits + serve stats; xG + 3-way pricing + predicted XI) AND the
+  most distinctive injury-impact regimes (single-player tennis withdrawals;
+  soccer predicted-XI position granularity). Other sports fall through to
+  the generic prompt.
 - Detection via `event.sport_type` (gamma-tag-derived). Other sources like
   `series_slug` are not consulted — for events where gamma omits the sport
   tag (typically seasonal futures), we don't rank them anyway.
@@ -39,8 +46,15 @@ Tennis-specific focus:
   best-of-3 has more variance. Note round (R64 / R32 / QF / SF / F) — top
   players sometimes play down to the level in early Masters rounds.
 - H2H samples are small but predictive. Cite both lifetime AND on-surface H2H.
+- Court conditions and weather are quantitative form adjustments, not
+  storylines: heat (slower courts, dehydrating long rallies), wind on outdoor
+  sessions (US Open day, Roland Garros), clay drying speed after rain, roof
+  open/closed shifts ball flight. Pull current/forecast conditions and
+  surface their expected impact in `computed_numbers` (e.g.
+  `wind_serve_drag_<player>`, `heat_hold_pct_adjust_<player>`).
 - Sources: tennisabstract.com (ELO + surface splits), ATP/WTA official, Infosys
-  ATP stats, flashscore for recent results.
+  ATP stats, flashscore for recent results, weather.com / Météo-France for
+  outdoor-session conditions.
 - code_execution: surface-conditioned ELO from tennisabstract or recent matches;
   serve+return-game model. Log5 doesn't apply cleanly to tennis — use
   surface-conditioned win-rate as the baseline instead.
@@ -74,23 +88,9 @@ Tennis-specific focus:
   season tank, post-Slam letdown.
 - Crowd factor: home crowd impact (US Open Americans, Roland Garros French
   players, Australian Open Aussies, Davis Cup ties).
-- Weather / venue: heat (hard court > clay), wind on outdoor courts (especially
-  US Open day sessions), clay drying speed after rain, roof open/closed in
-  night sessions.
-""".strip(),
-
-    ("market_context", "tennis"): """
-Tennis-specific focus:
-- Sportsbook coverage of tennis is thinner than NBA/NFL. Pinnacle and Bet365
-  are sharpest; Betfair Exchange gives the truest market price. Most US books
-  (DraftKings, FanDuel, BetMGM) lag and offer wider spreads.
-- Tennis is a live-betting-dominant market — pre-match prices may not reflect
-  late warm-up news or court conditions. Open-vs-current line movement in the
-  last 2–4 hours pre-match is the sharp signal.
-- Sources: oddsportal.com / betexplorer.com for line history; Betfair Exchange
-  for the live equilibrium price.
-- de-vig two-sided ML directly (no draws in tennis singles). Singles only —
-  doubles markets have very different liquidity patterns.
+- Weather and court conditions are NOT in scope for this lens — the statistics
+  fetcher quantifies them as measurable form adjustments. Do not search for
+  them here.
 """.strip(),
 
     # ---------------- SOCCER ----------------
@@ -108,6 +108,12 @@ Soccer-specific focus:
   league matches. Do NOT collapse to a binary head-to-head — surface a draw
   probability when the event has 3 outcomes, and label your computed numbers
   with which outcome they reference (`p_home`, `p_draw`, `p_away`).
+- Weather is a measurable xG modifier, not a storyline: heavy rain favors
+  slower technical teams and reduces total goals; strong wind hurts long-ball
+  teams and inflates set-piece variance; summer heat reduces high-press
+  intensity and total xG. Pull current/forecast conditions and adjust the
+  Poisson λ accordingly in `code_execution`, surfacing as
+  `weather_xg_adjust_<team>` so the reasoner can attribute the shift.
 - code_execution: Poisson model from team xG-for / xGA-against rates, or Dixon-
   Coles for low-scoring leagues. Cite the 3-way fair probabilities side by side.
 """.strip(),
@@ -144,25 +150,8 @@ Soccer-specific focus:
   across European time zones, less relevant for domestic league play.
 - Crowd / venue: home advantage, neutral venue (cup finals), behind-closed-
   doors penalty (worth ~3pp of home advantage).
-- Weather: rain favors slower technical teams that don't rely on quick
-  transitions; wind hurts long-ball teams; heat in summer-league fixtures.
-""".strip(),
-
-    ("market_context", "soccer"): """
-Soccer-specific focus:
-- THREE-WAY pricing (home / draw / away) — de-vig the FULL triplet, not just
-  two sides. Surface fair P(home), P(draw), P(away) as separate computed
-  numbers. Top-5 leagues have ~25–30% draw rates baked into market prices.
-- Asian Handicap (AH) lines from Pinnacle and Asian books often carry SHARPER
-  signal than European 1X2 lines. AH 0 (draw void) approximates a two-way
-  market and is a useful sanity check on European pricing.
-- Sportsbook coverage of soccer is mature and competitive. Pinnacle, Bet365,
-  Betfair Exchange are sharpest. Avoid using US-facing books (DraftKings,
-  FanDuel) as the consensus signal — they price on US recreational flow.
-- Line movement is sharpest in the 24h pre-kickoff after team news drops.
-  Open-vs-current movement in that window is the sharp action.
-- Sources: oddsportal.com / betexplorer.com for line history, Betfair Exchange
-  for the truest market, soccerway for fixture context.
+- Weather is NOT in scope for this lens — the statistics fetcher quantifies it
+  as a Poisson-λ adjustment. Do not search for forecasts here.
 """.strip(),
 }
 
@@ -182,3 +171,88 @@ def render_sport_hint(lens: LensName, event: PolymarketEvent) -> str | None:
     if body is None:
         return None
     return f"--- Sport-specific focus ({sport}, lens={lens}) ---\n{body}"
+
+
+# Reasoner-side calibration anchors. The fetcher's job is to capture facts;
+# the reasoner's job is to convert those facts into a typed verdict
+# (probability, signed availability shift, motivation_edge). Different sports
+# put very different magnitudes on the same status word — a tennis
+# "withdrawal" is structural where an NBA "questionable" usually resolves
+# available — so the reasoner needs sport-specific bands. Initially populated
+# for the injury lens only, where the gap is biggest; statistics and
+# narrative reasoners are sport-blind today and the (lens, sport) key shape
+# leaves room to specialize them later.
+REASONER_SPORT_HINTS: dict[tuple[LensName, str], str] = {
+    # ---------------- INJURY · TENNIS ----------------
+    ("injury", "tennis"): """
+Tennis-specific calibration:
+- Singles is structural: each "side" IS a single player. A confirmed pre-match
+  withdrawal / walkover is full impact — bound the magnitude near ±0.18 to
+  ±0.20 (the schema cap exists for exactly this case), not the lower 0.05–0.10
+  band that team sports use.
+- "Questionable" 24h pre-match has roughly a 50% out-rate; mid-tournament,
+  higher. Don't under-size: a credible questionable tag is typically -0.06 to
+  -0.10, not -0.02.
+- Body-part / surface interaction shapes magnitude beyond the status word:
+    * shoulder / wrist issues → serve breakdown; larger impact on hard / grass
+      where serve dominates rallies.
+    * lower-body (knee, ankle, hip) → larger impact on clay (longer rallies,
+      sliding) than on hard.
+- Best-of-5 (Slams, Davis Cup) amplifies marginal-injury risk vs best-of-3
+  (more retirement chances, more fatigue surfacing). For a marginal injury at
+  a Slam, push one band stronger than at a 250.
+- Coach changes mid-season are technical disruption, not availability — keep
+  them out of the signed shift even if the notebook flags them.
+- `lineup_confidence`: 'confirmed' once the player is on the entry list AND
+  has practiced same-day; 'probable' when listed but warm-up issues reported;
+  'uncertain' otherwise.
+""".strip(),
+
+    # ---------------- INJURY · SOCCER ----------------
+    ("injury", "soccer"): """
+Soccer-specific calibration:
+- Predicted XI is load-bearing; the impact is position-conditioned, not just
+  "star out / star in". Anchor magnitudes by role:
+    * starting striker out:        −0.04 to −0.08
+    * key creative midfielder out: −0.03 to −0.06
+    * starting goalkeeper out:     −0.03 to −0.06 (wider band — backup keeper
+      quality varies a lot)
+    * starting key defender out:   −0.02 to −0.04
+    * bench / fringe rotation:     −0.01 to −0.02 (do not size higher even
+      when the absent player is a household name in another role)
+- Suspensions and red-card bans land FLATLY at the same magnitude as a
+  confirmed out for that position. Don't discount because the body is
+  healthy — they're equally unavailable.
+- Squad depth damps any one absence by ~30% on top-6 EPL / Bundesliga sides
+  with deep benches; bottom-half teams with thin benches feel the absence at
+  the upper end of the band.
+- Fixture congestion (UCL midweek before a weekend league fixture, or 3
+  matches in 7 days) drives ROTATION, not injury. If the notebook flags
+  rotation risk without a confirmed absence, treat it as
+  `lineup_confidence='probable'` or `'uncertain'` — don't double-count it as
+  a signed shift on top of the fitness shift.
+- "Doubtful" in the 24h pre-match presser has a ~60–70% out-rate; size the
+  expected impact close to the role's "out" band, not as a coin flip.
+""".strip(),
+}
+
+
+def render_reasoner_sport_hint(
+    lens: LensName, event: PolymarketEvent
+) -> str | None:
+    """Return a sport-specific calibration hint to append to the reasoner's
+    user message, or `None` when no specialization applies.
+
+    Mirror of `render_sport_hint`: same `event.sport_type` detection, same
+    user-message-only posture (NEVER the cached system block, which would
+    bust per-event cache hits across the slate). Currently populated for the
+    injury lens only; other (lens, sport) combinations fall through to None
+    and the reasoner uses its generic prompt unchanged.
+    """
+    sport = event.sport_type
+    if sport is None:
+        return None
+    body = REASONER_SPORT_HINTS.get((lens, sport))
+    if body is None:
+        return None
+    return f"--- Sport-specific calibration ({sport}, lens={lens}) ---\n{body}"

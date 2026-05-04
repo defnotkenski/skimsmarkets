@@ -3,9 +3,9 @@
 Each reasoner takes the `LensNotebook` produced by its lens's fetcher
 (Grok or Gemini, transparent to the reasoner) plus the same event context
 the fetcher saw, and emits the typed report
-(`StatisticsReport`, `InjuryReport`, `NarrativeReport`, `MarketContextReport`)
-that the director consumes. Verdicts (probability, signed shift,
-motivation_edge, sharp_money_signal) live here, not in the notebook.
+(`StatisticsReport`, `InjuryReport`, `NarrativeReport`) that the director
+consumes. Verdicts (probability, signed shift, motivation_edge) live here,
+not in the notebook.
 
 System prompts are cached per-lens via `CacheControlEphemeralParam` —
 Anthropic caps active ephemeral breakpoints at 4 per request and we use 1
@@ -35,15 +35,14 @@ from skimsmarkets.agents.director import CLAUDE_MAX_OUTPUT_TOKENS, CLAUDE_MODEL
 from skimsmarkets.agents.fetchers import render_context, render_lens_extras
 from skimsmarkets.agents.prompts import (
     INJURY_REASONER_SYSTEM,
-    MARKET_CONTEXT_REASONER_SYSTEM,
     NARRATIVE_REASONER_SYSTEM,
     STATISTICS_REASONER_SYSTEM,
 )
+from skimsmarkets.agents.sport_hints import render_reasoner_sport_hint
 from skimsmarkets.agents.schemas import (
     InjuryReport,
     LensName,
     LensNotebook,
-    MarketContextReport,
     NarrativeReport,
     SpecialistReport,
     StatisticsReport,
@@ -66,7 +65,7 @@ async def _run_reasoner(
     output_format: type[BaseModel],
     lens: LensName,
 ) -> BaseModel:
-    """Shared body for the four lens reasoners.
+    """Shared body for the three lens reasoners.
 
     Mirrors `synthesize_prediction` in director.py: cached system block,
     adaptive thinking, max effort. The user message is the canonical event
@@ -81,9 +80,18 @@ async def _run_reasoner(
     # serialize them through the notebook itself.
     extras = render_lens_extras(lens, event)
     extras_block = f"\n\n{extras}" if extras else ""
+    # Sport-specific calibration hint (currently: injury reasoner for tennis
+    # and soccer). Same posture as the fetcher's sport_hint and the lens
+    # extras above — appended to the per-event user message, never the
+    # cached system block, so the slate-wide cache hit on the system prompt
+    # is preserved. Returns None for sport/lens combinations we don't
+    # specialize, leaving the reasoner on its generic prompt.
+    sport_hint = render_reasoner_sport_hint(lens, event)
+    sport_hint_block = f"\n\n{sport_hint}" if sport_hint else ""
     user_msg = (
         render_context(event)
         + extras_block
+        + sport_hint_block
         + "\n\n--- LensNotebook ---\n"
         + notebook.model_dump_json(indent=2)
         + "\n\nReturn the typed report per the schema. "
@@ -155,20 +163,8 @@ async def reason_narrative(
     return out
 
 
-async def reason_market_context(
-    anthropic: AsyncAnthropic, event: PolymarketEvent, notebook: LensNotebook
-) -> MarketContextReport:
-    out = await _run_reasoner(
-        anthropic, event, notebook, MARKET_CONTEXT_REASONER_SYSTEM, MarketContextReport,
-        "market_context",
-    )
-    assert isinstance(out, MarketContextReport)
-    return out
-
-
 REASONERS: dict[str, ReasonerFn] = {
     "statistics": reason_statistics,
     "injury": reason_injury,
     "narrative": reason_narrative,
-    "market_context": reason_market_context,
 }

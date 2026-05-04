@@ -739,7 +739,7 @@ async def _run_lenses(
     reasoner_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
 ) -> tuple[dict[str, LensNotebook], dict[str, SpecialistReport]] | None:
-    """Run all four lenses for one event. Each lens is a provider fetcher
+    """Run all three lenses for one event. Each lens is a provider fetcher
     (Stage A) → Claude reasoner (Stage B) chain; lenses run in parallel,
     fetcher→reasoner is sequential within a lens.
 
@@ -795,15 +795,28 @@ _LOG_ROOT = Path(__file__).resolve().parents[2] / "logs" / "runs"
 
 
 def _persist_run(result: RunResult) -> None:
-    """Write each prediction (with its entry decision) to a per-run JSONL.
+    """Write predictions AND per-event drops to a per-run JSONL.
 
     One file per run named `<run_id>.jsonl`. Best-effort: any I/O failure is
     logged and swallowed — persistence must never abort the run, matching the
     enrichment-stage posture.
 
+    Two row shapes share the file, distinguished by a top-level `record_type`
+    field:
+      - `record_type="prediction"` — one row per ranked event with the
+        director's synthesis, judge's defensibility score, full lens
+        notebooks + reasoner reports.
+      - `record_type="error"` — one row per dropped event with `event_id`,
+        `stage` (e.g. `fetcher:injury`, `reasoner:statistics`, `director`,
+        `tennis_stats`, `judge`), and the captured error string.
+    Both share the run-level metadata (`run_id`, `logged_at_utc`,
+    `fetcher_provider`, `fetcher_model`) so a grading script can `jq` over
+    the slate without joining against a sidecar.
+
     Why JSONL not parquet: lines are easy to tail, easy to grep, easy to feed
     into a future grading script that joins against gamma settlement after
-    kickoff. Volume is tiny (one line per ranked event, ~30/day).
+    kickoff. Volume is tiny (≈one line per ranked event + a handful of error
+    rows on a bad slate).
     """
     try:
         _LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -837,6 +850,10 @@ def _persist_run(result: RunResult) -> None:
                 # tennis events the stub / vendor failed to populate.
                 ts = result.tennis_stats.get(p.event_id)
                 payload = {
+                    # Discriminator — see function docstring for shapes.
+                    # Listed first so `jq '.record_type'` is one cheap
+                    # field-read per row when grouping.
+                    "record_type": "prediction",
                     "run_id": result.run_id,
                     "logged_at_utc": logged_at,
                     # Run-level fetcher metadata — top-level (not nested in
@@ -854,7 +871,7 @@ def _persist_run(result: RunResult) -> None:
                     "headline": p.headline,
                     # Director synthesis fields — `reasoning` is the 3-6
                     # sentence rationale, `specialist_weights` shows how
-                    # the four lenses were weighted, `disagreements_flagged`
+                    # the three lenses were weighted, `disagreements_flagged`
                     # surfaces material directional disagreements between
                     # specialists, and `uw_flow_note` captures the director's
                     # read on Unusual Whales flow when present (null
@@ -880,7 +897,30 @@ def _persist_run(result: RunResult) -> None:
                     "specialist_reports": reports_for_event,
                 }
                 f.write(json.dumps(payload, separators=(",", ":")) + "\n")
-        log.info("persisted %d predictions to %s", len(result.predictions), path)
+            # Error rows — one per dropped event. Useful for measuring
+            # provider-specific drop rate (`jq 'select(.record_type=="error"
+            # and .fetcher_provider=="gemini") | .stage'`), the stage
+            # distribution (which lens fails most), and tracking
+            # error-message classes (Gemini STOP-truncations vs MAX_TOKENS
+            # vs schema parse failures vs reasoner timeouts).
+            for err in result.errors:
+                error_payload = {
+                    "record_type": "error",
+                    "run_id": result.run_id,
+                    "logged_at_utc": logged_at,
+                    "fetcher_provider": result.fetcher_provider,
+                    "fetcher_model": result.fetcher_model,
+                    "event_id": err.event_id,
+                    "stage": err.stage,
+                    "error": err.error,
+                }
+                f.write(json.dumps(error_payload, separators=(",", ":")) + "\n")
+        log.info(
+            "persisted %d predictions and %d errors to %s",
+            len(result.predictions),
+            len(result.errors),
+            path,
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("run-log persistence failed: %s", e)
 
@@ -1092,6 +1132,10 @@ async def run_pipeline(
                     e,
                 )
 
-    if result.predictions:
+    # Persist when there's anything to write — predictions OR drops. An
+    # all-failed run (every event hit a fetcher/reasoner/director error)
+    # still produces useful telemetry: the error rows tell us WHY the slate
+    # collapsed, which the terminal Errors table loses to scrollback.
+    if result.predictions or result.errors:
         _persist_run(result)
     return result

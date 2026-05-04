@@ -16,7 +16,6 @@ from skimsmarkets.agents.prompts import DIRECTOR_SYSTEM
 from skimsmarkets.agents.schemas import (
     EventPrediction,
     InjuryReport,
-    MarketContextReport,
     MarketPrediction,
     NarrativeReport,
     SpecialistReport,
@@ -136,7 +135,6 @@ def _render_user_message(
     statistics: StatisticsReport,
     injury: InjuryReport,
     narrative: NarrativeReport,
-    market_context: MarketContextReport,
 ) -> str:
     return (
         _render_event_context_block(event)
@@ -144,7 +142,6 @@ def _render_user_message(
         + f"--- StatisticsReport ---\n{statistics.model_dump_json(indent=2)}\n\n"
         + f"--- InjuryReport ---\n{injury.model_dump_json(indent=2)}\n\n"
         + f"--- NarrativeReport ---\n{narrative.model_dump_json(indent=2)}\n\n"
-        + f"--- MarketContextReport ---\n{market_context.model_dump_json(indent=2)}\n\n"
         + "Return an EventPrediction per the schema. "
         "Set predicted_winner to the exact yes_sub_title string of the side you expect to win."
     )
@@ -190,7 +187,7 @@ async def synthesize_prediction(
     event: PolymarketEvent,
     reports: dict[str, SpecialistReport],
 ) -> MarketPrediction:
-    """Synthesize four specialist reports into an event-level EventPrediction,
+    """Synthesize three specialist reports into an event-level EventPrediction,
     then project onto the predicted winner's market.
     """
     user_msg = _render_user_message(
@@ -198,7 +195,6 @@ async def synthesize_prediction(
         statistics=cast(StatisticsReport, reports["statistics"]),
         injury=cast(InjuryReport, reports["injury"]),
         narrative=cast(NarrativeReport, reports["narrative"]),
-        market_context=cast(MarketContextReport, reports["market_context"]),
     )
 
     system_block = TextBlockParam(

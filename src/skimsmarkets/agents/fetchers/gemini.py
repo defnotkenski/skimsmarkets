@@ -65,14 +65,15 @@ Do NOT output a probability, a signed shift, a directional verdict, or a single
 Tools available — use whichever fit what you're trying to learn, and chain several calls if
 the first doesn't answer the question:
 - google_search: URL-citable facts — stats pages, official injury reports, press coverage,
-  sportsbook odds, weather, venue. For Twitter/X content (beat-reporter posts, breaking
-  news, public sentiment), use google_search with `site:x.com` or `site:twitter.com` plus
-  reporter handles. Recent posts may be incompletely indexed; flag thin social-media
-  coverage in `coverage` when injury/narrative reporting depends on it.
-- code_execution: run Python when numbers need computing — de-vigging sportsbook odds,
-  converting ratings to probabilities, weighting recent-form vs season baselines.
-  Don't eyeball math you could compute. Surface every numeric derivation in
-  `computed_numbers` so the reasoner can use it as-is.
+  weather, venue. For Twitter/X content (beat-reporter posts, breaking news, public
+  sentiment), use google_search with `site:x.com` or `site:twitter.com` plus reporter
+  handles. Recent posts may be incompletely indexed; flag thin social-media coverage
+  in `coverage` when injury/narrative reporting depends on it.
+- code_execution: run Python when numbers need computing — converting ratings to
+  probabilities, weighting recent-form vs season baselines, computing weather-impact
+  adjustments, log5 / Poisson / surface-conditioned baselines. Don't eyeball math you
+  could compute. Surface every numeric derivation in `computed_numbers` so the
+  reasoner can use it as-is.
 
 You are expected to actually call these tools — not recite what you already know.
 
@@ -145,27 +146,15 @@ What each tool can give you here:
 
 TOOLS_SECTION_NARRATIVE = """
 What each tool can give you here:
-- google_search: beat-reporter features, team press conferences, coaching interviews, and
-  (for outdoor sports) weather and venue pages. For public sentiment and locker-room
-  chatter, query `site:x.com` plus team / player handles or relevant beat-reporter
-  accounts (e.g. `site:x.com @MarcSpears Celtics locker room`). Twitter indexing on
-  Google is incomplete and lags — when sentiment data is sparse, set `coverage='thin'`
-  rather than overstating what you found.
+- google_search: beat-reporter features, team press conferences, coaching interviews,
+  managerial-change reporting, derby/cup-final coverage. For public sentiment and
+  locker-room chatter, query `site:x.com` plus team / player handles or relevant
+  beat-reporter accounts (e.g. `site:x.com @MarcSpears Celtics locker room`). Twitter
+  indexing on Google is incomplete and lags — when sentiment data is sparse, set
+  `coverage='thin'` rather than overstating what you found.
 - code_execution: ground a narrative claim in a number when you can (e.g. post-firing
   coaching-bump win% in the league, trade-deadline record splits) and put it in
   `computed_numbers`.
-""".strip()
-
-
-TOOLS_SECTION_MARKET_CONTEXT = """
-What each tool can give you here:
-- google_search: current moneyline / outright odds from DraftKings, FanDuel, BetMGM, and
-  especially Pinnacle (the sharpest book). Check open-vs-current for line movement. For
-  sharp-money commentary, betting-Twitter line-movement reporting, and steam-move alerts,
-  query `site:x.com` plus relevant betting handles (e.g. `site:x.com @Vsiniff steam`).
-- code_execution: de-vig the two-sided sportsbook odds into fair probabilities before
-  comparing — raw American moneylines include vig and will systematically mislead a
-  direct comparison.
 """.strip()
 
 
@@ -173,7 +162,6 @@ _TOOLS_BY_LENS: dict[LensName, str] = {
     "statistics": TOOLS_SECTION_STATISTICS,
     "injury": TOOLS_SECTION_INJURY,
     "narrative": TOOLS_SECTION_NARRATIVE,
-    "market_context": TOOLS_SECTION_MARKET_CONTEXT,
 }
 
 
@@ -191,7 +179,7 @@ def _strip_code_fence(text: str) -> str:
 class GeminiProvider:
     """Google Gen AI / Gemini implementation of `FetcherProvider`.
 
-    Holds the `genai.Client` for the run and pre-builds the four
+    Holds the `genai.Client` for the run and pre-builds the three
     lens-specific system prompts at construction. Each `fetch` call sends
     the system prompt via `system_instruction`, the rendered event context
     as the user content, and the two tools (`google_search`,

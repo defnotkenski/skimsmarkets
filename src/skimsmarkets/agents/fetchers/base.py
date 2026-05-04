@@ -17,7 +17,6 @@ from typing import Awaitable, Callable, Protocol
 
 from skimsmarkets.agents.prompts import (
     injury_notebook_system,
-    market_context_notebook_system,
     narrative_notebook_system,
     statistics_notebook_system,
 )
@@ -30,7 +29,7 @@ log = logging.getLogger(__name__)
 
 # Lens → (tools_section, notebook_tail) → system_prompt builder.
 # Providers call `build_lens_prompts` with their own per-lens tool prose
-# and shared notebook tail to pre-build the four lens-specific system
+# and shared notebook tail to pre-build the three lens-specific system
 # prompts at construction time. Centralised here so both providers stay
 # in sync on the lens-preamble bodies (which describe the lens's *job*,
 # not the provider's tools).
@@ -38,14 +37,13 @@ LENS_PROMPT_BUILDERS: dict[LensName, Callable[[str, str], str]] = {
     "statistics": statistics_notebook_system,
     "injury": injury_notebook_system,
     "narrative": narrative_notebook_system,
-    "market_context": market_context_notebook_system,
 }
 
 
 def build_lens_prompts(
     tools_by_lens: dict[LensName, str], notebook_tail: str
 ) -> dict[LensName, str]:
-    """Pre-build the four lens system prompts for one provider.
+    """Pre-build the three lens system prompts for one provider.
 
     `tools_by_lens` is the provider's per-lens "What each tool can give
     you here" prose; `notebook_tail` is the provider's generic tool list
@@ -123,8 +121,9 @@ def render_context(event: PolymarketEvent) -> str:
 
     Names team_a (Polymarket favorite) and team_b (the first non-team_a side) using
     the exact yes_sub_title strings so specialists echo them back verbatim. Every
-    tradable side is rendered with its bid/ask, implied, volume and liquidity so the
-    market-context specialist sees the whole event board without another fetch.
+    tradable side is rendered with its bid/ask, implied, volume and liquidity so
+    every specialist — and the director downstream — sees the same Polymarket
+    microstructure block without an extra fetch.
     """
     team_a_market = pick_team_a_market(event)
     team_b_market = next(
