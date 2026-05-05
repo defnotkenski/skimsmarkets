@@ -1,3 +1,31 @@
+"""Cross-sport Pydantic schemas for the agent layer.
+
+Per-sport report schemas (the typed reports each lens emits) live in
+`agents/sports/<sport>/schemas.py` — `agents/sports/default/schemas.py`
+holds the legacy `StatisticsReport` / `InjuryReport` / `NarrativeReport`
+trio; `agents/sports/tennis/schemas.py` holds the bespoke tennis trio.
+
+Only sport-agnostic types live here:
+- `LensNotebook` — fetcher Stage A output, free-form research notes +
+  citations + computed numbers. No verdict.
+- `Citation`, `ComputedNumber` — components of `LensNotebook`.
+- `PlayerStatus` — used by both legacy `InjuryReport` and tennis
+  `TennisConditionsContextReport.injury_concerns`. Worth keeping
+  cross-sport because the shape (name + team + status + impact note)
+  is identical.
+- `EventPrediction` — director's structured-output schema.
+- `MarketPrediction` — projection of an `EventPrediction` onto the
+  predicted-winner's market.
+- `DefensibilityAssessment`, `SlateDefensibilityJudgment` — slate judge
+  output.
+
+`LensNotebook.lens` is a plain `str` rather than a `Literal[...]` —
+with per-sport lens names the union would grow per sport, and lens-name
+validation already happens at runtime via
+`agents/fetchers/base.py:assert_lens_match` against the LensSet's
+declared lens names.
+"""
+
 from __future__ import annotations
 
 from typing import Literal
@@ -5,8 +33,6 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 Confidence = Literal["low", "medium", "high"]
-
-LensName = Literal["statistics", "injury", "narrative"]
 
 
 class Citation(BaseModel):
@@ -45,18 +71,23 @@ class ComputedNumber(BaseModel):
 
 
 class LensNotebook(BaseModel):
-    """Free-form research notebook emitted by a Grok fetcher for one lens.
+    """Free-form research notebook emitted by a fetcher for one lens.
 
     The fetcher's job is evidence capture, not judgment — so this schema has
     NO probability, NO signed shift, NO directional verdict. Those land in the
     typed report a downstream Claude reasoner emits from this notebook plus
     the same event context the fetcher saw.
 
+    `lens` is a free-form string set by the fetcher to the lens it was asked
+    to run. Validation against the LensSet's declared lens names happens at
+    runtime via `assert_lens_match` so prompt-mixup bugs fail loud at fetch
+    time.
+
     `research_notes` is intentionally free-form prose (sectioned by the
-    fetcher) so Grok's adaptive search loop ("found X, now look up Y") can
-    capture whatever it stumbles on without the schema predicting structure
-    upfront. Structured citation + computed-number lists ride alongside so
-    URLs and numbers stay machine-extractable.
+    fetcher) so the provider's adaptive search loop ("found X, now look up Y")
+    can capture whatever it stumbles on without the schema predicting
+    structure upfront. Structured citation + computed-number lists ride
+    alongside so URLs and numbers stay machine-extractable.
 
     `coverage` is the fetcher's self-assessment of how thin/rich the evidence
     is — the reasoner downgrades `confidence` to `low` when this is `thin`.
@@ -64,7 +95,12 @@ class LensNotebook(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    lens: LensName
+    lens: str = Field(
+        description=(
+            "The lens this notebook was produced for. Validated against the "
+            "active LensSet's declared lens names at runtime."
+        ),
+    )
     team_a_name: str = Field(
         description="Echoed verbatim from the event context's team_a_name.",
     )
@@ -84,75 +120,18 @@ class LensNotebook(BaseModel):
     )
 
 
-class StatisticsReport(BaseModel):
-    """Quantitative lens: form, head-to-head, splits, base rates."""
-
-    team_a_name: str = Field(description="Exact yes_sub_title of the team you call 'team_a'.")
-    team_b_name: str = Field(description="Exact yes_sub_title of the team you call 'team_b'.")
-    team_a_win_probability: float = Field(
-        ge=0.0,
-        le=1.0,
-        description="Probability team_a wins the event, 0-1.",
-    )
-    confidence: Confidence = Field(description="low if data was thin or stale.")
-    key_stats: list[str] = Field(
-        default_factory=list,
-        description="Concrete stat lines supporting the prediction.",
-    )
-    head_to_head_summary: str = Field(description="Recent head-to-head history.")
-    form_delta: str = Field(description="Recent-form comparison between the two sides.")
-    caveats: list[str] = Field(default_factory=list)
-
-
 class PlayerStatus(BaseModel):
+    """Cross-sport availability primitive used by injury / availability
+    reports. Reused by `default.InjuryReport.key_absences` and by
+    `tennis.TennisConditionsContextReport.injury_concerns`.
+    """
+
     name: str
     team: str
     status: str = Field(
         description="e.g. 'out', 'questionable', 'probable', 'suspended'."
     )
     impact_note: str = Field(description="How this affects the matchup.")
-
-
-class InjuryReport(BaseModel):
-    """Availability lens: injuries, suspensions, rest, lineup uncertainty."""
-
-    team_a_name: str
-    team_b_name: str
-    team_a_availability_impact: float = Field(
-        ge=-0.2,
-        le=0.2,
-        description="Signed probability shift for team_a from availability, -0.2 to +0.2.",
-    )
-    team_b_availability_impact: float = Field(ge=-0.2, le=0.2)
-    key_absences: list[PlayerStatus] = Field(default_factory=list)
-    lineup_confidence: Literal["confirmed", "probable", "uncertain"]
-    sources_checked: list[str] = Field(
-        default_factory=list,
-        description="Real URLs of injury sources consulted.",
-    )
-
-
-class NarrativeFactor(BaseModel):
-    factor: str
-    direction: Literal["team_a", "team_b", "neutral"]
-    strength: Literal["weak", "moderate", "strong"]
-
-
-class NarrativeReport(BaseModel):
-    """Storyline lens: motivation, coaching, locker-room, weather for outdoor sports."""
-
-    team_a_name: str
-    team_b_name: str
-    dominant_storyline: str
-    motivation_edge: Literal["team_a", "team_b", "neutral"]
-    narrative_factors: list[NarrativeFactor] = Field(default_factory=list)
-    public_perception_bias: str = Field(
-        description="e.g. 'public heavy on favorite', 'contrarian value on underdog'.",
-    )
-    sentiment_sources: list[str] = Field(default_factory=list)
-
-
-SpecialistReport = StatisticsReport | InjuryReport | NarrativeReport
 
 
 class EventPrediction(BaseModel):
@@ -202,7 +181,13 @@ class EventPrediction(BaseModel):
         description="3-6 sentences explaining the synthesis and how specialists were weighted.",
     )
     specialist_weights: dict[str, float] = Field(
-        description="Per-specialist weight in [0,1]; should roughly sum to 1.",
+        description=(
+            "Per-specialist weight in [0,1]; should roughly sum to 1. Keys are the "
+            "lens names declared by the active LensSet (e.g. tennis emits "
+            "'tennis_form_and_surface' / 'tennis_matchup_and_clutch' / "
+            "'tennis_conditions_and_context'; the default set emits "
+            "'statistics' / 'injury' / 'narrative')."
+        ),
     )
     disagreements_flagged: list[str] = Field(
         default_factory=list,
@@ -227,7 +212,9 @@ class MarketPrediction(BaseModel):
 
     Attaches the winning side's Polymarket slug + implied probability alongside
     the director's prediction so downstream sizing and reporting have a single
-    self-contained record.
+    self-contained record. Carries `sport_type` and `lens_set_name` for JSONL
+    grouping (`jq 'select(.sport_type=="tennis")'`) without joining against a
+    sidecar.
     """
 
     market_slug: str = Field(
@@ -235,6 +222,24 @@ class MarketPrediction(BaseModel):
     )
     event_id: str
     event_title: str | None = None
+    sport_type: str | None = Field(
+        default=None,
+        description=(
+            "Canonical `event.sport_type` (gamma-tag-derived) at time of "
+            "prediction. Used by JSONL retrospective analysis and by reporting "
+            "to group predictions by sport. None for events without a "
+            "recognized sport tag."
+        ),
+    )
+    lens_set_name: str | None = Field(
+        default=None,
+        description=(
+            "Name of the LensSet this prediction was synthesized through "
+            "(e.g. 'tennis'). Same as `sport_type` for sports with bespoke "
+            "lens sets; would differ if a sport were registered against "
+            "DEFAULT_LENS_SET via the soft-rollout escape hatch."
+        ),
+    )
     predicted_winner: str
     predicted_yes_probability: float = Field(ge=0.0, le=1.0)
     polymarket_implied_probability: float | None = Field(

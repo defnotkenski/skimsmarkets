@@ -10,18 +10,20 @@ from pathlib import Path
 
 import httpx
 from anthropic import AsyncAnthropic
+from pydantic import BaseModel
 
 from skimsmarkets import config as cfg
 from skimsmarkets.agents.director import synthesize_prediction
 from skimsmarkets.agents.fetchers import FetcherProvider, build_provider
 from skimsmarkets.agents.judge import judge_slate
-from skimsmarkets.agents.reasoners import REASONERS
+from skimsmarkets.agents.reasoners import run_reasoner
 from skimsmarkets.agents.schemas import (
     DefensibilityAssessment,
     LensNotebook,
     MarketPrediction,
-    SpecialistReport,
 )
+from skimsmarkets.agents.sports import resolve_lens_set
+from skimsmarkets.agents.sports.base import LensSet, LensSpec
 from skimsmarkets.clob import (
     fetch_book,
     fetch_price_history,
@@ -50,8 +52,13 @@ log = logging.getLogger(__name__)
 @dataclass
 class ErrorRecord:
     event_id: str
-    stage: str  # "fetcher:<lens>" / "reasoner:<lens>" / "director"
+    stage: str  # "fetcher:<lens>" / "reasoner:<lens>" / "director" / "lens_dispatch" / "tennis_stats" / "judge"
     error: str
+    # `sport_type` is captured at error creation so JSONL retro-analysis can
+    # group drops by sport (e.g. `jq '.stage=="lens_dispatch" | .sport_type'`).
+    # None for slate-level errors (`event_id="*"`, e.g. judge failures) or for
+    # events where sport_type wasn't resolved.
+    sport_type: str | None = None
 
 
 @dataclass
@@ -74,7 +81,12 @@ class RunResult:
     # grading can ask "did the fetcher find the right facts?" and "did
     # Claude reason correctly?" as separate questions.
     notebooks: dict[str, dict[str, LensNotebook]] = field(default_factory=dict)
-    reports: dict[str, dict[str, SpecialistReport]] = field(default_factory=dict)
+    # Reports are typed as `BaseModel` cross-pipeline because per-sport
+    # lens sets emit per-sport report schemas (no closed union). The
+    # per-sport director path is the only place that knows the concrete
+    # types — pipeline plumbing just stores and serializes via
+    # `model_dump`.
+    reports: dict[str, dict[str, BaseModel]] = field(default_factory=dict)
     # Per-event tennis stats vendor payload (when present). Keyed
     # event_id → TennisStatsContext. Populated in `enrich_tennis_stats`
     # for ATP/WTA singles head-to-heads only; non-tennis / no-key runs
@@ -99,7 +111,7 @@ class _LensOutcome:
 
     lens: str
     notebook: LensNotebook | None = None
-    report: SpecialistReport | None = None
+    report: BaseModel | None = None
     error_stage: str | None = None  # "fetcher" or "reasoner"
     error: BaseException | None = None
 
@@ -710,6 +722,7 @@ async def enrich_tennis_stats(
                         event_id=event.id,
                         stage="tennis_stats",
                         error=f"{type(e).__name__}: {e}",
+                        sport_type=event.sport_type,
                     )
                 )
                 log.warning(
@@ -740,39 +753,46 @@ async def _run_lenses(
     provider: FetcherProvider,
     anthropic: AsyncAnthropic,
     event: PolymarketEvent,
+    lens_set: LensSet,
     fetcher_sem: asyncio.Semaphore,
     reasoner_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
-) -> tuple[dict[str, LensNotebook], dict[str, SpecialistReport]] | None:
-    """Run all three lenses for one event. Each lens is a provider fetcher
-    (Stage A) → Claude reasoner (Stage B) chain; lenses run in parallel,
-    fetcher→reasoner is sequential within a lens.
+) -> tuple[dict[str, LensNotebook], dict[str, BaseModel]] | None:
+    """Run every lens declared by `lens_set` for one event. Each lens is a
+    provider fetcher (Stage A) → Claude reasoner (Stage B) chain; lenses
+    run in parallel, fetcher→reasoner is sequential within a lens.
 
     `fetcher_sem` is released between stages so a slow fetcher search loop
     doesn't tie up a fetcher slot through the (typically faster) Claude
-    reasoner call. Per-event failure posture matches the legacy specialists
+    reasoner call. Per-event failure posture is unchanged from the legacy
     pipeline: any failure at either stage of any lens drops the event so
     the director never receives a partial set of reports.
+
+    Per-sport-lens-set refactor: iterates `lens_set.lenses` (a tuple of
+    `LensSpec`) instead of the legacy `REASONERS` dict; the reasoner
+    helper is the generic `run_reasoner(anthropic, event, notebook, spec)`
+    rather than per-lens dispatch.
     """
 
-    async def _one(lens: str) -> _LensOutcome:
+    async def _one(spec: LensSpec) -> _LensOutcome:
+        lens = spec.name
         try:
             async with fetcher_sem:
-                notebook = await provider.fetch(event, lens)  # type: ignore[arg-type]
+                notebook = await provider.fetch(event, lens, lens_set=lens_set)
         except Exception as e:  # noqa: BLE001
             return _LensOutcome(lens=lens, error_stage="fetcher", error=e)
         try:
             async with reasoner_sem:
-                report = await REASONERS[lens](anthropic, event, notebook)
+                report = await run_reasoner(anthropic, event, notebook, spec)
         except Exception as e:  # noqa: BLE001
             return _LensOutcome(
                 lens=lens, notebook=notebook, error_stage="reasoner", error=e
             )
         return _LensOutcome(lens=lens, notebook=notebook, report=report)
 
-    outcomes = await asyncio.gather(*(_one(n) for n in REASONERS))
+    outcomes = await asyncio.gather(*(_one(spec) for spec in lens_set.lenses))
     notebooks: dict[str, LensNotebook] = {}
-    reports: dict[str, SpecialistReport] = {}
+    reports: dict[str, BaseModel] = {}
     failed = False
     for o in outcomes:
         if o.error is not None:
@@ -781,6 +801,7 @@ async def _run_lenses(
                     event_id=event.id,
                     stage=f"{o.error_stage}:{o.lens}",
                     error=f"{type(o.error).__name__}: {o.error}",
+                    sport_type=event.sport_type,
                 )
             )
             failed = True
@@ -854,6 +875,12 @@ def _persist_run(result: RunResult) -> None:
                 # fetcher use them?". Null on non-tennis events and on
                 # tennis events the stub / vendor failed to populate.
                 ts = result.tennis_stats.get(p.event_id)
+                # `lens_names` is derived from the keys of the prediction's
+                # specialist_reports (which match the LensSet's declared
+                # lens names by construction). Stable order via sorting
+                # is fine for jq filtering even though the LensSet itself
+                # has an ordered tuple.
+                lens_names_for_row = sorted(reports_for_event.keys())
                 payload = {
                     # Discriminator — see function docstring for shapes.
                     # Listed first so `jq '.record_type'` is one cheap
@@ -868,6 +895,15 @@ def _persist_run(result: RunResult) -> None:
                     "fetcher_model": result.fetcher_model,
                     "event_id": p.event_id,
                     "event_title": p.event_title,
+                    # Sport / lens-set metadata at the top level so jq
+                    # filters can group by sport without reaching into
+                    # `notebooks` keys: `jq 'select(.sport_type=="tennis")'`,
+                    # `jq 'select(.lens_set_name=="tennis")'`, or
+                    # `jq '.lens_names[]' | sort | uniq -c` for distribution
+                    # across the slate.
+                    "sport_type": p.sport_type,
+                    "lens_set_name": p.lens_set_name,
+                    "lens_names": lens_names_for_row,
                     "market_slug": p.market_slug,
                     "predicted_winner": p.predicted_winner,
                     "predicted_yes_probability": p.predicted_yes_probability,
@@ -916,6 +952,10 @@ def _persist_run(result: RunResult) -> None:
                     "fetcher_provider": result.fetcher_provider,
                     "fetcher_model": result.fetcher_model,
                     "event_id": err.event_id,
+                    # Top-level so `jq 'select(.stage=="lens_dispatch") | .sport_type'`
+                    # works for analyzing dropped-event distributions across
+                    # sports without reaching into nested fields.
+                    "sport_type": err.sport_type,
                     "stage": err.stage,
                     "error": err.error,
                 }
@@ -934,22 +974,26 @@ async def process_event(
     provider: FetcherProvider,
     anthropic: AsyncAnthropic,
     event: PolymarketEvent,
+    lens_set: LensSet,
     fetcher_sem: asyncio.Semaphore,
     reasoner_sem: asyncio.Semaphore,
     director_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
 ) -> tuple[
-    MarketPrediction, dict[str, LensNotebook], dict[str, SpecialistReport]
+    MarketPrediction, dict[str, LensNotebook], dict[str, BaseModel]
 ] | None:
-    """Run the full agent chain for one event.
+    """Run the full agent chain for one event under its sport's `lens_set`.
 
     Returns the prediction alongside the per-lens notebooks and reasoner
     reports so the caller can persist them to the run JSONL. Returns None
     when the event was dropped (any lens stage failure or director failure).
     """
-    log.info("processing event %s (%s)", event.id, event.title)
+    log.info(
+        "processing event %s sport=%s lens_set=%s (%s)",
+        event.id, event.sport_type, lens_set.sport, event.title,
+    )
     pairs = await _run_lenses(
-        provider, anthropic, event, fetcher_sem, reasoner_sem, errors
+        provider, anthropic, event, lens_set, fetcher_sem, reasoner_sem, errors
     )
     if pairs is None:
         return None
@@ -957,13 +1001,16 @@ async def process_event(
 
     async with director_sem:
         try:
-            prediction = await synthesize_prediction(anthropic, event, reports)
+            prediction = await synthesize_prediction(
+                anthropic, event, reports, lens_set
+            )
         except Exception as e:  # noqa: BLE001
             errors.append(
                 ErrorRecord(
                     event_id=event.id,
                     stage="director",
                     error=f"{type(e).__name__}: {e}",
+                    sport_type=event.sport_type,
                 )
             )
             return None
@@ -1057,6 +1104,46 @@ async def run_pipeline(
         if not events:
             return result
 
+        # Lens-set dispatch — strict-declaration: events whose `sport_type`
+        # has no registered LensSet drop with `ErrorRecord(stage=
+        # "lens_dispatch")` BEFORE the enrichment fan-out, so we don't
+        # pay UW / CLOB book / CLOB price-history / tennis-stats HTTP for
+        # events we'll never process. Keep `events` as the dispatchable
+        # subset for the rest of the run.
+        dispatchable: list[PolymarketEvent] = []
+        lens_sets_by_event: dict[str, LensSet] = {}
+        for ev in events:
+            ls = resolve_lens_set(ev)
+            if ls is None:
+                result.errors.append(
+                    ErrorRecord(
+                        event_id=ev.id,
+                        stage="lens_dispatch",
+                        error=(
+                            f"no lens set registered for sport_type="
+                            f"{ev.sport_type!r}"
+                        ),
+                        sport_type=ev.sport_type,
+                    )
+                )
+                continue
+            dispatchable.append(ev)
+            lens_sets_by_event[ev.id] = ls
+        dropped_dispatch = len(events) - len(dispatchable)
+        if dropped_dispatch:
+            log.info(
+                "lens_dispatch dropped %d/%d events with no registered lens set",
+                dropped_dispatch, len(events),
+            )
+        events = dispatchable
+
+        if not events:
+            # Whole slate dropped at lens_dispatch. Persist whatever
+            # error rows accumulated before bailing.
+            if result.errors:
+                _persist_run(result)
+            return result
+
         # Enrichment stages all share the same `gamma_resolver` so token-ID
         # lookups are paid for at most once per slug across UW + CLOB book +
         # CLOB price-history. UW runs first because it can drop events with
@@ -1104,6 +1191,7 @@ async def run_pipeline(
                         provider,
                         anthropic,
                         e,
+                        lens_sets_by_event[e.id],
                         fetcher_sem,
                         reasoner_sem,
                         director_sem,

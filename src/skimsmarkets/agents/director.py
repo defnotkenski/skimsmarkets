@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from typing import cast
 
 from anthropic import AsyncAnthropic
 from anthropic.types import (
@@ -11,18 +10,12 @@ from anthropic.types import (
     TextBlockParam,
     ThinkingConfigAdaptiveParam,
 )
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from skimsmarkets.agents.prompts import DIRECTOR_SYSTEM
+from skimsmarkets.agents.schemas import EventPrediction, MarketPrediction
 from skimsmarkets.agents.sport_hints import render_director_sport_hint
-from skimsmarkets.agents.schemas import (
-    EventPrediction,
-    InjuryReport,
-    MarketPrediction,
-    NarrativeReport,
-    SpecialistReport,
-    StatisticsReport,
-)
+from skimsmarkets.agents.sports import DIRECTOR_SHARED_PREAMBLE
+from skimsmarkets.agents.sports.base import LensSet
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 from skimsmarkets.unusual_whales import render_uw_block
 
@@ -55,7 +48,8 @@ def _render_event_context_block(event: PolymarketEvent) -> str:
     # Pre-match prose context — gamma's `eventMetadata.context_description`
     # is an AI-generated paragraph (form, recent H2H, line motivation).
     # Lives in the per-event user message (NOT the cached system prompt)
-    # so the prompt cache hit on DIRECTOR_SYSTEM is preserved.
+    # so the prompt cache hit on DIRECTOR_SHARED_PREAMBLE + sport tail is
+    # preserved.
     if event.context_description:
         lines.append(f"Pre-match context: {event.context_description}")
     for m in event.markets:
@@ -143,25 +137,41 @@ def _render_event_context_block(event: PolymarketEvent) -> str:
 
 def _render_user_message(
     event: PolymarketEvent,
-    statistics: StatisticsReport,
-    injury: InjuryReport,
-    narrative: NarrativeReport,
+    reports: dict[str, BaseModel],
+    lens_set: LensSet,
 ) -> str:
+    """Compose the director's per-event user message.
+
+    Reports are rendered IN THE ORDER the lens set declares so the
+    director reads them in the same layout the sport-specific tail
+    references. Each report block is named after its lens (e.g.
+    `--- tennis_form_and_surface report ---`) so the director's prose
+    can refer to lens names that match `specialist_weights` keys.
+    """
     # Sport-specific contingency menu for sizing the `confidence` tier.
     # Rides on the per-event user message — NEVER the cached system block —
-    # so the slate-wide cache hit on DIRECTOR_SYSTEM is preserved. None when
-    # `event.sport_type` doesn't have a specialization, in which case the
-    # director uses the generic conf framing from DIRECTOR_SYSTEM alone.
+    # so the slate-wide cache hit is preserved.
     sport_hint = render_director_sport_hint(event)
     sport_hint_block = f"{sport_hint}\n\n" if sport_hint else ""
+
+    report_blocks: list[str] = []
+    for spec in lens_set.lenses:
+        report = reports.get(spec.name)
+        if report is None:
+            # Defensive — `_run_lenses` should have produced one report
+            # per declared lens or dropped the event before we got here.
+            continue
+        report_blocks.append(
+            f"--- {spec.name} report ---\n{report.model_dump_json(indent=2)}"
+        )
+    reports_str = "\n\n".join(report_blocks)
+
     return (
         _render_event_context_block(event)
         + "\n\n"
         + sport_hint_block
-        + f"--- StatisticsReport ---\n{statistics.model_dump_json(indent=2)}\n\n"
-        + f"--- InjuryReport ---\n{injury.model_dump_json(indent=2)}\n\n"
-        + f"--- NarrativeReport ---\n{narrative.model_dump_json(indent=2)}\n\n"
-        + "Return an EventPrediction per the schema. "
+        + reports_str
+        + "\n\nReturn an EventPrediction per the schema. "
         "Set predicted_winner to the exact yes_sub_title string of the side you expect to win."
     )
 
@@ -181,6 +191,7 @@ def _project_to_market_prediction(
     event: PolymarketEvent,
     winner_market: PolymarketMarket,
     event_pred: EventPrediction,
+    lens_set: LensSet,
 ) -> MarketPrediction:
     """Project the event-level prediction onto the winning side's Polymarket
     market so reporting has a single self-contained record.
@@ -189,6 +200,8 @@ def _project_to_market_prediction(
         market_slug=winner_market.slug,
         event_id=event.id,
         event_title=event.title,
+        sport_type=event.sport_type,
+        lens_set_name=lens_set.sport,
         predicted_winner=event_pred.predicted_winner,
         predicted_yes_probability=event_pred.predicted_winner_probability,
         polymarket_implied_probability=winner_market.yes_implied_probability,
@@ -204,21 +217,33 @@ def _project_to_market_prediction(
 async def synthesize_prediction(
     anthropic: AsyncAnthropic,
     event: PolymarketEvent,
-    reports: dict[str, SpecialistReport],
+    reports: dict[str, BaseModel],
+    lens_set: LensSet,
 ) -> MarketPrediction:
-    """Synthesize three specialist reports into an event-level EventPrediction,
-    then project onto the predicted winner's market.
-    """
-    user_msg = _render_user_message(
-        event=event,
-        statistics=cast(StatisticsReport, reports["statistics"]),
-        injury=cast(InjuryReport, reports["injury"]),
-        narrative=cast(NarrativeReport, reports["narrative"]),
-    )
+    """Synthesize a sport's specialist reports into an event-level
+    `EventPrediction`, then project onto the predicted winner's market.
 
-    system_block = TextBlockParam(
+    The director sends TWO cached system blocks: the sport-agnostic
+    `DIRECTOR_SHARED_PREAMBLE` (cached once across the whole slate) and
+    the sport-specific `lens_set.director_system_tail` (cached once per
+    unique sport on the slate). Two ephemeral breakpoints — well within
+    the Anthropic 4-cap; reasoners take 1, judge takes 1, no overlap.
+    """
+    user_msg = _render_user_message(event, reports, lens_set)
+
+    # Order matters: the shared preamble caches once across all sports;
+    # the sport-specific tail caches once per unique sport. Anthropic
+    # processes cache breakpoints in order, so a fresh sport on the slate
+    # produces a cache MISS on the tail block but a cache HIT on the
+    # preamble — net cost of the new sport is just the tail's tokens.
+    shared_block = TextBlockParam(
         type="text",
-        text=DIRECTOR_SYSTEM,
+        text=DIRECTOR_SHARED_PREAMBLE,
+        cache_control=CacheControlEphemeralParam(type="ephemeral"),
+    )
+    sport_tail_block = TextBlockParam(
+        type="text",
+        text=lens_set.director_system_tail,
         cache_control=CacheControlEphemeralParam(type="ephemeral"),
     )
     user_message = MessageParam(role="user", content=user_msg)
@@ -232,7 +257,7 @@ async def synthesize_prediction(
             parsed = await anthropic.messages.parse(
                 model=CLAUDE_MODEL,
                 max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
-                system=[system_block],
+                system=[shared_block, sport_tail_block],
                 messages=[user_message],
                 output_format=EventPrediction,
                 # Opus 4.7 only supports adaptive thinking. `effort` is NOT inside the
@@ -259,8 +284,9 @@ async def synthesize_prediction(
 
     assert parsed is not None and event_pred is not None  # break-path invariant
     log.debug(
-        "director event=%s tokens in/out=%s/%s",
+        "director event=%s sport=%s tokens in/out=%s/%s",
         event.id,
+        lens_set.sport,
         parsed.usage.input_tokens,
         parsed.usage.output_tokens,
     )
@@ -273,4 +299,6 @@ async def synthesize_prediction(
             f"Known sides: {[m.yes_sub_title for m in event.markets]}"
         )
 
-    return _project_to_market_prediction(event, winner_market, event_pred)
+    return _project_to_market_prediction(
+        event, winner_market, event_pred, lens_set
+    )

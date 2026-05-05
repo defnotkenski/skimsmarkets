@@ -7,7 +7,14 @@ The fetcher's job is evidence capture, not judgment — it emits a
 commits to a probability or directional verdict. The verdict lives in the
 downstream Claude reasoner (see `agents/reasoners.py`). Provider files
 (`grok.py`, `gemini.py`) implement `FetcherProvider` by wiring their SDK
-to the prebuilt per-lens system prompts that `LENS_PROMPT_BUILDERS` exposes.
+to per-(sport, lens) system prompts pre-built at construction by
+iterating `SPORT_LENS_SETS`.
+
+Per-sport-lens-set refactor: the legacy `LENS_PROMPT_BUILDERS` dict
+(keyed by `LensName` Literal) is gone — each `LensSpec` now owns its
+own `fetcher_system_builder`. The legacy `render_lens_extras` switch is
+also gone — each `LensSpec.render_extras` callable produces the per-lens
+user-message append.
 """
 
 from __future__ import annotations
@@ -15,49 +22,38 @@ from __future__ import annotations
 import logging
 from typing import Awaitable, Callable, Protocol
 
-from skimsmarkets.agents.prompts import (
-    injury_notebook_system,
-    narrative_notebook_system,
-    statistics_notebook_system,
-)
-from skimsmarkets.agents.schemas import LensName, LensNotebook
+from skimsmarkets.agents.schemas import LensNotebook
+from skimsmarkets.agents.sports.base import LensSet, LensSpec
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
-from skimsmarkets.tennis import render_tennis_stats_block
 
 log = logging.getLogger(__name__)
 
 
-# Lens → (tools_section, notebook_tail) → system_prompt builder.
-# Providers call `build_lens_prompts` with their own per-lens tool prose
-# and shared notebook tail to pre-build the three lens-specific system
-# prompts at construction time. Centralised here so both providers stay
-# in sync on the lens-preamble bodies (which describe the lens's *job*,
-# not the provider's tools).
-LENS_PROMPT_BUILDERS: dict[LensName, Callable[[str, str], str]] = {
-    "statistics": statistics_notebook_system,
-    "injury": injury_notebook_system,
-    "narrative": narrative_notebook_system,
-}
+def build_lens_prompts_for_set(
+    lens_set: LensSet,
+    tools_by_lens: dict[str, str],
+    notebook_tail: str,
+) -> dict[str, str]:
+    """Pre-build per-lens system prompts for ONE sport's lens set.
 
+    `tools_by_lens` maps the lens's name → that provider's per-lens
+    "What each tool can give you here" prose. `notebook_tail` is the
+    provider's generic tool list + output rules. Each lens's
+    `fetcher_system_builder` builds the cached fetcher system prompt
+    by composing the lens-specific preamble (which describes the
+    lens's *job*) with these provider-specific bits (which name the
+    provider's tools).
 
-def build_lens_prompts(
-    tools_by_lens: dict[LensName, str], notebook_tail: str
-) -> dict[LensName, str]:
-    """Pre-build the three lens system prompts for one provider.
-
-    `tools_by_lens` is the provider's per-lens "What each tool can give
-    you here" prose; `notebook_tail` is the provider's generic tool list
-    + output rules. The lens-preamble bodies (the load-bearing prose
-    describing each lens's job) come from `LENS_PROMPT_BUILDERS` so both
-    providers stay in lockstep on what each lens actually does.
-
-    Iterates `LENS_PROMPT_BUILDERS` keys directly (rather than `.items()`)
-    so the loop variable retains its `LensName` literal type — PyCharm's
-    type narrowing widens through tuple-unpacked comprehensions.
+    Lens names are unique across the entire registry (tennis lens names
+    don't collide with default lens names), so providers maintain a
+    flat `_TOOLS_BY_LENS` dict keyed by full lens name and accumulate
+    entries as new sports ship.
     """
     return {
-        lens: LENS_PROMPT_BUILDERS[lens](tools_by_lens[lens], notebook_tail)
-        for lens in LENS_PROMPT_BUILDERS
+        spec.name: spec.fetcher_system_builder(
+            tools_by_lens[spec.name], notebook_tail
+        )
+        for spec in lens_set.lenses
     }
 
 
@@ -66,23 +62,32 @@ class FetcherProvider(Protocol):
 
     `name` and `model` are persisted to the per-run JSONL (top-level row
     metadata) so retrospective grading can group hit-rate by provider /
-    model version. `fetch` runs one lens for one event and returns the
-    parsed `LensNotebook`; lens-mismatch validation happens inside the
-    provider via `assert_lens_match` so prompt-mixup bugs fail loud at
-    fetch time.
+    model version. `fetch` runs one lens for one event in the named
+    sport's lens set and returns the parsed `LensNotebook`; lens-mismatch
+    validation happens inside the provider via `assert_lens_match` so
+    prompt-mixup bugs fail loud at fetch time.
+
+    `lens_set` is passed alongside `lens` so the provider can resolve
+    the cached system prompt by `(sport, lens_name)` without re-doing
+    dispatch — the pipeline already resolved it once via
+    `agents.sports.resolve_lens_set` at the lens-dispatch stage.
     """
 
     name: str
     model: str
 
     async def fetch(
-        self, event: PolymarketEvent, lens: LensName
+        self,
+        event: PolymarketEvent,
+        lens: str,
+        *,
+        lens_set: LensSet,
     ) -> LensNotebook: ...
 
     async def aclose(self) -> None: ...
 
 
-def assert_lens_match(parsed: LensNotebook, expected: LensName, event_id: str) -> None:
+def assert_lens_match(parsed: LensNotebook, expected: str, event_id: str) -> None:
     """Fail loud when a fetcher returns the wrong `lens` discriminator.
 
     Catches prompt-mixup bugs at fetch time rather than letting them
@@ -291,22 +296,24 @@ def render_context(event: PolymarketEvent) -> str:
     )
 
 
-def render_lens_extras(lens: LensName, event: PolymarketEvent) -> str | None:
-    """Lens-specific user-message append, or None when nothing applies.
+def render_user_message_for_lens(
+    event: PolymarketEvent, spec: LensSpec
+) -> str:
+    """Compose the per-lens user message a fetcher actually sends.
 
-    Mirrors the `render_sport_hint(...)` injection point — content rides
-    on the per-event user message (NOT the cached system prompt) so the
-    cache hit on the system block is preserved. The block is restricted
-    to a specific lens to keep the lens-silo posture intact: tennis
-    player stats feed only the statistics specialist; the other three
-    lenses go through this helper unchanged.
-
-    Adding more lens-specific blocks later means editing this function,
-    not every provider's `fetch` body.
+    Order: cross-lens event context, then per-lens fetcher sport hint,
+    then per-lens render_extras (e.g. tennis stats block on
+    `tennis_form_and_surface`). All rides on the user message — never the
+    cached system block.
     """
-    if lens == "statistics" and event.tennis_stats is not None:
-        return render_tennis_stats_block(event.tennis_stats)
-    return None
+    user_msg = render_context(event)
+    if (sport_hint := spec.render_fetcher_hint()) is not None:
+        user_msg += "\n\n" + sport_hint
+    if spec.render_extras is not None and (
+        extras := spec.render_extras(event)
+    ) is not None:
+        user_msg += "\n\n" + extras
+    return user_msg
 
 
 # Type alias retained for readability at the protocol boundary; providers
