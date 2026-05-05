@@ -151,17 +151,18 @@ _RECENT_MEETING_PAGE_SIZE = 3
 _RETRY_ATTEMPTS = 5
 _RETRY_BASE_S = 1.0
 
-# Per-provider HTTP concurrency cap. The matchstat rate limit is
-# 100 req/min/IP; bursting all our calls in one `asyncio.gather` (which
-# we did from `warm_form_for_selection` and inside per-event
-# `_player_stats`) saturated the limit instantly and forced exhausted
-# retries. The semaphore bounds in-flight calls so the natural
-# per-request latency (~200-400ms) spaces them out into the budget.
-# Value tuned for: with N=4 in-flight × ~300ms latency = ~13 req/sec
-# burst, but the existing retry-on-429 path absorbs occasional
-# overshoots without warnings reaching the log. Sized to be safely
-# under the burst threshold the vendor tolerates in practice.
-_REQUEST_CONCURRENCY = 4
+# Per-provider HTTP rate limit. MatchStat's published limit is
+# 5 requests per second; we enforce it client-side with a token bucket
+# so we never depend on the retry-on-429 path under normal operation
+# (the retry stays in place as a backstop for vendor-side hiccups).
+# A semaphore alone can't enforce a per-second cap because throughput
+# = concurrency / latency, and latency varies — at 100ms per call
+# even concurrency=1 fires 10 req/sec. The token bucket decouples
+# rate from latency. `_BURST_TOKENS` lets the first few calls fire
+# back-to-back for snappy startup; subsequent calls drip out at the
+# steady rate.
+_REQUESTS_PER_SECOND = 5.0
+_BURST_TOKENS = 5
 
 
 def _normalize_name(name: str) -> str:
@@ -231,6 +232,63 @@ def _tier_from_rank_id(rid: Any) -> str | None:
     return _RANK_ID_TO_TIER.get(n)
 
 
+class _TokenBucket:
+    """Async token-bucket rate limiter for steady-rate HTTP throttling.
+
+    Semaphores cap *concurrency*; this caps *rate*. The distinction
+    matters when latency is short or unpredictable — a 100 req/min
+    vendor with a Semaphore(2) and 50 ms response time would still
+    fire ~40 req/sec, blowing the limit. The token bucket decouples
+    rate from latency by handing out one token per `1 / rate` seconds
+    regardless of how long each call takes.
+
+    `capacity` is the burst budget — calls that arrive when the bucket
+    is full fire immediately; the bucket then refills at `rate`
+    tokens per second. A capacity equal to the rate gives roughly
+    "one second's worth of burst" which is fine for startup snappiness
+    without overshooting the steady-state limit for long.
+
+    Single-process semantics; not durable across runs. Sufficient for
+    our use case (one provider per pipeline run).
+    """
+
+    def __init__(self, rate_per_second: float, capacity: float) -> None:
+        self._rate = rate_per_second
+        self._capacity = capacity
+        self._tokens = capacity
+        self._last_refill: float | None = None
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Block until one token is available, then consume it.
+
+        Lock-guarded so concurrent callers compute consistent token
+        counts. Refills lazily on each acquire — no background task,
+        no clock-tick overhead.
+        """
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            if self._last_refill is None:
+                self._last_refill = now
+            else:
+                elapsed = now - self._last_refill
+                self._tokens = min(
+                    self._capacity, self._tokens + elapsed * self._rate
+                )
+                self._last_refill = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+            # Bucket empty: sleep until exactly one token will be
+            # available, then consume it. Holding the lock during the
+            # sleep serialises waiters in arrival order, which is the
+            # behaviour we want for fairness.
+            wait = (1.0 - self._tokens) / self._rate
+            await asyncio.sleep(wait)
+            self._tokens = 0.0
+
+
 class MatchStatTennisProvider:
     """Async-context-managed adapter for the MatchStat tennis API.
 
@@ -260,13 +318,17 @@ class MatchStatTennisProvider:
             "atp": asyncio.Lock(),
             "wta": asyncio.Lock(),
         }
-        # Per-provider HTTP concurrency cap. Every `_get` call acquires
-        # this semaphore so bursts from `asyncio.gather` callers
-        # (warm_form_for_selection, _player_stats fan-out, the H2H
-        # parallel block) can't overwhelm the vendor's 100 req/min
-        # rate limit. Created in __init__ so a single shared budget
-        # spans the whole provider lifetime.
-        self._request_sem = asyncio.Semaphore(_REQUEST_CONCURRENCY)
+        # Per-provider HTTP rate limiter. Every `_get` call acquires
+        # one token before issuing the request; the bucket refills at
+        # the vendor's published 5 req/sec limit. Bursts from
+        # `asyncio.gather` callers (warm_form_for_selection,
+        # _player_stats fan-out, H2H parallel block) get serialised
+        # automatically without saturating the limit. Single shared
+        # budget spans the whole provider lifetime.
+        self._rate_limiter = _TokenBucket(
+            rate_per_second=_REQUESTS_PER_SECOND,
+            capacity=_BURST_TOKENS,
+        )
         # Profile cache keyed by (tour, player_id) → the profile tuple.
         # Populated on the first `_player_profile` call for each player and
         # reused for the rest of the provider's lifetime. Two callers hit
@@ -313,57 +375,62 @@ class MatchStatTennisProvider:
         (network, non-2xx, malformed JSON) returns None and lets the caller
         degrade gracefully — never raises through to abort the pipeline.
 
-        Concurrency: every call acquires `self._request_sem` so bursts
-        from `asyncio.gather` callers can't overwhelm the vendor's
-        100 req/min rate limit. Retries on 429 use exponential backoff
-        with jitter so simultaneously-throttled callers desynchronize
-        on the way back up — without jitter, all N concurrent retries
-        wake at the same moment and 429 again immediately.
+        Rate limit: every call acquires one token from
+        `self._rate_limiter` before issuing the request. The bucket
+        refills at the vendor's 5 req/sec ceiling so we never burst
+        past it under normal operation. Retries on 429 use
+        exponential backoff with jitter as a backstop for vendor-side
+        hiccups (transient overload, IP-shared throttling) — without
+        jitter, all N concurrent retries would wake at the same
+        moment and re-429 immediately.
         """
         if self._client is None:
             raise RuntimeError(
                 "MatchStatTennisProvider used outside of `async with` context"
             )
         url = f"{_BASE_URL}{path}"
-        async with self._request_sem:
-            for attempt in range(_RETRY_ATTEMPTS):
-                try:
-                    resp = await self._client.get(url, params=params)
-                    resp.raise_for_status()
-                    return resp.json()
-                except httpx.HTTPStatusError as e:
-                    status = e.response.status_code
-                    if status == 404:
-                        log.debug("matchstat %s: 404", path)
-                        return None
-                    if status == 429 and attempt + 1 < _RETRY_ATTEMPTS:
-                        retry_after = e.response.headers.get("Retry-After")
-                        # Exponential backoff with jitter: ±50% of base.
-                        # Without jitter, gather()'d callers all get
-                        # 429'd at once, all back off `2^n`, all retry
-                        # at the same instant and 429 again. Jitter
-                        # spreads the wakeups across a window so the
-                        # rate-limit window drains.
-                        try:
-                            backoff = (
-                                float(retry_after)
-                                if retry_after
-                                else _RETRY_BASE_S * (2 ** attempt)
-                            )
-                        except ValueError:
-                            backoff = _RETRY_BASE_S * (2 ** attempt)
-                        wait = backoff * random.uniform(0.5, 1.5)
-                        log.debug(
-                            "matchstat %s: 429 sleeping %.1fs (attempt %d/%d)",
-                            path, wait, attempt + 1, _RETRY_ATTEMPTS,
+        for attempt in range(_RETRY_ATTEMPTS):
+            # Acquire one token per attempt — retries pay the rate
+            # limit too, otherwise a 429 burst would re-saturate the
+            # bucket on the way back up.
+            await self._rate_limiter.acquire()
+            try:
+                resp = await self._client.get(url, params=params)
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status == 404:
+                    log.debug("matchstat %s: 404", path)
+                    return None
+                if status == 429 and attempt + 1 < _RETRY_ATTEMPTS:
+                    retry_after = e.response.headers.get("Retry-After")
+                    # Exponential backoff with jitter: ±50% of base.
+                    # Without jitter, gather()'d callers all get
+                    # 429'd at once, all back off `2^n`, all retry
+                    # at the same instant and 429 again. Jitter
+                    # spreads the wakeups across a window so the
+                    # rate-limit window drains.
+                    try:
+                        backoff = (
+                            float(retry_after)
+                            if retry_after
+                            else _RETRY_BASE_S * (2 ** attempt)
                         )
-                        await asyncio.sleep(wait)
-                        continue
-                    log.warning("matchstat %s: HTTP %s", path, status)
-                    return None
-                except Exception as e:  # noqa: BLE001
-                    log.warning("matchstat %s: %s", path, type(e).__name__)
-                    return None
+                    except ValueError:
+                        backoff = _RETRY_BASE_S * (2 ** attempt)
+                    wait = backoff * random.uniform(0.5, 1.5)
+                    log.debug(
+                        "matchstat %s: 429 sleeping %.1fs (attempt %d/%d)",
+                        path, wait, attempt + 1, _RETRY_ATTEMPTS,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                log.warning("matchstat %s: HTTP %s", path, status)
+                return None
+            except Exception as e:  # noqa: BLE001
+                log.warning("matchstat %s: %s", path, type(e).__name__)
+                return None
         return None
 
     # ----- Rankings index (name → id) -----
