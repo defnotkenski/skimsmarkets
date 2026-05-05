@@ -25,15 +25,21 @@ package import. Callers that need them go directly to the submodule:
 """
 
 from skimsmarkets.tennis.models import (
+    TennisH2HMeeting,
     TennisHeadToHead,
+    TennisInMatchupStats,
     TennisPlayerStats,
+    TennisRecentMatch,
     TennisStatsContext,
 )
 from skimsmarkets.tennis.rendering import render_tennis_stats_block
 
 __all__ = [
+    "TennisH2HMeeting",
     "TennisHeadToHead",
+    "TennisInMatchupStats",
     "TennisPlayerStats",
+    "TennisRecentMatch",
     "TennisStatsContext",
     "render_tennis_stats_block",
 ]

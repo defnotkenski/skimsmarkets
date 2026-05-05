@@ -16,10 +16,17 @@ source per event — unlike the polymarket models where `gamma_*` /
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date as _date_t
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator
+
+# Field-name aliasing: several models below have a `date` field. The
+# bare `date` type from `datetime` would shadow the field annotation at
+# class-body eval time and break Pydantic's type-hint resolution. Import
+# the type as `_date_t` and use it everywhere a `datetime.date`
+# annotation is needed.
 
 
 def _coerce_date(v: Any) -> Any:
@@ -31,7 +38,7 @@ def _coerce_date(v: Any) -> Any:
     """
     if v is None or v == "":
         return None
-    if isinstance(v, date) and not isinstance(v, datetime):
+    if isinstance(v, _date_t) and not isinstance(v, datetime):
         return v
     if isinstance(v, datetime):
         return v.date()
@@ -42,10 +49,113 @@ def _coerce_date(v: Any) -> Any:
         # Accept ISO date or ISO datetime; trim time portion for the
         # latter so callers can pass either shape.
         try:
-            return date.fromisoformat(s[:10])
+            return _date_t.fromisoformat(s[:10])
         except ValueError:
             return None
     return None
+
+
+class TennisRecentMatch(BaseModel):
+    """One row in `TennisPlayerStats.recent_matches`.
+
+    The compact `last_10_form` string ("WWLWWLWWWL") tells the reasoner
+    *whether* the player won, but nothing about the quality of those wins.
+    A 3-row digest of recent matches with opponent / score / round /
+    surface / tournament tier closes that gap — straight-sets wins at a
+    Masters event read very differently from grinding three-set wins at
+    a 250-level tournament. Three rows is the budget; older matches stay
+    folded into `last_10_form`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    date: _date_t | None = None
+    # Opponent's name as the vendor ships it. Diacritics preserved — the
+    # reasoner doesn't need normalized forms for display.
+    opponent_name: str
+    won: bool
+    # Score line as the vendor ships it (e.g. "6-4 6-2", "7-6(5) 6-3 4-6 6-2",
+    # "5-0 ret."). Distinguishes a straight-sets win from a five-setter
+    # the same player won.
+    result: str | None = None
+    # Surface key collapsed to "hard" / "clay" / "grass" / "carpet".
+    surface: str | None = None
+    # Round name as the vendor ships it ("Final", "1/2" = SF, "1/4" = QF).
+    round: str | None = None
+    tournament_name: str | None = None
+    # Tier label derived from tournament.rankId — distinguishes "won 6
+    # straight at a Challenger" from "won 6 straight at a Masters."
+    tournament_tier: str | None = None
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def _d(cls, v: Any) -> Any:
+        return _coerce_date(v)
+
+
+class TennisH2HMeeting(BaseModel):
+    """One row in `TennisHeadToHead.recent_meetings`.
+
+    Replaces the previous flat `last_meeting_*` block with a list so the
+    reasoner sees the matchup *trajectory* across the last few meetings,
+    not just the most recent. Three meetings is enough to spot
+    "Sinner-Alcaraz has tilted from 2-3 to 6-3 across the last year"
+    without bloating the prompt.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    date: _date_t | None = None
+    winner_name: str | None = None
+    surface: str | None = None
+    round: str | None = None
+    # Score line, same shape as TennisRecentMatch.result.
+    result: str | None = None
+    tournament_name: str | None = None
+    tournament_tier: str | None = None
+
+    @field_validator("date", mode="before")
+    @classmethod
+    def _d(cls, v: Any) -> Any:
+        return _coerce_date(v)
+
+
+class TennisInMatchupStats(BaseModel):
+    """Per-player stats conditioned on the matchup itself.
+
+    Career averages (on `TennisPlayerStats`) tell the reasoner how a
+    player performs against the field. These tell it how the player
+    performs specifically against THIS opponent — a player who's 47% on
+    BP-conversion overall might be 35% specifically against this opponent.
+    Sourced from a single `/h2h/stats` call that ships both players'
+    matchup-conditioned aggregates side by side.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # `(wins, total)` so the reasoner sees sample size — a 1-1 deciding-set
+    # record carries less weight than 5-2.
+    decider_record: tuple[int, int] | None = None
+    tiebreak_record: tuple[int, int] | None = None
+    # Format-conditioned record. bo3 = standard ATP/WTA tour (250s, 500s,
+    # Masters, regular WTA). bo5 = men's slams. The split matters: a
+    # matchup that's 5-11 in bo3 but 2-6 in bo5 reads as "deeply lopsided
+    # at slams specifically" rather than just "lopsided overall."
+    bo3_record: tuple[int, int] | None = None
+    bo5_record: tuple[int, int] | None = None
+    # Comeback rate when losing the first set (existing field, moved into
+    # this nested block).
+    first_set_lost_match_won_pct: float | None = None
+    # Closeout rate when winning the first set — the natural complement.
+    # Together with `first_set_lost_match_won_pct` they characterise how
+    # this player handles set 1 outcomes against this specific opponent.
+    first_set_won_match_won_pct: float | None = None
+    # Career-aggregate first-serve points won and break-point conversion
+    # pct, computed ONLY across this matchup's prior meetings. Distinct
+    # from the same field on `TennisPlayerStats` (which is across all
+    # career opponents). Stored as ratios in [0, 1] for consistency.
+    first_serve_win_pct: float | None = None
+    break_point_convert_pct: float | None = None
 
 
 class TennisPlayerStats(BaseModel):
@@ -84,6 +194,13 @@ class TennisPlayerStats(BaseModel):
     # journeyman). Free to populate — comes on the same profile call as
     # current rank.
     best_rank_singles: int | None = None
+    # Bio fields lifted from `profile.information`. Free — same call we
+    # already make for `form` and `bestRank`. Age is the load-bearing
+    # one (a 21yo vs a 38yo reads differently from rank delta alone);
+    # `plays` ("Right-Handed, Two-Handed Backhand") matters for stylistic
+    # matchups (LH/RH split, one- vs two-handed BH on clay).
+    age_years: int | None = None
+    plays: str | None = None
     # `(wins, losses)` over a vendor-defined window — typically YTD or
     # trailing 52 weeks. Provider docs the window in its rendering tail.
     ytd_win_loss: tuple[int, int] | None = None
@@ -94,7 +211,12 @@ class TennisPlayerStats(BaseModel):
     # Compact "WWLWWLWWWL" string — last N matches in chronological order
     # (oldest → newest). N is vendor-defined; we don't try to enforce.
     last_10_form: str | None = None
-    last_match_date: date | None = None
+    # Detailed digest of the most recent N matches with opp / score /
+    # round / surface / tier. Complements `last_10_form` (which is just
+    # the W/L pattern) by carrying *quality of opposition* and *match
+    # tightness*. Newest first; capped at 3 rows in the renderer.
+    recent_matches: list[TennisRecentMatch] | None = None
+    last_match_date: _date_t | None = None
     # Career serve metrics. All four percentages live in [0.0, 1.0] —
     # the renderer multiplies by 100 for display. The vendor ships raw
     # counters (numerator + denominator) which the provider divides
@@ -103,6 +225,14 @@ class TennisPlayerStats(BaseModel):
     first_serve_in_pct: float | None = None
     first_serve_win_pct: float | None = None
     second_serve_win_pct: float | None = None
+    # Career return-side percentages. Computed from `match-stats.rtnStats`
+    # via 1 − (opponent's serve-win on this player), so this is "career
+    # first/second-serve return-points-won %" — the canonical complement
+    # to the serve-side trio above. Together with `break_point_convert_pct`
+    # (which is BPs *converted given a chance*), these give the full
+    # career return-game profile.
+    first_serve_return_win_pct: float | None = None
+    second_serve_return_win_pct: float | None = None
     # Break-point save % (when serving) and break-point conversion %
     # (when returning). The two together are the canonical "is this
     # player clutch?" pair the tennis sport hint already flags as
@@ -111,15 +241,25 @@ class TennisPlayerStats(BaseModel):
     break_point_convert_pct: float | None = None
     # Current-year W/L vs elite competition and at the biggest events.
     # Sourced from `/player/perf-breakdown` (the vendor's year × tier
-    # matrix). These three rows are the load-bearing slice of an
-    # otherwise-massive payload — together they answer "does this player
-    # show up against good opponents and at the big stages?". Other
-    # rows (`top1`, `top5`, futures, challengers, mainTour) are
-    # available on the same response but compete for prompt space; we
-    # pick the three with the cleanest signal-per-token.
+    # matrix). These rows answer "does this player show up against good
+    # opponents and at the big stages?". `top5` distinguishes "elite-tier
+    # slayer" from "merely beats top-10s" (a third of Sinner's top-10
+    # wins YTD are vs ranks 6-10 specifically). Other rows (`top1`,
+    # `top20`, `top50`, futures, challengers) are available on the same
+    # response but compete for prompt space; we pick the ones with the
+    # cleanest signal-per-token.
+    record_vs_top_5: tuple[int, int] | None = None
     record_vs_top_10: tuple[int, int] | None = None
     record_at_grand_slam: tuple[int, int] | None = None
     record_at_masters: tuple[int, int] | None = None
+    # Career titles per tier. Sourced from `/player/titles`; one extra
+    # HTTP call per player but distinct signal — career achievement
+    # baseline that rank can't capture (a 28yo with 0 slam titles + 15
+    # mainTour reads differently from a 22yo with 4 slams). Keys:
+    # "grand_slam", "masters", "main_tour", "tour_finals". Lower tiers
+    # (futures, challengers, team_cup) skipped — not load-bearing for
+    # tour-level Polymarket markets.
+    career_titles: dict[str, int] | None = None
 
     @field_validator("last_match_date", mode="before")
     @classmethod
@@ -130,54 +270,35 @@ class TennisPlayerStats(BaseModel):
 class TennisHeadToHead(BaseModel):
     """Head-to-head history between the two players in this match.
 
-    The matchup-specific clutch records (decider, tiebreak, comeback)
-    come from a separate `/h2h/stats` vendor call and are aggregated
-    across ALL prior meetings between these two players. They're
-    materially different from career averages — a player who's 67% in
-    deciders overall might be 33% in deciders specifically against this
-    opponent. The reasoner is told to weight these matchup-conditioned
-    numbers above career averages when both are present.
+    The matchup-specific clutch records (decider, tiebreak, comeback,
+    bo3/bo5, matchup serve/BP) live on the per-player `a_in_matchup` /
+    `b_in_matchup` blocks rather than as flat `_a/_b` fields, because
+    the field count grew enough that flat naming was getting noisy. The
+    reasoner is told to weight these matchup-conditioned numbers above
+    career averages when both are present.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     a_wins: int = 0
     b_wins: int = 0
-    last_meeting: date | None = None
-    last_meeting_winner: str | None = None
-    last_meeting_surface: str | None = None
-    # Round name of the last meeting (e.g. "Final", "1/2", "1/4") — pass-
-    # through from the vendor. Adds context that "they last played in a
-    # Slam final" reads differently from "they last played a R128
-    # qualifier match." Free to populate; comes on the same h2h/matches
-    # call we already make.
-    last_meeting_round: str | None = None
-    # Score of the last meeting (e.g. "6-4 6-2", "7-6(5) 6-3 4-6 6-2").
-    # Tells the reasoner whether the match was tight or dominant — a
-    # straight-sets win means a different "form" signal than a
-    # five-setter the same player won.
-    last_meeting_result: str | None = None
-    # Matchup-conditioned clutch records. Each is `(wins, total)` so the
-    # reasoner sees the sample size (a 1-1 deciding-set record carries
-    # less weight than 5-2). All four can be None when the matchup has
-    # no prior meetings or when /h2h/stats was unavailable. The "a" /
-    # "b" suffix matches the player_a / player_b convention used
-    # everywhere else in the schema.
-    decider_record_a: tuple[int, int] | None = None
-    decider_record_b: tuple[int, int] | None = None
-    tiebreak_record_a: tuple[int, int] | None = None
-    tiebreak_record_b: tuple[int, int] | None = None
-    # "Comeback rate when losing the first set" specifically against this
-    # opponent. Captured for both players so the reasoner can see e.g.
-    # "Alcaraz comes back from set 1 down 50% of the time vs Djokovic"
-    # alongside the symmetric figure. Useful in best-of-5 contexts.
-    first_set_lost_match_won_pct_a: float | None = None
-    first_set_lost_match_won_pct_b: float | None = None
-
-    @field_validator("last_meeting", mode="before")
-    @classmethod
-    def _d(cls, v: Any) -> Any:
-        return _coerce_date(v)
+    # Per-surface H2H counts: surface key → `(a_wins, b_wins)`. The vendor
+    # ships h2h/info as a per-court list anyway — we used to sum across
+    # surfaces, but for surface-conditioned matchups (e.g. clay slate
+    # match between players whose H2H is wildly different on clay vs hard)
+    # the per-surface breakdown is the load-bearing read. Surface keys
+    # match `TennisPlayerStats.surface_win_loss` ("hard" / "clay" /
+    # "grass" / "carpet").
+    surface_h2h: dict[str, tuple[int, int]] | None = None
+    # Most recent meetings, newest first. Capped at 3 in the fetcher
+    # (pageSize=3 on /h2h/matches). Replaces the previous flat
+    # `last_meeting_*` fields with a list so the matchup arc — has it
+    # tilted recently? — is visible without flattening to "last winner."
+    recent_meetings: list[TennisH2HMeeting] | None = None
+    # Per-player matchup-conditioned aggregates. None when the matchup
+    # has no prior meetings or /h2h/stats was unavailable.
+    a_in_matchup: TennisInMatchupStats | None = None
+    b_in_matchup: TennisInMatchupStats | None = None
 
 
 class TennisStatsContext(BaseModel):
@@ -213,9 +334,9 @@ class TennisStatsContext(BaseModel):
         would cost prompt tokens for no information.
 
         Threshold: at least one of (a) any ranking populated on either
-        player, (b) any surface or YTD split, (c) any non-zero H2H. UW's
-        `has_actionable_signal` filter applies the same posture for flow
-        signals.
+        player, (b) any surface or YTD split, (c) recent matches detail,
+        (d) any non-zero H2H. UW's `has_actionable_signal` filter applies
+        the same posture for flow signals.
         """
         for player in (self.player_a, self.player_b):
             if player.rank_singles is not None:
@@ -225,6 +346,8 @@ class TennisStatsContext(BaseModel):
             if player.surface_win_loss:
                 return True
             if player.last_10_form:
+                return True
+            if player.recent_matches:
                 return True
         h2h = self.head_to_head
         if h2h is not None and (h2h.a_wins > 0 or h2h.b_wins > 0):

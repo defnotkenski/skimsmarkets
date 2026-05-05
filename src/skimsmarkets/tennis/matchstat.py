@@ -3,7 +3,7 @@
 Vendor: <https://tennisapidoc.matchstat.com>. Hosted on RapidAPI under
 `tennis-api-atp-wta-itf.p.rapidapi.com`. Auth via two static headers
 (`X-RapidAPI-Key`, `X-RapidAPI-Host`) on every request. Rate limit is
-100 req/min/IP — generous for our usage (≤ 1 rankings call + 6 per-match
+100 req/min/IP — generous for our usage (≤ 1 rankings call + ~7 per-player
 calls × a handful of tennis matches per slate).
 
 Why each endpoint:
@@ -12,7 +12,9 @@ Why each endpoint:
                                        so rankings is the only path. Top
                                        500 covers virtually all
                                        Polymarket-traded tour singles.
-  - `/{tour}/player/profile/{id}`    — `form` array (recent W/L), bio.
+  - `/{tour}/player/profile/{id}`    — `form` array (recent W/L), bio
+                                       (`information.birthdate`, `plays`),
+                                       and career-high rank (`bestRank`).
                                        Profile does NOT carry points; we
                                        read those from the rankings index
                                        hit instead.
@@ -20,11 +22,37 @@ Why each endpoint:
                                        Most recent year's row gives YTD
                                        totals + per-surface splits in one
                                        payload.
-  - `/{tour}/h2h/info/{a}/{b}`       — per-surface H2H counts. We sum
-                                       across surfaces for total H2H.
+  - `/{tour}/player/past-matches/{id}` — last-N matches with opp / score /
+                                       round / surface / tier. Used both
+                                       for `last_match_date` and the
+                                       3-row recent-match digest.
+  - `/{tour}/player/perf-breakdown/{id}` — current-year W/L matrix.
+                                       We pull top-5, top-10, slam,
+                                       masters cells.
+  - `/{tour}/player/match-stats/{id}` — career serve + return + BP stats.
+                                       The `rtnStats` block is opponent's
+                                       serve performance against this
+                                       player, so we invert it for
+                                       return-points-won %.
+  - `/{tour}/player/titles/{id}`     — career titles per tier. Career
+                                       achievement baseline distinct from
+                                       YTD records (a 28yo with 0 slam
+                                       titles + 15 mainTour is a
+                                       different player from a 22yo with
+                                       4 slams, regardless of rank).
+  - `/{tour}/h2h/info/{a}/{b}`       — per-surface H2H counts. Preserved
+                                       per-surface (used to be summed)
+                                       so surface-conditioned matchups
+                                       read correctly.
   - `/{tour}/h2h/matches/{a}/{b}`    — reverse-chronological meeting list.
-                                       First entry is the most recent
-                                       meeting — feeds `last_meeting_*`.
+                                       PageSize=3 surfaces matchup
+                                       trajectory across recent meetings,
+                                       not just the latest one.
+  - `/{tour}/h2h/stats/{a}/{b}`      — matchup-conditioned aggregates.
+                                       We pull decider/tiebreak,
+                                       bo3/bo5 split, set-1 win/lose →
+                                       match conversion, and matchup
+                                       1st-serve-won + BP-convert.
 
 Naming normalization: vendor names sometimes carry diacritics
 (e.g. "Cóbolli") that Polymarket strips. We index on a lowercase +
@@ -37,7 +65,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import TracebackType
 from typing import Any, Self
 
@@ -45,8 +73,11 @@ import httpx
 
 from skimsmarkets.tennis.identity import TennisMatchIdentity
 from skimsmarkets.tennis.models import (
+    TennisH2HMeeting,
     TennisHeadToHead,
+    TennisInMatchupStats,
     TennisPlayerStats,
+    TennisRecentMatch,
     TennisStatsContext,
 )
 
@@ -76,12 +107,44 @@ _COURT_ID_TO_SURFACE: dict[int, str] = {
     5: "grass",
 }
 
-# `round` and `tournament` get added to `include=` on h2h/matches calls
-# so the vendor ships the joined `round.name` (e.g. "Final", "1/2",
-# "1/4") and `tournament.courtId` inline rather than forcing a separate
-# round-id lookup. Centralised so the include string and the parser
-# stay in sync.
-_H2H_MATCHES_INCLUDE = "tournament,round"
+# Vendor tournament rankId → tier label. Sourced from the /player/titles
+# tourRankId enumeration (probed): 0 futures, 1 challenger, 2 main_tour,
+# 3 masters, 4 grand_slam, 5 team_cup, 7 tour_finals. Only the upper
+# tiers reach the prompt — Polymarket trades tour-level events almost
+# exclusively, so a Challenger label on a recent match is a meaningful
+# downgrade signal but Futures/team-cup labels are noise.
+_RANK_ID_TO_TIER: dict[int, str] = {
+    0: "futures",
+    1: "challenger",
+    2: "main_tour",
+    3: "masters",
+    4: "grand_slam",
+    5: "team_cup",
+    7: "tour_finals",
+}
+
+# Tier keys we actually surface in `career_titles`. The lower tiers
+# (futures, challenger, team_cup) and Davis/Fed Cup are dropped — they
+# are not load-bearing for tour-level Polymarket markets.
+_TITLE_TIERS_KEEP: dict[int, str] = {
+    2: "main_tour",
+    3: "masters",
+    4: "grand_slam",
+    7: "tour_finals",
+}
+
+# `round` and `tournament` get added to `include=` on h2h/matches and
+# past-matches calls so the vendor ships the joined `round.name`
+# (e.g. "Final", "1/2", "1/4") and `tournament.courtId` /
+# `tournament.rankId` inline. Centralised so the include string and the
+# parser stay in sync.
+_MATCH_INCLUDE = "tournament,round"
+
+# Recent-match / recent-meeting page sizes. Kept conservative — the
+# renderer caps at 3 rows for prompt-token reasons, but we pull a couple
+# extra in case the vendor omits a row.
+_RECENT_MATCH_PAGE_SIZE = 5
+_RECENT_MEETING_PAGE_SIZE = 3
 
 _RETRY_ATTEMPTS = 3
 _RETRY_BASE_S = 1.0
@@ -117,12 +180,41 @@ def _coerce_int(v: Any) -> int | None:
     return None
 
 
-def _parse_date(v: Any) -> Any:
-    """Vendor ships dates as `2026-04-20T00:00:00.000Z`. The model's
-    `_coerce_date` validator accepts the ISO datetime string already; we
-    pass the raw value through unchanged.
+def _parse_iso_date(v: Any) -> date | None:
+    """Vendor ships dates as `2026-04-20T00:00:00.000Z`. Trim to the
+    date portion and parse — used for computing age from birthdate
+    where the validator on the model isn't available.
     """
-    return v
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        return date.fromisoformat(v[:10])
+    except ValueError:
+        return None
+
+
+def _years_between(birth: date, today: date) -> int:
+    """Whole-year age. Subtracts a year if the birthday hasn't landed
+    yet this calendar year.
+    """
+    years = today.year - birth.year
+    if (today.month, today.day) < (birth.month, birth.day):
+        years -= 1
+    return max(years, 0)
+
+
+def _surface_from_court_id(cid: Any) -> str | None:
+    n = _coerce_int(cid)
+    if n is None:
+        return None
+    return _COURT_ID_TO_SURFACE.get(n)
+
+
+def _tier_from_rank_id(rid: Any) -> str | None:
+    n = _coerce_int(rid)
+    if n is None:
+        return None
+    return _RANK_ID_TO_TIER.get(n)
 
 
 class MatchStatTennisProvider:
@@ -286,26 +378,24 @@ class MatchStatTennisProvider:
 
     async def _player_profile(
         self, tour: str, pid: int
-    ) -> tuple[list[str], int | None]:
-        """Returns (form_array_or_empty, best_rank_or_None).
+    ) -> tuple[list[str], int | None, int | None, str | None]:
+        """Returns (form_array, best_rank, age_years, plays).
 
-        Single profile call with `include=form` covers two needs: the
-        recent W/L array AND career-high ranking — the latter sits at
-        `data.bestRank.position`. Free to extract on the same response;
-        no extra HTTP. The vendor ships `form` oldest → newest; we
-        pass it through unchanged and let the renderer upper-case +
-        slice to the most recent N.
+        Single profile call with `include=form,ranking,information` covers
+        four needs: the recent W/L array, career-high ranking
+        (`bestRank.position`), birthdate (under `information.birthdate`,
+        used to compute current age), and `information.plays`
+        (handedness + backhand style). All free on the same response;
+        no extra HTTP. The vendor ships `form` oldest → newest; we pass
+        it through unchanged.
         """
-        # `include=form,ranking` ships both the recent W/L array and
-        # the `bestRank` block on the same response. Without `ranking`
-        # the vendor omits `bestRank` even though `curRank` always lands.
         body = await self._get(
             f"/tennis/v2/{tour}/player/profile/{pid}",
-            params={"include": "form,ranking"},
+            params={"include": "form,ranking,information"},
         )
         data = body.get("data") if isinstance(body, dict) else None
         if not isinstance(data, dict):
-            return [], None
+            return [], None, None, None
         form = data.get("form") or []
         if not isinstance(form, list):
             form = []
@@ -313,46 +403,116 @@ class MatchStatTennisProvider:
         best_block = data.get("bestRank")
         if isinstance(best_block, dict):
             best_rank = _coerce_int(best_block.get("position"))
-        return [str(x) for x in form if isinstance(x, str)], best_rank
+        age_years: int | None = None
+        plays: str | None = None
+        info = data.get("information")
+        if isinstance(info, dict):
+            birth = _parse_iso_date(info.get("birthdate"))
+            if birth is not None:
+                age_years = _years_between(birth, datetime.now(UTC).date())
+            raw_plays = info.get("plays")
+            if isinstance(raw_plays, str) and raw_plays.strip():
+                plays = raw_plays.strip()
+        return (
+            [str(x) for x in form if isinstance(x, str)],
+            best_rank,
+            age_years,
+            plays,
+        )
 
-    async def _player_last_match_date(self, tour: str, pid: int) -> Any:
-        """Return the date string of the player's most recent match, or None.
+    async def _player_recent_matches(
+        self, tour: str, pid: int, name: str
+    ) -> tuple[date | None, list[TennisRecentMatch]]:
+        """Pull the last N matches; return `(last_match_date, recent_matches)`.
 
-        Vendor ships past-matches reverse-chronological; pageSize=1 means
-        we pay for one row regardless of the player's match count. The
-        date is left as the vendor's ISO string and the model's
-        `_coerce_date` validator parses it later.
+        Single call replaces what used to be a pageSize=1 "just the date"
+        lookup. The first row's date doubles as `last_match_date`; the
+        rest of the rows feed `TennisPlayerStats.recent_matches` with
+        opp / score / round / surface / tier so the prompt can show
+        recent quality instead of just a W/L pattern.
+
+        `pid` and `name` are the subject player; we pick opponent vs
+        subject by comparing `player1Id`/`player2Id` against `pid`,
+        which is robust to whichever side the vendor lists the subject
+        on.
         """
         body = await self._get(
             f"/tennis/v2/{tour}/player/past-matches/{pid}",
-            params={"pageSize": 1},
+            params={"pageSize": _RECENT_MATCH_PAGE_SIZE, "include": _MATCH_INCLUDE},
         )
         rows = body.get("data") if isinstance(body, dict) else None
         if not isinstance(rows, list) or not rows:
-            return None
-        first = rows[0]
-        if not isinstance(first, dict):
-            return None
-        return first.get("date")
+            return None, []
+        last_date: date | None = None
+        out: list[TennisRecentMatch] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_date = _parse_iso_date(row.get("date"))
+            if last_date is None and row_date is not None:
+                last_date = row_date
+            p1 = row.get("player1") if isinstance(row.get("player1"), dict) else {}
+            p2 = row.get("player2") if isinstance(row.get("player2"), dict) else {}
+            p1_id = _coerce_int(row.get("player1Id"))
+            is_subject_p1 = p1_id == pid
+            opp_block = p2 if is_subject_p1 else p1
+            opp_name = opp_block.get("name") if isinstance(opp_block, dict) else None
+            if not isinstance(opp_name, str) or not opp_name:
+                # Skip rows we can't attribute — pretty much never
+                # happens on the live vendor but guard anyway.
+                continue
+            winner_id = _coerce_int(row.get("match_winner"))
+            won = winner_id == pid
+            tourn = row.get("tournament") if isinstance(row.get("tournament"), dict) else {}
+            surface = _surface_from_court_id(tourn.get("courtId"))
+            tier = _tier_from_rank_id(tourn.get("rankId"))
+            tname = tourn.get("name")
+            tournament_name = tname.strip() if isinstance(tname, str) and tname.strip() else None
+            rnd = row.get("round") if isinstance(row.get("round"), dict) else {}
+            rname = rnd.get("name")
+            round_name = rname.strip() if isinstance(rname, str) and rname.strip() else None
+            result = row.get("result")
+            score = result.strip() if isinstance(result, str) and result.strip() else None
+            out.append(
+                TennisRecentMatch(
+                    date=row_date,
+                    opponent_name=opp_name.strip(),
+                    won=won,
+                    result=score,
+                    surface=surface,
+                    round=round_name,
+                    tournament_name=tournament_name,
+                    tournament_tier=tier,
+                )
+            )
+        # `name` is unused at parse time but kept in the signature so the
+        # caller can pass it explicitly — it makes the call site read as
+        # "fetch recent matches for this player by name" and avoids a
+        # silent reordering bug if the IDs ever flip.
+        del name
+        return last_date, out
 
     async def _player_tier_records(
         self, tour: str, pid: int
     ) -> dict[str, tuple[int, int] | None]:
-        """Pull current-year W/L vs top-10 + at Slams + at Masters.
+        """Pull current-year W/L vs top-5/top-10 + at Slams + at Masters.
 
         Perf-breakdown ships a year-keyed dict whose value is a 4-axis
         matrix (`court`, `round`, `rank`, `level`). We deliberately
-        consume only three cells of one year's slice — the full payload
+        consume only four cells of one year's slice — the full payload
         is enormous and most cells overlap signal we already have via
         surface-summary or h2h. Year selection: the largest numeric key
         present (vendor sorts unspecified, max() makes us robust to
         order changes). Cells use `aw`/`al` (all wins / all losses) per
         the vendor's convention; the bare `w`/`l` columns track only
-        finals.
+        finals. `top5` is added alongside `top10` because the gap
+        between "elite-tier slayer" and "merely beats top-10s" is
+        material and the cell is on the same response.
         """
         body = await self._get(f"/tennis/v2/{tour}/player/perf-breakdown/{pid}")
         data = body.get("data") if isinstance(body, dict) else None
         out: dict[str, tuple[int, int] | None] = {
+            "record_vs_top_5": None,
             "record_vs_top_10": None,
             "record_at_grand_slam": None,
             "record_at_masters": None,
@@ -390,6 +550,7 @@ class MatchStatTennisProvider:
                 return None
             return (wins or 0, losses or 0)
 
+        out["record_vs_top_5"] = _cell("rank", "top5")
         out["record_vs_top_10"] = _cell("rank", "top10")
         out["record_at_grand_slam"] = _cell("level", "grandSlam")
         out["record_at_masters"] = _cell("level", "masters")
@@ -401,14 +562,20 @@ class MatchStatTennisProvider:
         """Career serve / return / break-point percentages.
 
         The vendor ships raw counters (numerator + denominator) under
-        `serviceStats` and `breakPointsServeStats` / `breakPointsRtnStats`.
-        We compute the ratios here so the prompt block carries
-        percentages directly — the reasoner shouldn't have to do
-        arithmetic on raw counts in-context. Field naming convention:
+        `serviceStats`, `rtnStats`, `breakPointsServeStats`, and
+        `breakPointsRtnStats`. We compute the ratios here so the prompt
+        block carries percentages directly — the reasoner shouldn't have
+        to do arithmetic on raw counts in-context. Field naming:
         `<x>Gm` is the numerator (count of events meeting condition),
-        `<x>OfGm` is the denominator (eligible events). Ratios that
-        can't be computed (zero denominator, missing fields) come back
-        as None and the renderer suppresses those lines.
+        `<x>OfGm` is the denominator (eligible events).
+
+        `rtnStats` is the awkward one: the vendor stores it as opponent's
+        serve performance against this player (same field shape as
+        `serviceStats`, just from the other side of the net). So
+        return-points-won % is `1 − (rtnStats.winningOnFirstServe /
+        rtnStats.winningOnFirstServeOf)`. Doing the inversion here means
+        the model field is the canonical "return-points-won" reading
+        without further math by the renderer or reasoner.
 
         Returns a dict so the caller can spread the values directly into
         `TennisPlayerStats(...)` without N positional args. Keys mirror
@@ -420,6 +587,8 @@ class MatchStatTennisProvider:
             "first_serve_in_pct": None,
             "first_serve_win_pct": None,
             "second_serve_win_pct": None,
+            "first_serve_return_win_pct": None,
+            "second_serve_return_win_pct": None,
             "break_point_save_pct": None,
             "break_point_convert_pct": None,
         }
@@ -444,6 +613,20 @@ class MatchStatTennisProvider:
             srv.get("winningOnSecondServeGm"), srv.get("winningOnSecondServeOfGm")
         )
 
+        # Return side: `rtnStats` is "opponent's serve performance against
+        # this player." Invert to get this player's return-points-won %.
+        rtn = data.get("rtnStats") if isinstance(data.get("rtnStats"), dict) else {}
+        opp_first_held = _ratio(
+            rtn.get("winningOnFirstServeGm"), rtn.get("winningOnFirstServeOfGm")
+        )
+        if opp_first_held is not None:
+            out["first_serve_return_win_pct"] = 1.0 - opp_first_held
+        opp_second_held = _ratio(
+            rtn.get("winningOnSecondServeGm"), rtn.get("winningOnSecondServeOfGm")
+        )
+        if opp_second_held is not None:
+            out["second_serve_return_win_pct"] = 1.0 - opp_second_held
+
         bp_srv = data.get("breakPointsServeStats") if isinstance(data.get("breakPointsServeStats"), dict) else {}
         out["break_point_save_pct"] = _ratio(
             bp_srv.get("breakPointSavedGm"), bp_srv.get("breakPointFacedGm")
@@ -454,6 +637,40 @@ class MatchStatTennisProvider:
             bp_rtn.get("breakPointWonGm"), bp_rtn.get("breakPointChanceGm")
         )
         return out
+
+    async def _player_career_titles(
+        self, tour: str, pid: int
+    ) -> dict[str, int] | None:
+        """Career titles per tier from `/player/titles`.
+
+        Distinct signal from YTD `record_at_grand_slam` etc.: those are
+        current-year W/L; this is "career titles ever won." A 28yo with
+        0 slam titles + 15 main-tour titles reads very differently from
+        a 22yo with 4 slam titles. One extra HTTP call per player.
+
+        Lower tiers (futures, challenger, team_cup) are dropped at parse
+        time — Polymarket markets are tour-level and lower-tier title
+        counts are noise that competes with prompt budget.
+        """
+        body = await self._get(f"/tennis/v2/{tour}/player/titles/{pid}")
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            return None
+        out: dict[str, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            tier_id = _coerce_int(row.get("tourRankId"))
+            if tier_id is None:
+                continue
+            tier_key = _TITLE_TIERS_KEEP.get(tier_id)
+            if tier_key is None:
+                continue
+            won = _coerce_int(row.get("titlesWon"))
+            if won is None or won <= 0:
+                continue
+            out[tier_key] = won
+        return out or None
 
     async def _player_surface_year_record(
         self, tour: str, pid: int
@@ -520,27 +737,28 @@ class MatchStatTennisProvider:
             return TennisPlayerStats(name=name)
         pid, position, points = ranking_hit
 
-        # All five per-player endpoints are independent — fan them out
-        # so each player's full block lands in one round-trip's worth
-        # of wall time rather than five sequential ones. The outer
-        # `fetch` ALSO gathers across players, so two-player wall time
-        # is bounded by the slowest single call. Total cost per match:
-        # 5 (this player) + 5 (other player) + 2 (h2h info+matches) +
-        # 1 (h2h stats) = 13 + 5 = 18 calls. With the upgraded 5/sec
-        # ceiling that's ~3.6s of vendor budget per match, fully
-        # parallel → ~1s wall clock.
+        # All six per-player endpoints are independent — fan them out so
+        # each player's full block lands in one round-trip's worth of
+        # wall time rather than six sequential ones. The outer `fetch`
+        # ALSO gathers across players, so two-player wall time is bounded
+        # by the slowest single call. Total cost per match: 6 (this
+        # player) + 6 (other player) + 3 (h2h info+matches+stats) = 15
+        # calls. With the 100 req/min ceiling that's ~9s of vendor budget
+        # per match, fully parallel → ~1s wall clock.
         (
-            (form_arr, best_rank),
+            (form_arr, best_rank, age_years, plays),
             (ytd_pair, surfaces),
             match_stats,
             tier_records,
-            last_match_raw,
+            (last_match_date_, recent_matches),
+            career_titles,
         ) = await asyncio.gather(
             self._player_profile(tour, pid),
             self._player_surface_year_record(tour, pid),
             self._player_match_stats(tour, pid),
             self._player_tier_records(tour, pid),
-            self._player_last_match_date(tour, pid),
+            self._player_recent_matches(tour, pid, name),
+            self._player_career_titles(tour, pid),
         )
 
         last_10_form: str | None = None
@@ -557,10 +775,14 @@ class MatchStatTennisProvider:
             rank_singles=position,
             rank_points=points,
             best_rank_singles=best_rank,
+            age_years=age_years,
+            plays=plays,
             ytd_win_loss=ytd_pair,
             surface_win_loss=surfaces,
             last_10_form=last_10_form or None,
-            last_match_date=last_match_raw,
+            recent_matches=recent_matches or None,
+            last_match_date=last_match_date_,
+            career_titles=career_titles,
             **match_stats,
             **tier_records,
         )
@@ -575,149 +797,192 @@ class MatchStatTennisProvider:
         name_a: str,
         name_b: str,
     ) -> TennisHeadToHead | None:
-        """Fetch overall H2H counts + the most recent meeting.
+        """Fetch overall H2H counts + recent meetings + matchup-conditioned stats.
 
-        h2h/info returns per-surface rows; we sum across surfaces for
-        totals. h2h/matches is reverse-chronological — the first entry
-        is the latest meeting, fed into `last_meeting_*` for the prompt.
-        Empty H2H (no prior meetings) returns `(0, 0)` rather than None,
-        and the renderer suppresses the section when both counts are
-        zero (via `has_actionable_signal`).
+        Three concurrent calls:
+          /h2h/info — per-surface counts. Preserved per-surface (used to
+            be summed) so surface-conditioned matchups read correctly.
+          /h2h/matches — pageSize=3 reverse-chronological. Replaces the
+            previous "last meeting only" with the matchup arc.
+          /h2h/stats — matchup-conditioned aggregates (decider, tiebreak,
+            bo3/bo5, set-1 win/lose conversions, in-matchup serve + BP).
+
+        Empty H2H (no prior meetings) returns None and the renderer
+        suppresses the section.
         """
-        # /h2h/stats is the matchup-conditioned-stats endpoint —
-        # firstSetWin/Lose-MatchWin %, decidingSet record, tiebreak
-        # record across all prior meetings between this exact pair.
-        # Fanned out alongside info+matches; one extra call total.
         info_body, matches_body, stats_body = await asyncio.gather(
             self._get(f"/tennis/v2/{tour}/h2h/info/{a_id}/{b_id}"),
             self._get(
                 f"/tennis/v2/{tour}/h2h/matches/{a_id}/{b_id}",
-                params={"pageSize": 1, "include": _H2H_MATCHES_INCLUDE},
+                params={
+                    "pageSize": _RECENT_MEETING_PAGE_SIZE,
+                    "include": _MATCH_INCLUDE,
+                },
             ),
             self._get(f"/tennis/v2/{tour}/h2h/stats/{a_id}/{b_id}"),
         )
 
-        a_wins = 0
-        b_wins = 0
+        # ----- /h2h/info: per-surface AND total counts -----
+        a_wins_total = 0
+        b_wins_total = 0
+        surface_h2h: dict[str, tuple[int, int]] = {}
         info_rows = info_body.get("data") if isinstance(info_body, dict) else None
         if isinstance(info_rows, list):
             for row in info_rows:
                 if not isinstance(row, dict):
                     continue
-                a_wins += _coerce_int(row.get("player1wins")) or 0
-                b_wins += _coerce_int(row.get("player2wins")) or 0
+                a_w = _coerce_int(row.get("player1wins")) or 0
+                b_w = _coerce_int(row.get("player2wins")) or 0
+                a_wins_total += a_w
+                b_wins_total += b_w
+                surface = _surface_from_court_id(row.get("courtId"))
+                if surface is None:
+                    continue
+                if a_w == 0 and b_w == 0:
+                    # Suppress empty surface rows so the prompt doesn't
+                    # render "grass=0-0" alongside meaningful entries.
+                    continue
+                prev_a, prev_b = surface_h2h.get(surface, (0, 0))
+                surface_h2h[surface] = (prev_a + a_w, prev_b + b_w)
 
-        last_meeting = None
-        last_winner = None
-        last_surface = None
-        last_round = None
-        last_result = None
+        # ----- /h2h/matches: list of recent meetings (newest first) -----
+        recent_meetings: list[TennisH2HMeeting] = []
         match_rows = matches_body.get("data") if isinstance(matches_body, dict) else None
-        if isinstance(match_rows, list) and match_rows:
-            first = match_rows[0]
-            if isinstance(first, dict):
-                last_meeting = _parse_date(first.get("date"))
-                # `match_winner` is the winner's player id. h2h/matches
-                # always comes back keyed (player1, player2) = (a, b),
-                # but we still compare on id rather than position to
-                # stay defensive.
-                winner_id = _coerce_int(first.get("match_winner"))
+        if isinstance(match_rows, list):
+            for row in match_rows[:_RECENT_MEETING_PAGE_SIZE]:
+                if not isinstance(row, dict):
+                    continue
+                row_date = _parse_iso_date(row.get("date"))
+                winner_id = _coerce_int(row.get("match_winner"))
                 if winner_id == a_id:
-                    last_winner = name_a
+                    winner_name = name_a
                 elif winner_id == b_id:
-                    last_winner = name_b
-                tourn = first.get("tournament")
-                if isinstance(tourn, dict):
-                    cid = _coerce_int(tourn.get("courtId"))
-                    if cid is not None:
-                        last_surface = _COURT_ID_TO_SURFACE.get(cid)
-                # `round.name` ships joined when `include=round`. Vendor
-                # uses fraction shorthand for late rounds ("1/2" = SF,
-                # "1/4" = QF) — pass through unchanged so anyone
-                # familiar with tour notation reads it natively.
-                rnd = first.get("round")
-                if isinstance(rnd, dict):
-                    rname = rnd.get("name")
-                    if isinstance(rname, str) and rname.strip():
-                        last_round = rname.strip()
-                # Score line as the vendor ships it (e.g. "6-4 6-2",
-                # "7-6(5) 6-3 4-6 6-2"). Distinguishing a straight-sets
-                # win from a five-setter the same player won is itself
-                # a form signal.
-                result = first.get("result")
-                if isinstance(result, str) and result.strip():
-                    last_result = result.strip()
+                    winner_name = name_b
+                else:
+                    winner_name = None
+                tourn = row.get("tournament") if isinstance(row.get("tournament"), dict) else {}
+                surface = _surface_from_court_id(tourn.get("courtId"))
+                tier = _tier_from_rank_id(tourn.get("rankId"))
+                tname = tourn.get("name")
+                tournament_name = tname.strip() if isinstance(tname, str) and tname.strip() else None
+                rnd = row.get("round") if isinstance(row.get("round"), dict) else {}
+                rname = rnd.get("name")
+                round_name = rname.strip() if isinstance(rname, str) and rname.strip() else None
+                result = row.get("result")
+                score = result.strip() if isinstance(result, str) and result.strip() else None
+                recent_meetings.append(
+                    TennisH2HMeeting(
+                        date=row_date,
+                        winner_name=winner_name,
+                        surface=surface,
+                        round=round_name,
+                        result=score,
+                        tournament_name=tournament_name,
+                        tournament_tier=tier,
+                    )
+                )
 
-        # Matchup-specific clutch records from /h2h/stats. Vendor's
-        # `data.player1Stats` corresponds to player_a (the IDs in the
-        # URL path are positional). Fields live on the nested per-player
-        # blocks. We pull (wins, total) pairs rather than the
-        # vendor-supplied percentage so the prompt shows sample size,
-        # which the reasoner needs to weight 1-of-1 vs 5-of-7
-        # appropriately.
-        decider_a = decider_b = None
-        tiebreak_a = tiebreak_b = None
-        comeback_a = comeback_b = None
-        stats_data = stats_body.get("data") if isinstance(stats_body, dict) else None
-        if isinstance(stats_data, dict):
-            p1 = stats_data.get("player1Stats")
-            p2 = stats_data.get("player2Stats")
-
-            def _wins_total(
-                block: Any, win_key: str, total_key: str
-            ) -> tuple[int, int] | None:
-                if not isinstance(block, dict):
-                    return None
-                wins = _coerce_int(block.get(win_key))
-                total = _coerce_int(block.get(total_key))
-                if wins is None or total is None or total <= 0:
-                    return None
-                return (wins, total)
-
-            def _pct(block: Any, key: str) -> float | None:
-                if not isinstance(block, dict):
-                    return None
-                v = block.get(key)
-                if v is None:
-                    return None
-                # Vendor ships percentages as integers 0–100; we store
-                # them as ratios in [0, 1] for consistency with the
-                # career serve/return percentages elsewhere.
-                f = _coerce_int(v)
-                if f is None:
-                    return None
-                return f / 100.0
-
-            decider_a = _wins_total(p1, "decidingSetWin", "decidingSetCount")
-            decider_b = _wins_total(p2, "decidingSetWin", "decidingSetCount")
-            tiebreak_a = _wins_total(p1, "tiebreakWon", "tiebreakCount")
-            tiebreak_b = _wins_total(p2, "tiebreakWon", "tiebreakCount")
-            comeback_a = _pct(p1, "firstSetLoseMatchWinPercentage")
-            comeback_b = _pct(p2, "firstSetLoseMatchWinPercentage")
+        # ----- /h2h/stats: matchup-conditioned per-player aggregates -----
+        a_in_matchup = self._build_matchup_stats(stats_body, "player1Stats")
+        b_in_matchup = self._build_matchup_stats(stats_body, "player2Stats")
 
         # Suppress only when literally nothing was found — a populated
         # stats block alone is enough signal even without h2h/info.
         if (
-            a_wins == 0 and b_wins == 0
-            and last_meeting is None
-            and decider_a is None and decider_b is None
+            a_wins_total == 0 and b_wins_total == 0
+            and not recent_meetings
+            and a_in_matchup is None and b_in_matchup is None
         ):
             return None
 
         return TennisHeadToHead(
-            a_wins=a_wins,
-            b_wins=b_wins,
-            last_meeting=last_meeting,
-            last_meeting_winner=last_winner,
-            last_meeting_surface=last_surface,
-            last_meeting_round=last_round,
-            last_meeting_result=last_result,
-            decider_record_a=decider_a,
-            decider_record_b=decider_b,
-            tiebreak_record_a=tiebreak_a,
-            tiebreak_record_b=tiebreak_b,
-            first_set_lost_match_won_pct_a=comeback_a,
-            first_set_lost_match_won_pct_b=comeback_b,
+            a_wins=a_wins_total,
+            b_wins=b_wins_total,
+            surface_h2h=surface_h2h or None,
+            recent_meetings=recent_meetings or None,
+            a_in_matchup=a_in_matchup,
+            b_in_matchup=b_in_matchup,
+        )
+
+    @staticmethod
+    def _build_matchup_stats(
+        stats_body: Any, player_block_key: str
+    ) -> TennisInMatchupStats | None:
+        """Pull one player's matchup-conditioned aggregates from /h2h/stats.
+
+        The vendor's `data.player1Stats` corresponds to player_a (the IDs
+        in the URL path are positional). We extract:
+          - decider/tiebreak (wins, total) — sample-size visible for the
+            reasoner.
+          - bo3/bo5 (wins, total) — format-conditioned record. Slams =
+            bo5; everything else = bo3. The split tells the reasoner
+            "this matchup is lopsided AT slams specifically" vs lopsided
+            overall.
+          - first-set-won → match-win pct AND first-set-lost → match-win
+            pct. Together they characterise how this player handles set
+            1 outcomes against this specific opponent.
+          - first-serve-won pct + BP-convert pct, IN matchup. Distinct
+            from the same fields on `TennisPlayerStats` (career across
+            all opponents).
+
+        Returns None when the response is missing or has no usable cells.
+        """
+        if not isinstance(stats_body, dict):
+            return None
+        data = stats_body.get("data")
+        if not isinstance(data, dict):
+            return None
+        block = data.get(player_block_key)
+        if not isinstance(block, dict):
+            return None
+
+        def _wins_total(win_key: str, total_key: str) -> tuple[int, int] | None:
+            wins = _coerce_int(block.get(win_key))
+            total = _coerce_int(block.get(total_key))
+            if wins is None or total is None or total <= 0:
+                return None
+            return (wins, total)
+
+        def _pct(key: str) -> float | None:
+            # Vendor ships percentages as integers 0–100; we store them
+            # as ratios in [0, 1] for consistency with career
+            # serve/return percentages elsewhere.
+            v = _coerce_int(block.get(key))
+            if v is None:
+                return None
+            return v / 100.0
+
+        decider = _wins_total("decidingSetWin", "decidingSetCount")
+        tiebreak = _wins_total("tiebreakWon", "tiebreakCount")
+        bo3 = _wins_total("bestOfThreeWon", "bestOfThreeCount")
+        bo5 = _wins_total("bestOfFiveWon", "bestOfFiveCount")
+        comeback_pct = _pct("firstSetLoseMatchWinPercentage")
+        closeout_pct = _pct("firstSetWinMatchWinPercentage")
+        first_serve_win = _pct("winningOnFirstServePercentage")
+        bp_convert = _pct("breakpointsWonPercentage")
+
+        # Suppress when the player has literally no matchup-conditioned
+        # signal — caller will drop the whole H2H if both sides come
+        # back None.
+        if all(
+            v is None
+            for v in (
+                decider, tiebreak, bo3, bo5,
+                comeback_pct, closeout_pct,
+                first_serve_win, bp_convert,
+            )
+        ):
+            return None
+
+        return TennisInMatchupStats(
+            decider_record=decider,
+            tiebreak_record=tiebreak,
+            bo3_record=bo3,
+            bo5_record=bo5,
+            first_set_lost_match_won_pct=comeback_pct,
+            first_set_won_match_won_pct=closeout_pct,
+            first_serve_win_pct=first_serve_win,
+            break_point_convert_pct=bp_convert,
         )
 
     # ----- Public entry point -----
