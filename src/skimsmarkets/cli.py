@@ -11,6 +11,8 @@ from skimsmarkets import config as cfg
 from skimsmarkets.backtest.dataset import build_dataset
 from skimsmarkets.pipeline import SlateOptions, fetch_slate, run_pipeline
 from skimsmarkets.reporting import print_events_table, print_run_summary
+from skimsmarkets.selection import select_top_events
+from skimsmarkets.tennis.provider import build_tennis_provider
 
 
 # ---------------------------------------------------------------------------
@@ -99,16 +101,37 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
 
 async def _cmd_fetch(args: argparse.Namespace) -> int:
     """Display-only: build the same slate `rank` would consume and print it
-    as a table without invoking any LLM. Shares `fetch_slate` with
-    `run_pipeline` so the displayed slate matches what would be ranked.
+    as a table without invoking any LLM. Shares `fetch_slate` AND
+    `select_top_events` with `run_pipeline` so the displayed slate
+    matches what would be ranked — including the fundamental-imbalance
+    cap that selects the top `MAX_SLATE_EVENTS` by player-rank ratio
+    and team-record delta. Without re-applying selection here, fetch
+    would print the full filtered slate (often 100+ events) while
+    `rank` would silently consume only the top-N — a confusing drift
+    between what the user sees and what gets ranked.
 
     Gamma is unauthenticated, so we open a standalone `httpx.AsyncClient`
     rather than reusing the UW one — fetch has no UW context.
     """
     opts = _slate_opts_from_args(args)
     gamma_sem = asyncio.Semaphore(cfg.GAMMA_FETCH_SEM)
-    async with httpx.AsyncClient(timeout=20.0) as http:
+    # Use the env-driven config — `fetch` doesn't take provider flags
+    # (those are rank-specific). Tennis provider defaults to whatever
+    # `TENNIS_STATS_API_KEY` resolves to: real adapter when set, stub
+    # when not. Stub means selection scoring sees `lookup_player_rank`
+    # / `lookup_player_form` returning None for every tennis event,
+    # which falls through to team_record + tipoff cleanly.
+    config = cfg.Config.from_env()
+    async with (
+        httpx.AsyncClient(timeout=20.0) as http,
+        build_tennis_provider(config) as tennis_provider,
+    ):
         events = await fetch_slate(opts, http=http, gamma_sem=gamma_sem)
+        events = await select_top_events(
+            events,
+            max_events=cfg.MAX_SLATE_EVENTS,
+            tennis_provider=tennis_provider,
+        )
     print_events_table(events, opts.leagues, horizon_hours=opts.horizon_hours)
     return 0
 
