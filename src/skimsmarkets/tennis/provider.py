@@ -20,6 +20,7 @@ Why a stub instead of just `None`:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from types import TracebackType
 from typing import Protocol, Self
 
@@ -50,6 +51,32 @@ class TennisStatsProvider(Protocol):
     async def fetch(
         self, identity: TennisMatchIdentity
     ) -> TennisStatsContext | None: ...
+
+    async def warm_for_selection(self, tours: Iterable[str]) -> None:
+        """Pre-warm any caches needed for fast synchronous rank lookups.
+
+        Called by the pre-LLM selection stage when it needs to score
+        events by player-rank delta. Real adapters paginate their
+        rankings indexes here so subsequent `lookup_player_rank` calls
+        are O(1) dict hits with no HTTP. Stub providers no-op.
+
+        Idempotent — repeat calls for the same tour are free.
+        """
+        ...
+
+    def lookup_player_rank(
+        self, tour: str, name: str
+    ) -> tuple[int, int] | None:
+        """Synchronous rank lookup against any pre-warmed index.
+
+        Returns `(rank_position, rank_points)` when both are known, or
+        None when the player isn't in the index (or the index isn't
+        warmed). Selection scoring uses both fields: `points` gives a
+        better skill-gap proxy than `position` (the ATP/WTA points
+        spread is non-linear in rank), and falls back to `position`
+        when points are absent.
+        """
+        ...
 
     async def __aenter__(self) -> Self: ...
 
@@ -83,6 +110,18 @@ class StubTennisStatsProvider:
             identity.player_b,
             identity.tour,
         )
+        return None
+
+    async def warm_for_selection(self, tours: Iterable[str]) -> None:
+        # No backing index — selection scoring will see None for every
+        # `lookup_player_rank` and fall back to other signals (team
+        # records, tipoff). Iterate `tours` only for signature symmetry.
+        for _ in tours:
+            pass
+
+    def lookup_player_rank(
+        self, tour: str, name: str
+    ) -> tuple[int, int] | None:
         return None
 
     async def __aenter__(self) -> Self:

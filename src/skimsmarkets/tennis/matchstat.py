@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import unicodedata
+from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from types import TracebackType
 from typing import Any, Self
@@ -373,6 +374,42 @@ class MatchStatTennisProvider:
     ) -> tuple[int, int | None, int | None] | None:
         idx = self._index.get(tour, {})
         return idx.get(_normalize_name(name))
+
+    # ----- Selection-stage helpers (called pre-cap, no HTTP per event) -----
+
+    async def warm_for_selection(self, tours: Iterable[str]) -> None:
+        """Warm the rankings index for one or more tours in parallel.
+
+        Idempotent: `_ensure_index` early-returns when the tour is
+        already cached. Pagination cost is one-time per tour
+        (5 calls × 100 entries = top 500), shared across the entire
+        process lifetime — every tennis event in the slate uses the
+        warm index for free after that.
+        """
+        unique_tours = {t for t in tours if t in self._index_locks}
+        if not unique_tours:
+            return
+        await asyncio.gather(*(self._ensure_index(t) for t in unique_tours))
+
+    def lookup_player_rank(
+        self, tour: str, name: str
+    ) -> tuple[int, int] | None:
+        """Sync `(rank_position, rank_points)` lookup against the warm index.
+
+        Returns None when:
+          - the index isn't warm for this tour
+          - the player isn't in the top-N covered by the index
+          - the matched record is missing position OR points
+        Callers (selection scoring) treat None as "no rank signal"
+        and degrade to other imbalance signals.
+        """
+        hit = self._resolve(tour, name)
+        if hit is None:
+            return None
+        _pid, position, points = hit
+        if position is None or points is None:
+            return None
+        return position, points
 
     # ----- Per-player fetches -----
 

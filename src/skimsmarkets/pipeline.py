@@ -30,6 +30,7 @@ from skimsmarkets.clob import (
     summarize_history,
 )
 from skimsmarkets.polymarket.models import PolymarketEvent
+from skimsmarkets.selection import select_top_events
 from skimsmarkets.tennis import TennisStatsContext
 from skimsmarkets.tennis.identity import tennis_match_identity
 from skimsmarkets.tennis.provider import (
@@ -174,6 +175,16 @@ async def fetch_gamma_slate(
     The CLOB book + price-history enrichment stages run on the unified
     slate post-`fetch_slate`, not here — keeps `fetch_gamma_slate` a pure
     fetch+filter without HTTP fan-out beyond the listing call.
+
+    The `MAX_SLATE_EVENTS` cap is NOT applied here. It moved to the
+    pre-LLM `selection.select_top_events` stage in `run_pipeline`, which
+    ranks candidates by *fundamental imbalance* (player-rank ratio for
+    tennis, win-pct delta for team sports) instead of by tipoff. This
+    function returns the full filtered slate sorted by tipoff so the
+    `skims fetch` CLI path (which has no LLM cost to manage) sees an
+    uncapped slate, and so the selection stage has the full population
+    to score over. Callers that want the soonest-N can slice the result
+    directly.
     """
     now = datetime.now(tz=UTC)
     horizon_start = now - timedelta(hours=6)
@@ -272,13 +283,15 @@ async def fetch_gamma_slate(
         dropped_blowout,
     )
 
-    # Sort by earliest market tipoff ascending, then cap to
-    # `MAX_SLATE_EVENTS`. Sort is unconditional because gamma's listing is
-    # ordered by `endDate` (settlement window), not tipoff — the two
-    # diverge on tours like ATP where settlement lags match end by days,
-    # so a naive head-slice would pick an arbitrary subset rather than
-    # "the soonest games." Events without any market `game_start_time`
-    # sort last so they don't displace tradable events at the head.
+    # Sort by earliest market tipoff ascending. Sort is unconditional
+    # because gamma's listing is ordered by `endDate` (settlement
+    # window), not tipoff — the two diverge on tours like ATP where
+    # settlement lags match end by days. The cap that used to live here
+    # moved to `selection.select_top_events` (called from
+    # `run_pipeline`); this function now returns the full filtered slate
+    # so the selection stage can score the entire population by
+    # fundamental imbalance rather than just the soonest-N. Events
+    # without any market `game_start_time` sort last.
     _far_future = datetime.max.replace(tzinfo=UTC)
 
     def _tipoff(ev: PolymarketEvent) -> datetime:
@@ -286,14 +299,6 @@ async def fetch_gamma_slate(
         return min(starts) if starts else _far_future
 
     kept.sort(key=_tipoff)
-    if len(kept) > cfg.MAX_SLATE_EVENTS:
-        truncated = len(kept) - cfg.MAX_SLATE_EVENTS
-        kept = kept[: cfg.MAX_SLATE_EVENTS]
-        log.info(
-            "capped slate to %d soonest-tipoff events (truncated %d)",
-            cfg.MAX_SLATE_EVENTS,
-            truncated,
-        )
     return kept
 
 
@@ -1030,6 +1035,21 @@ async def run_pipeline(
         )
         events = await fetch_slate(slate_opts, http=uw.http, gamma_sem=gamma_sem)
         result.fetched_events = len(events)
+
+        # Pre-LLM selection — score by fundamental imbalance (player-rank
+        # ratio for tennis, win-pct delta for team-record sports) and
+        # cap to MAX_SLATE_EVENTS. Replaces the legacy "soonest-tipoff"
+        # cap that lived in `fetch_gamma_slate`. Tipoff is preserved as
+        # the tiebreaker so events without a stat-based signal (futures,
+        # niche sports) still order soonest-first among themselves.
+        # Tennis-event scoring requires the matchstat rankings index to
+        # be warm; `select_top_events` warms it lazily on first use, so
+        # non-tennis-only slates pay no warmup cost.
+        events = await select_top_events(
+            events,
+            max_events=cfg.MAX_SLATE_EVENTS,
+            tennis_provider=tennis_provider,
+        )
 
         result.considered_events = len(events)
         log.info("considering %d events", len(events))
