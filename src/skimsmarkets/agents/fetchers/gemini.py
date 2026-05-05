@@ -11,8 +11,9 @@ Twitter/X gap: Gemini has no native X search (xAI's `x_search` is a
 provider-specific primitive). The per-lens tools sections below tell Gemini
 to fall back to `google_search` with `site:x.com` / `site:twitter.com` for
 beat-reporter posts. Coverage will likely be thinner on the social-data
-lenses (narrative, injury, tennis_conditions_and_context) — that's part of
-what the A/B measures, not a bug to paper over.
+lenses (`tennis_conditions_and_context` for warm-up issues / late
+withdrawals) — that's part of what the A/B measures, not a bug to paper
+over.
 
 Per-sport-lens-set refactor: prompts are pre-built per `(sport, lens)` at
 construction by iterating `SPORT_LENS_SETS`. `_TOOLS_BY_LENS` is the
@@ -127,50 +128,6 @@ developments — pre-game baselines decay quickly once the ball is in the air. N
 """.strip()
 
 
-# ----- DEFAULT lens set tool prose -----
-
-_TOOLS_DEFAULT_STATISTICS = """
-What each tool can give you here:
-- google_search: stats pages (basketball-reference, fangraphs, fbref, pro-football-reference,
-  or sport equivalents), recent game logs, home/away splits, rating systems. For roster /
-  line changes that might invalidate a baseline, query `site:x.com` plus the team or
-  reporter handle.
-- code_execution: derive candidate team_a-win baselines via log5, rating-differential, or
-  recent-N-games weighting and surface them in `computed_numbers` (label them clearly so
-  the reasoner can pick the most defensible one). Compute league base rates (e.g.
-  home-team win%) for the reasoner to anchor against. Don't pick a single final number —
-  the reasoner will weigh candidates.
-""".strip()
-
-_TOOLS_DEFAULT_INJURY = """
-What each tool can give you here:
-- google_search: official team injury reports, ESPN injury index, The Athletic. For beat
-  reporters (Shams, Woj, Schefter, Rapoport, Passan, or sport equivalents) and team
-  accounts where injury news usually breaks first, query `site:x.com` plus the reporter
-  handle (e.g. `site:x.com @ShamsCharania Lakers injury`). Recent posts may be incompletely
-  indexed — when injury reporting is sparse, set `coverage='thin'` and surface the gap in
-  `research_notes`. For combat sports / tennis, weigh-ins, withdrawals, training-camp
-  reporting.
-- code_execution: when a star is out, compute the on/off win-rate split, win-share delta,
-  BPM-with/without, or sport-equivalent impact number and surface it in `computed_numbers`
-  (e.g. label='lakers_with_lebron_winrate', value=0.62, method='regular-season W/L when
-  active vs out, n=…'). The reasoner will combine these into the signed shift.
-""".strip()
-
-_TOOLS_DEFAULT_NARRATIVE = """
-What each tool can give you here:
-- google_search: beat-reporter features, team press conferences, coaching interviews,
-  managerial-change reporting, derby/cup-final coverage. For public sentiment and
-  locker-room chatter, query `site:x.com` plus team / player handles or relevant
-  beat-reporter accounts (e.g. `site:x.com @MarcSpears Celtics locker room`). Twitter
-  indexing on Google is incomplete and lags — when sentiment data is sparse, set
-  `coverage='thin'` rather than overstating what you found.
-- code_execution: ground a narrative claim in a number when you can (e.g. post-firing
-  coaching-bump win% in the league, trade-deadline record splits) and put it in
-  `computed_numbers`.
-""".strip()
-
-
 # ----- TENNIS lens set tool prose -----
 
 _TOOLS_TENNIS_FORM_AND_SURFACE = """
@@ -225,10 +182,6 @@ What each tool can give you here:
 
 
 _TOOLS_BY_LENS: dict[str, str] = {
-    # Default lens set
-    "statistics": _TOOLS_DEFAULT_STATISTICS,
-    "injury": _TOOLS_DEFAULT_INJURY,
-    "narrative": _TOOLS_DEFAULT_NARRATIVE,
     # Tennis lens set
     "tennis_form_and_surface": _TOOLS_TENNIS_FORM_AND_SURFACE,
     "tennis_matchup_and_clutch": _TOOLS_TENNIS_MATCHUP_AND_CLUTCH,

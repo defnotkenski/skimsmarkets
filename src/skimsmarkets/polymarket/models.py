@@ -624,8 +624,9 @@ class PolymarketEvent(BaseModel):
     # head-to-heads when a `TennisStatsProvider` returns an actionable
     # context. Always None for non-tennis events, doubles markets, and
     # whenever the provider had no record / failed. Consumed only by the
-    # statistics fetcher / reasoner — director and other lenses don't see
-    # it (lens-silo posture; see CLAUDE.md and the tennis package docstring).
+    # `tennis_form_and_surface` fetcher / reasoner — director and other
+    # lenses don't see it (lens-silo posture; see CLAUDE.md and the
+    # tennis package docstring).
     tennis_stats: TennisStatsContext | None = None
 
     @field_validator("id", mode="before")

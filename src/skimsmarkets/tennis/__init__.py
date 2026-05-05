@@ -1,19 +1,20 @@
 """Tennis player-stats enrichment.
 
 Wraps the optional third-party tennis stats vendor that feeds the
-statistics specialist with structured player data (rankings, surface
-splits, recent form, head-to-head). Provider-agnostic by design: the
-`TennisStatsProvider` Protocol mirrors `agents/fetchers/base.py:FetcherProvider`
-so a real adapter can be dropped in next to the stub without touching the
-pipeline wiring.
+`tennis_form_and_surface` lens with structured player data (rankings,
+surface splits, recent form, head-to-head). Provider-agnostic by design:
+the `TennisStatsProvider` Protocol mirrors
+`agents/fetchers/base.py:FetcherProvider` so a real adapter can be
+dropped in next to the stub without touching the pipeline wiring.
 
 Scope is narrow on purpose:
 - Only ATP/WTA singles head-to-heads. Doubles, qualifiers, and mixed-tour
   novelty markets fall through `tennis_match_identity` to None.
-- Only the statistics lens consumes the data. The other three lenses and
-  the director don't see it — these stats *are* what the statistics
-  specialist exists to compute, so feeding them anywhere else conflates
-  "data from Polymarket" with "data from a third-party vendor."
+- Only the `tennis_form_and_surface` lens consumes the data. The other
+  two tennis lenses and the director don't see it — these stats *are*
+  the structured payload that lens consumes, so feeding them anywhere
+  else conflates "data from Polymarket" with "data from a third-party
+  vendor."
 
 Import shape — only models and rendering are re-exported here. `identity`
 and `provider` import `PolymarketEvent` from `skimsmarkets.polymarket.models`,

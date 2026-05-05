@@ -1,13 +1,12 @@
 """Sport-keyed lens-set primitives — `LensSpec` (one lens) and `LensSet`
 (one sport's ordered tuple of lenses + per-sport director tail).
 
-The agent layer used to hard-code three lenses (statistics / injury /
-narrative) for every event. With per-sport lens sets, each sport declares
-its own ordered list — tennis ships its own `tennis_form_and_surface` /
-`tennis_matchup_and_clutch` / `tennis_conditions_and_context` trio with
-sport-specific prompts and report schemas. The dispatch primitives live
-here so the registry (`agents/sports/__init__.py`) and the per-sport
-packages (`agents/sports/<sport>/`) share one shape.
+Each sport declares its own ordered list of lenses — tennis ships
+`tennis_form_and_surface` / `tennis_matchup_and_clutch` /
+`tennis_conditions_and_context` with sport-specific prompts and report
+schemas. The dispatch primitives live here so the registry
+(`agents/sports/__init__.py`) and the per-sport packages
+(`agents/sports/<sport>/`) share one shape.
 
 A `LensSpec` is one lens's full contract:
 
@@ -18,22 +17,18 @@ A `LensSpec` is one lens's full contract:
   names not colliding lets that key shape stay simple.
 - `fetcher_system_builder(tools_section, notebook_tail) -> str`: builds
   the cached fetcher system prompt from a provider's per-lens tool prose
-  and shared notebook tail. Same shape as the legacy
-  `statistics_notebook_system` / `injury_notebook_system` /
-  `narrative_notebook_system` builders in the old `agents/prompts.py`.
+  and shared notebook tail.
 - `reasoner_system`: cached system prompt for the Claude reasoner.
 - `report_schema`: the Pydantic class the reasoner returns.
   Cross-sport pipeline plumbing carries `dict[str, BaseModel]`; the
   per-sport director path knows the concrete types.
 - `render_extras(event) -> str | None`: per-lens user-message append.
-  Replaces the old `render_lens_extras` switch. Currently tennis stats
-  feeds only `tennis_form_and_surface`; default-sport specs leave this
-  `None`.
-- `fetcher_sport_hint` / `reasoner_sport_hint`: static, per-lens guidance
-  strings. Replace the old `(lens, sport)` keyed dicts in
-  `agents/sport_hints.py`. They ride on the per-event user message, never
-  the cached system block, so slate-wide cache hits on the system stay
-  warm.
+  Currently the structured tennis-stats block feeds only
+  `tennis_form_and_surface`; specs that don't need a per-lens append
+  leave this `None`.
+- `fetcher_sport_hint` / `reasoner_sport_hint`: static, per-lens
+  guidance strings that ride on the per-event user message, never the
+  cached system block, so slate-wide cache hits on the system stay warm.
 
 A `LensSet` bundles the lenses for one sport plus the director's
 sport-specific synthesis tail. The director's cross-sport content lives
@@ -98,11 +93,9 @@ class LensSpec:
 class LensSet:
     """One sport's ordered lens set + sport-specific director tail.
 
-    `sport` is the canonical `event.sport_type` string the registry keys on
-    (`"tennis"`, etc.) or the literal `"default"` for the legacy trio used
-    as a test fixture / future opt-in. The registry does NOT register
-    `"default"` itself by default — events with no matching sport drop with
-    `ErrorRecord(stage="lens_dispatch")`.
+    `sport` is the canonical `event.sport_type` string the registry keys
+    on (`"tennis"`, etc.). Events whose `sport_type` has no matching
+    entry drop with `ErrorRecord(stage="lens_dispatch")`.
 
     `director_system_tail` is the sport-specific director synthesis prompt.
     The director sends `[DIRECTOR_SHARED_PREAMBLE, director_system_tail]`

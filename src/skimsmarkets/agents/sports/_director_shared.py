@@ -175,9 +175,9 @@ Examples of good headlines:
 - "Chiefs take it as the Bengals' top-3 corner and starting LT both ruled out."
 - "Slight Nuggets edge — Jokic well-rested while Wolves play their third in four nights."
 Examples of bad headlines (do NOT do this):
-- "Statistics and injury both lean team_a; narrative is neutral." (specialist jargon)
-- "Lakers should probably win this one if their bench can hold up." (hedging)
-- "Lakers win because of stats, injuries, and narrative." (no decisive factor)
+- "tennis_form_and_surface and tennis_matchup_and_clutch both lean Alcaraz; conditions neutral." (specialist jargon)
+- "Alcaraz should probably win this one if his serve holds up." (hedging)
+- "Alcaraz wins because of form, matchup, and conditions." (no decisive factor)
 
 Return ONLY valid JSON matching the EventPrediction schema.
 

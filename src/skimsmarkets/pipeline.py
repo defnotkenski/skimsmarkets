@@ -833,8 +833,9 @@ def _persist_run(result: RunResult) -> None:
         director's synthesis, judge's defensibility score, full lens
         notebooks + reasoner reports.
       - `record_type="error"` — one row per dropped event with `event_id`,
-        `stage` (e.g. `fetcher:injury`, `reasoner:statistics`, `director`,
-        `tennis_stats`, `judge`), and the captured error string.
+        `stage` (e.g. `fetcher:tennis_form_and_surface`,
+        `reasoner:tennis_matchup_and_clutch`, `director`, `tennis_stats`,
+        `judge`), and the captured error string.
     Both share the run-level metadata (`run_id`, `logged_at_utc`,
     `fetcher_provider`, `fetcher_model`) so a grading script can `jq` over
     the slate without joining against a sidecar.

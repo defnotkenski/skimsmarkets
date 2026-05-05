@@ -3,8 +3,7 @@ per-sport lens architecture.
 
 `SPORT_LENS_SETS` maps `event.sport_type` → `LensSet`. Strict-declaration
 posture: events whose `sport_type` has no registration drop with
-`ErrorRecord(stage="lens_dispatch")`. There is intentionally NO automatic
-fallback to `DEFAULT_LENS_SET` — adding a sport requires explicit
+`ErrorRecord(stage="lens_dispatch")`. Adding a sport requires explicit
 registration here, which forces the per-sport prompts/schemas to actually
 exist before that sport's events flow through the LLM stack.
 
@@ -14,20 +13,12 @@ Adding a sport:
   2. Add `_TOOLS_BY_LENS` entries in `agents/fetchers/grok.py` and
      `agents/fetchers/gemini.py` for the new lens names.
   3. Register here: `SPORT_LENS_SETS["<sport>"] = <SPORT>_LENS_SET`.
-
-Soft-rollout escape hatch (not the chosen default): to keep an existing
-sport on the legacy three-lens trio temporarily, register the default
-set under that sport key, e.g.
-`SPORT_LENS_SETS["soccer"] = DEFAULT_LENS_SET`. Replace with a bespoke
-set when ready. The architecture supports this; the strict-declaration
-interpretation is what's chosen on PR1.
 """
 
 from __future__ import annotations
 
 from skimsmarkets.agents.sports._director_shared import DIRECTOR_SHARED_PREAMBLE
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
-from skimsmarkets.agents.sports.default import DEFAULT_LENS_SET
 from skimsmarkets.agents.sports.tennis import TENNIS_LENS_SET
 from skimsmarkets.polymarket.models import PolymarketEvent
 
@@ -54,7 +45,6 @@ def resolve_lens_set(event: PolymarketEvent) -> LensSet | None:
 
 
 __all__ = [
-    "DEFAULT_LENS_SET",
     "DIRECTOR_SHARED_PREAMBLE",
     "LensSet",
     "LensSpec",

@@ -1,8 +1,9 @@
 """Pydantic shapes for tennis player-stats enrichment.
 
 Same posture as `unusual_whales/models.py:UnusualWhalesContext`:
-- Structurally compact — only fields the statistics specialist can
-  actually consume in a prompt; we don't mirror the vendor's full payload.
+- Structurally compact — only fields the `tennis_form_and_surface`
+  specialist can actually consume in a prompt; we don't mirror the
+  vendor's full payload.
 - `has_actionable_signal()` lets the renderer skip cleanly when the
   fetched context is too thin to be worth the prompt-token cost.
 - All numeric fields are `| None` so a partial fetch (vendor missing a
@@ -159,7 +160,8 @@ class TennisInMatchupStats(BaseModel):
 
 
 class TennisPlayerStats(BaseModel):
-    """Per-player snapshot the statistics specialist consumes verbatim.
+    """Per-player snapshot the `tennis_form_and_surface` specialist
+    consumes verbatim.
 
     Every numeric field is optional because vendors differ in what they
     expose: rapid-API-style indexes have ranking + form but no surface
@@ -206,7 +208,8 @@ class TennisPlayerStats(BaseModel):
     ytd_win_loss: tuple[int, int] | None = None
     # Surface keys: `"hard"`, `"clay"`, `"grass"`, `"carpet"`. Values are
     # `(wins, losses)`. Surface-conditioned form is more predictive than
-    # YTD aggregates per the existing tennis-statistics sport hint.
+    # YTD aggregates per `_FETCHER_HINT_FORM_AND_SURFACE` in
+    # `agents/sports/tennis/lens_set.py`.
     surface_win_loss: dict[str, tuple[int, int]] | None = None
     # Compact "WWLWWLWWWL" string — last N matches in chronological order
     # (oldest → newest). N is vendor-defined; we don't try to enforce.

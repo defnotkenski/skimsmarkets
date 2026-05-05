@@ -5,11 +5,11 @@ formatting, kept out of the agent modules so the rendering can be
 unit-tested without spinning up a fetcher and so any future consumer
 (CLI debug, JSONL pretty-print) shares the same shape.
 
-Rendered block goes onto the per-event user message of the *statistics*
-fetcher only, appended after `render_context(event)` and the existing
-`render_sport_hint(...)` output. The reasoner sees the same string
-because reasoners receive the same event context the fetcher does
-(`agents/reasoners.py`).
+Rendered block goes onto the per-event user message of the
+`tennis_form_and_surface` fetcher only, appended after
+`render_context(event)` and the lens's `render_fetcher_hint(...)`
+output. The reasoner sees the same string because reasoners receive the
+same event context the fetcher does (`agents/reasoners.py`).
 
 Token budget: aim for ~300–400 tokens per match. Heavy tier additions
 (per-surface H2H, recent meetings list, recent-match digest, career
@@ -304,12 +304,14 @@ def _fmt_h2h(h2h: TennisHeadToHead, name_a: str, name_b: str) -> list[str]:
 
 
 def render_tennis_stats_block(ctx: TennisStatsContext) -> str:
-    """Compact tennis player-stats render for the statistics fetcher.
+    """Compact tennis player-stats render for the
+    `tennis_form_and_surface` fetcher.
 
     Returns a multi-line string with a labelled header so the reasoner
-    can find it deterministically (the statistics reasoner prompt
-    references this header literally). Empty bodies aren't expected —
-    `has_actionable_signal` is the gate the caller should check first.
+    can find it deterministically (the `tennis_form_and_surface`
+    reasoner prompt references this header literally). Empty bodies
+    aren't expected — `has_actionable_signal` is the gate the caller
+    should check first.
     """
     lines: list[str] = []
     header_extras: list[str] = []

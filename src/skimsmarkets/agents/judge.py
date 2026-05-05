@@ -101,11 +101,12 @@ Rubric — judge each event against these signals (in roughly this priority):
    `uw_flow_note` is null (UW had no coverage), this signal is neutral —
    don't penalize and don't boost.
 
-4. Specialist-weights diffusion. With three lenses, equal weighting is ~0.33
-   each. If `specialist_weights` is concentrated (one lens >0.6 of the
-   synthesis), the call rests on a single input and is fragile — penalize.
-   Diffuse weights (no lens >0.45, all lenses in the 0.25–0.45 band) mean
-   removing any one input wouldn't flip the call — boost.
+4. Specialist-weights diffusion. Equal weighting is `1/N` for an `N`-lens
+   sport (e.g. ~0.33 each for a 3-lens set). If `specialist_weights` is
+   concentrated — one lens roughly twice its equal-share weight or more
+   (e.g. >0.6 in a 3-lens sport) — the call rests on a single input and
+   is fragile; penalize. Diffuse weights — no lens above ~1.4× equal
+   share — mean removing any one input wouldn't flip the call; boost.
 
 5. Probability/implied gap discipline. Compare `predicted_yes_probability`
    against `polymarket_implied_probability`. A small gap (<5pp) is the
@@ -120,9 +121,10 @@ Output, per event in the input batch:
 - `defensibility_score` — float in [0,1], higher = stronger case.
 - `defensibility_rationale` — 1–2 sentences naming the load-bearing reasons
   for the score. No jargon. Don't restate the director's prediction;
-  explain why the *case* is strong or weak. Bad: "Lakers expected to win."
+  explain why the *case* is strong or weak. Bad: "Alcaraz expected to win."
   Good: "All three lenses align directionally and UW smart-money confirms;
-  reasoning concentrated in injury but the injury signal is unambiguous."
+  reasoning concentrated in tennis_matchup_and_clutch but the H2H signal
+  is unambiguous."
 - `defensibility_flags` — up to 3 short snake_case slugs naming the
   specific weaknesses present. Use the vocabulary below; coin a new flag
   only when none fits. Empty list when the case is clean.

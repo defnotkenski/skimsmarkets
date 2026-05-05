@@ -1,18 +1,17 @@
 """Cross-sport Pydantic schemas for the agent layer.
 
 Per-sport report schemas (the typed reports each lens emits) live in
-`agents/sports/<sport>/schemas.py` — `agents/sports/default/schemas.py`
-holds the legacy `StatisticsReport` / `InjuryReport` / `NarrativeReport`
-trio; `agents/sports/tennis/schemas.py` holds the bespoke tennis trio.
+`agents/sports/<sport>/schemas.py` — e.g. `agents/sports/tennis/schemas.py`
+holds the tennis lens reports.
 
 Only sport-agnostic types live here:
 - `LensNotebook` — fetcher Stage A output, free-form research notes +
   citations + computed numbers. No verdict.
 - `Citation`, `ComputedNumber` — components of `LensNotebook`.
-- `PlayerStatus` — used by both legacy `InjuryReport` and tennis
-  `TennisConditionsContextReport.injury_concerns`. Worth keeping
-  cross-sport because the shape (name + team + status + impact note)
-  is identical.
+- `PlayerStatus` — availability primitive (name + team + status + impact
+  note) currently used by `tennis.TennisConditionsContextReport.injury_concerns`.
+  Lives here rather than under `agents/sports/tennis/` so a future sport
+  can reuse the shape without taking a dependency on the tennis package.
 - `EventPrediction` — director's structured-output schema.
 - `MarketPrediction` — projection of an `EventPrediction` onto the
   predicted-winner's market.
@@ -121,9 +120,10 @@ class LensNotebook(BaseModel):
 
 
 class PlayerStatus(BaseModel):
-    """Cross-sport availability primitive used by injury / availability
-    reports. Reused by `default.InjuryReport.key_absences` and by
-    `tennis.TennisConditionsContextReport.injury_concerns`.
+    """Cross-sport availability primitive used by
+    `tennis.TennisConditionsContextReport.injury_concerns`. Lives here so
+    a future sport's report schema can reuse the shape without taking a
+    dependency on the tennis package.
     """
 
     name: str
@@ -185,8 +185,7 @@ class EventPrediction(BaseModel):
             "Per-specialist weight in [0,1]; should roughly sum to 1. Keys are the "
             "lens names declared by the active LensSet (e.g. tennis emits "
             "'tennis_form_and_surface' / 'tennis_matchup_and_clutch' / "
-            "'tennis_conditions_and_context'; the default set emits "
-            "'statistics' / 'injury' / 'narrative')."
+            "'tennis_conditions_and_context')."
         ),
     )
     disagreements_flagged: list[str] = Field(
@@ -235,9 +234,7 @@ class MarketPrediction(BaseModel):
         default=None,
         description=(
             "Name of the LensSet this prediction was synthesized through "
-            "(e.g. 'tennis'). Same as `sport_type` for sports with bespoke "
-            "lens sets; would differ if a sport were registered against "
-            "DEFAULT_LENS_SET via the soft-rollout escape hatch."
+            "(e.g. 'tennis'). Matches `sport_type` for the current registry."
         ),
     )
     predicted_winner: str

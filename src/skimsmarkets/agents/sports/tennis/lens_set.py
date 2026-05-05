@@ -64,12 +64,10 @@ def _render_tennis_stats_extras(event: PolymarketEvent) -> str | None:
     return render_tennis_stats_block(event.tennis_stats)
 
 
-# Per-lens fetcher sport-hint bodies. These migrate the relevant content
-# from the legacy `SPORT_HINTS[("statistics", "tennis")]` /
-# `("injury", "tennis")` / `("narrative", "tennis")` keys, re-attributed
-# by lens job. Form/surface/serve metrics + Log5/Elo method notes →
-# form_and_surface; H2H method notes + clutch + handedness → matchup;
-# weather/court/medical-timeout/coaching → conditions.
+# Per-lens fetcher sport-hint bodies. Form/surface/serve metrics +
+# Log5/Elo method notes → form_and_surface; H2H method notes + clutch +
+# handedness → matchup; weather/court/medical-timeout/coaching →
+# conditions.
 
 _FETCHER_HINT_FORM_AND_SURFACE = """
 Tennis form-and-surface specifics:
