@@ -175,15 +175,18 @@ class EventPrediction(BaseModel):
     )
     confidence: Confidence = Field(
         description=(
-            "Robustness of the prediction to any single input being wrong — NOT a "
-            "measure of how lopsided the matchup is. high = multiple specialists "
-            "(and UW flow when present) independently support predicted_winner, so "
-            "removing any one input leaves the winner unchanged; medium = most agree "
-            "but one is load-bearing; low = predicted_winner flips if a single input "
-            "is wrong, or specialists themselves mostly reported confidence='low'. "
-            "A 52-48 call with all three lenses agreeing directionally IS high "
-            "confidence; an 80-20 call resting entirely on one late injury report "
-            "is low confidence."
+            "Robustness of the pick to real-world contingencies — count how many "
+            "independent things would have to break against the pick (in the WORLD, "
+            "not in the model) for it to lose. NOT a measure of how lopsided the "
+            "matchup is. high = multiple independent contingencies would have to "
+            "stack against the pick (e.g. ATP top-100 vs unranked qualifier in R32 — "
+            "would need late withdrawal AND adverse weather AND in-match upset run); "
+            "medium = the pick survives the most common single contingency but a "
+            "stacked pair would break it; low = a single common contingency flips "
+            "the pick (one starter scratched, one cold shooting half, one early red "
+            "card). The point is fragility, not magnitude — a 52-48 call where the "
+            "favorite enters fully fit on a neutral surface and no obvious single "
+            "contingency could flip it IS still high confidence."
         ),
     )
     headline: str = Field(

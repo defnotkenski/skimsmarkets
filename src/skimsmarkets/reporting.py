@@ -44,26 +44,26 @@ def _confidence_style(c: str) -> str:
 
 
 def _defensibility_stars(score: float) -> str:
-    """Render a [0,1] defensibility score as a 1-5 star rating, color-graded
-    with the existing pastel palette (mint = strong case, peach = mid,
-    rose = weak). Empty stars stay dim. Bucket boundaries are 0.85 / 0.65
-    / 0.45 / 0.25 — chosen so a typical 0.74 lands at ★★★★ and 0.30 at
-    ★★, which matches the "Yelp rating" mental model the user expects at
-    a glance. The numeric score is still surfaced verbatim in the
-    rationale table for when precision matters; the stars are the
-    glanceable form.
+    """Render a [0,1] defensibility score as a 1-5 fire-emoji rating. Bucket
+    boundaries are 0.85 / 0.65 / 0.45 / 0.25 — chosen so a typical 0.74
+    lands at four flames and 0.30 at two, matching the "Yelp rating" mental
+    model. The numeric score is still surfaced verbatim on the JSONL row
+    when precision matters; the emojis are the glanceable form. No color
+    branch — fire emojis carry their own heat semantics, and most terminals
+    render emoji glyphs through their own font where rich's color codes
+    don't apply consistently anyway.
     """
     if score >= 0.85:
-        filled, color = 5, _MINT
+        filled = 5
     elif score >= 0.65:
-        filled, color = 4, _MINT
+        filled = 4
     elif score >= 0.45:
-        filled, color = 3, _PEACH
+        filled = 3
     elif score >= 0.25:
-        filled, color = 2, _ROSE
+        filled = 2
     else:
-        filled, color = 1, _ROSE
-    return f"[{color}]{'★' * filled}[/][{_DIM}]{'☆' * (5 - filled)}[/]"
+        filled = 1
+    return "🔥" * filled
 
 
 def _pick_favorite(event: PolymarketEvent) -> PolymarketMarket:
@@ -221,19 +221,12 @@ def print_run_summary(result: RunResult) -> None:
                 else "—"
             )
             da = result.defensibility_assessments.get(p.event_id)
-            if da is not None:
-                # Stars on top, comma-joined flags dimly underneath. Empty
-                # flags = clean case; render just the stars. Numeric score
-                # lives in the rationale table for when precision matters.
-                if da.defensibility_flags:
-                    case_cell = (
-                        f"{_defensibility_stars(da.defensibility_score)}\n"
-                        f"[{_DIM}]{','.join(da.defensibility_flags)}[/]"
-                    )
-                else:
-                    case_cell = _defensibility_stars(da.defensibility_score)
-            else:
-                case_cell = "—"
+            # Stars only — flags (`lens_disagreement`, `concentrated_weights`,
+            # etc.) added clutter without changing the read at a glance. They
+            # still persist on the JSONL row for retrospective grading.
+            case_cell = (
+                _defensibility_stars(da.defensibility_score) if da is not None else "—"
+            )
             leaderboard.add_row(
                 str(rank),
                 event_display,

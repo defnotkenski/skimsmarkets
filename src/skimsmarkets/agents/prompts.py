@@ -243,8 +243,9 @@ pricing the matchup — no specialist's opinion sits between you and it.
 You are NOT making a trading decision. Downstream ranks events by your
 `predicted_winner_probability`, so produce the best-calibrated probability you can from the
 specialists' inputs — and report a prediction for every event, not just the high-conviction
-ones. Separately, tag the prediction with a `confidence` reflecting how ROBUST your call is
-(defined below); confidence is independent of how lopsided the matchup is.
+ones. Separately, tag the prediction with a `confidence` reflecting how robust your call is
+to real-world contingencies (defined below); confidence is independent of how lopsided the
+matchup is.
 
 Rules for synthesis:
 - Do NOT blindly average. Weight each specialist by (a) their stated confidence and (b) how
@@ -289,19 +290,29 @@ Rules for synthesis:
 - `predicted_winner` MUST exactly match one of the yes_sub_titles listed in the event context
   (e.g. 'Cavaliers' or 'Lakers'). Do not abbreviate or rename — downstream looks up the
   winner's Polymarket market by exact match on this string.
-- `confidence` measures how ROBUST your prediction is to any single input being wrong —
-  NOT how lopsided the matchup is. Treat the three specialists plus UW flow (when present)
-  as independent inputs and ask: would `predicted_winner` flip if one of them were wrong?
-    * high: multiple inputs independently support the same winner; removing any one would
-      leave `predicted_winner` unchanged. A 52-48 call where all three lenses agree
-      directionally IS high confidence — you're sure of the number even though the
-      matchup is close.
-    * medium: most inputs agree but one is meaningfully load-bearing; the call would
-      tighten without it but probably not flip.
-    * low: `predicted_winner` hinges on a single input (e.g. a late injury report alone
-      flipping a stats-favored side, or UW flow as the only directional signal). Also
-      use 'low' when the specialists themselves mostly reported `confidence='low'` —
-      convergent-but-thin reasoning isn't robust.
+- `confidence` measures the pick's ROBUSTNESS to real-world contingencies — count how
+  many independent things would have to break against the pick (in the WORLD, not in
+  the model) for it to lose. NOT how lopsided the matchup is. Common contingencies
+  include: late scratches / withdrawals, lineup rotation (rest decisions), weather
+  shifts (wind / rain / heat on outdoor sports), in-game injury, foul trouble on a
+  star, hot/cold half from a role player, ref/umpire skew, set-piece variance,
+  judge scoring on close decisions. Sport-specific contingency menus are in the
+  per-event hint block below when present — use them.
+    * high: multiple independent contingencies would have to STACK against the pick
+      for it to lose. Example: ATP top-100 vs unranked qualifier in R32 needs a
+      late withdrawal AND a surface/weather upset AND an in-match collapse to
+      flip — that's high. A 52-48 call where the favorite enters fully fit on a
+      neutral surface and no obvious single contingency would flip it IS also
+      high — fragility, not magnitude.
+    * medium: the pick survives the most common single contingency (one role
+      player off, neutral weather) but a stacked pair would break it. Typical
+      mid-market call where one or two ordinary things going wrong is enough.
+    * low: a single common contingency flips the pick. Example: two evenly-matched
+      NBA teams where one starter scratched at warmup swings it; soccer 3-way
+      where an early red card resets the game; tennis match where one player is
+      coming off back-to-back deciders and a fitness scare would end it. Also
+      use 'low' when the specialists themselves mostly reported `confidence='low'`
+      — your robustness can't exceed the data quality you're built on.
 - specialist_weights keys must be exactly: 'statistics', 'injury', 'narrative', and the
   values should approximately sum to 1.
 
@@ -413,11 +424,15 @@ Hard rules:
 Rubric — judge each event against these signals (in roughly this priority):
 
 1. Reasoning coherence. Does the director's `reasoning` actually justify
-   the `confidence` tier and `predicted_winner_probability`? A "high"
-   confidence call paired with hand-wavy reasoning is a contradiction —
-   penalize. A "low" confidence call paired with thorough reasoning that
-   acknowledges its own thinness is internally consistent — don't penalize
-   the low conviction itself.
+   the `confidence` tier and `predicted_winner_probability`? `confidence`
+   measures the pick's robustness to real-world contingencies — high =
+   multiple independent contingencies would have to stack against the pick
+   for it to lose; low = a single common contingency flips it. A "high"
+   confidence call whose reasoning never names the contingencies the pick
+   would survive is a contradiction — penalize. A "low" confidence call
+   whose reasoning explicitly identifies the single-contingency failure
+   mode is internally consistent — don't penalize the low conviction
+   itself.
 
 2. Lens alignment. `disagreements_flagged` empty = the three specialists
    agreed directionally (strong signal). Populated = at least one material
@@ -460,7 +475,7 @@ Output, per event in the input batch:
     * `uw_contra`             — uw_flow_note explicitly diverges from predicted_winner
     * `concentrated_weights`  — one specialist_weight > 0.6
     * `unexplained_gap`       — large predicted/implied gap not addressed in reasoning
-    * `low_confidence_tier`   — director self-reported confidence='low' AND reasoning is also thin
+    * `low_confidence_tier`   — director self-reported confidence='low' (a single common contingency flips the pick) AND reasoning doesn't name a clear contingency-survival case
     * `live_volatility`       — reasoning mentions LIVE/in-play state with rapidly-changing context
 
 Cover EVERY event in the batch — return one assessment per input event,

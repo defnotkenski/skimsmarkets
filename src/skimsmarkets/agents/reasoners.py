@@ -29,9 +29,13 @@ from anthropic.types import (
     TextBlockParam,
     ThinkingConfigAdaptiveParam,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from skimsmarkets.agents.director import CLAUDE_MAX_OUTPUT_TOKENS, CLAUDE_MODEL
+from skimsmarkets.agents.director import (
+    CLAUDE_MAX_OUTPUT_TOKENS,
+    CLAUDE_MODEL,
+    _PARSE_RETRY_ATTEMPTS,
+)
 from skimsmarkets.agents.fetchers import render_context, render_lens_extras
 from skimsmarkets.agents.prompts import (
     INJURY_REASONER_SYSTEM,
@@ -106,21 +110,39 @@ async def _run_reasoner(
     )
     user_message = MessageParam(role="user", content=user_msg)
 
-    parsed = await anthropic.messages.parse(
-        model=CLAUDE_MODEL,
-        max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
-        system=[system_block],
-        messages=[user_message],
-        output_format=output_format,
-        thinking=ThinkingConfigAdaptiveParam(type="adaptive"),
-        output_config=OutputConfigParam(effort="max"),
-    )
-    report = parsed.parsed_output
-    if report is None:
-        raise RuntimeError(
-            f"Reasoner returned no parsed output for lens={lens} event={event.id}; "
-            f"stop_reason={parsed.stop_reason}"
-        )
+    # Retry once on parse-class failures (malformed JSON, no parsed output) —
+    # same posture as the director. Genuine API errors raise their own
+    # exception classes and bubble past unchanged.
+    parsed = None
+    report = None
+    for attempt in range(_PARSE_RETRY_ATTEMPTS):
+        try:
+            parsed = await anthropic.messages.parse(
+                model=CLAUDE_MODEL,
+                max_tokens=CLAUDE_MAX_OUTPUT_TOKENS,
+                system=[system_block],
+                messages=[user_message],
+                output_format=output_format,
+                thinking=ThinkingConfigAdaptiveParam(type="adaptive"),
+                output_config=OutputConfigParam(effort="max"),
+            )
+            report = parsed.parsed_output
+            if report is None:
+                raise RuntimeError(
+                    f"Reasoner returned no parsed output for lens={lens} event={event.id}; "
+                    f"stop_reason={parsed.stop_reason}"
+                )
+            break
+        except (ValidationError, RuntimeError) as e:
+            if attempt + 1 < _PARSE_RETRY_ATTEMPTS:
+                log.warning(
+                    "reasoner parse retry lens=%s event=%s attempt=%d/%d: %s",
+                    lens, event.id, attempt + 1, _PARSE_RETRY_ATTEMPTS, e,
+                )
+                continue
+            raise
+
+    assert parsed is not None and report is not None  # break-path invariant
     log.debug(
         "reasoner=%s event=%s tokens in/out=%s/%s",
         lens,

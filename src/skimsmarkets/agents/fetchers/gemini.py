@@ -53,6 +53,15 @@ GEMINI_MODEL = "gemini-3.1-pro-preview"
 # real notebooks mid-JSON in practice — set this explicitly.
 GEMINI_MAX_OUTPUT_TOKENS = 16_000
 
+# Gemini-3.x occasionally returns finish_reason=STOP with truncated JSON,
+# or empty text when grounding tools fire in an unhappy path. Both are
+# transient sampling bugs — a re-call almost always clears them. One retry
+# (2 attempts total) catches the common case without burning unbounded
+# tokens on a genuinely broken event. Genuine API errors (auth, 429
+# RESOURCE_EXHAUSTED) raise `google.genai.errors.ClientError` which is NOT
+# a RuntimeError and bubbles past the retry loop unchanged.
+_PARSE_RETRY_ATTEMPTS = 2
+
 
 # Generic notebook tail — output rules + tool list naming Gemini's actual
 # tools. The Twitter/X workaround is mentioned where x_search would have
@@ -237,38 +246,59 @@ class GeminiProvider:
             max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
         )
 
-        response = await self._client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_msg,
-            config=config,
-        )
+        # The API call + parse is retried once on transient parse-class
+        # failures (empty text, truncated JSON despite finish_reason=STOP).
+        # Success breaks out; the second attempt's failure re-raises with
+        # the same RuntimeError shape the pipeline expects for
+        # ErrorRecord(stage="fetcher:<lens>"). `response` and `parsed` are
+        # set on the success path before break.
+        response = None
+        parsed: LensNotebook | None = None
+        for attempt in range(_PARSE_RETRY_ATTEMPTS):
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=user_msg,
+                    config=config,
+                )
 
-        raw = _strip_code_fence(response.text or "")
-        # `finish_reason=MAX_TOKENS` is the canonical signal that the
-        # response was truncated mid-output — surfacing it in the error
-        # lets a future operator distinguish "schema/format problem" from
-        # "bump the budget" without re-running.
-        finish_reason = None
-        candidates = getattr(response, "candidates", None) or []
-        if candidates:
-            finish_reason = getattr(candidates[0], "finish_reason", None)
-        if not raw:
-            raise RuntimeError(
-                f"Gemini returned empty response for lens={lens} "
-                f"event={event.id} finish_reason={finish_reason}"
-            )
-        try:
-            parsed = LensNotebook.model_validate_json(raw)
-        except Exception as e:
-            # Surface a slice of the raw response so debugging is fast —
-            # Gemini sometimes prepends a tool-use trace before the JSON
-            # which `_strip_code_fence` doesn't catch.
-            preview = raw[:400].replace("\n", " ")
-            raise RuntimeError(
-                f"Gemini response failed LensNotebook parse for lens={lens} "
-                f"event={event.id} finish_reason={finish_reason}: {e}. "
-                f"preview={preview!r}"
-            ) from e
+                raw = _strip_code_fence(response.text or "")
+                # `finish_reason=MAX_TOKENS` is the canonical signal that the
+                # response was truncated mid-output — surfacing it in the error
+                # lets a future operator distinguish "schema/format problem" from
+                # "bump the budget" without re-running.
+                finish_reason = None
+                candidates = getattr(response, "candidates", None) or []
+                if candidates:
+                    finish_reason = getattr(candidates[0], "finish_reason", None)
+                if not raw:
+                    raise RuntimeError(
+                        f"Gemini returned empty response for lens={lens} "
+                        f"event={event.id} finish_reason={finish_reason}"
+                    )
+                try:
+                    parsed = LensNotebook.model_validate_json(raw)
+                except Exception as e:
+                    # Surface a slice of the raw response so debugging is fast —
+                    # Gemini sometimes prepends a tool-use trace before the JSON
+                    # which `_strip_code_fence` doesn't catch.
+                    preview = raw[:400].replace("\n", " ")
+                    raise RuntimeError(
+                        f"Gemini response failed LensNotebook parse for lens={lens} "
+                        f"event={event.id} finish_reason={finish_reason}: {e}. "
+                        f"preview={preview!r}"
+                    ) from e
+                break
+            except RuntimeError as e:
+                if attempt + 1 < _PARSE_RETRY_ATTEMPTS:
+                    log.warning(
+                        "gemini parse retry lens=%s event=%s attempt=%d/%d: %s",
+                        lens, event.id, attempt + 1, _PARSE_RETRY_ATTEMPTS, e,
+                    )
+                    continue
+                raise
+
+        assert parsed is not None and response is not None  # break-path invariant
         assert_lens_match(parsed, lens, event.id)
 
         # `usage_metadata` is the Gen AI SDK's token-count record. Field
