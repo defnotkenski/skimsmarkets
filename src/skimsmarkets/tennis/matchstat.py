@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import unicodedata
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
@@ -147,8 +148,20 @@ _MATCH_INCLUDE = "tournament,round"
 _RECENT_MATCH_PAGE_SIZE = 5
 _RECENT_MEETING_PAGE_SIZE = 3
 
-_RETRY_ATTEMPTS = 3
+_RETRY_ATTEMPTS = 5
 _RETRY_BASE_S = 1.0
+
+# Per-provider HTTP concurrency cap. The matchstat rate limit is
+# 100 req/min/IP; bursting all our calls in one `asyncio.gather` (which
+# we did from `warm_form_for_selection` and inside per-event
+# `_player_stats`) saturated the limit instantly and forced exhausted
+# retries. The semaphore bounds in-flight calls so the natural
+# per-request latency (~200-400ms) spaces them out into the budget.
+# Value tuned for: with N=4 in-flight × ~300ms latency = ~13 req/sec
+# burst, but the existing retry-on-429 path absorbs occasional
+# overshoots without warnings reaching the log. Sized to be safely
+# under the burst threshold the vendor tolerates in practice.
+_REQUEST_CONCURRENCY = 4
 
 
 def _normalize_name(name: str) -> str:
@@ -247,6 +260,13 @@ class MatchStatTennisProvider:
             "atp": asyncio.Lock(),
             "wta": asyncio.Lock(),
         }
+        # Per-provider HTTP concurrency cap. Every `_get` call acquires
+        # this semaphore so bursts from `asyncio.gather` callers
+        # (warm_form_for_selection, _player_stats fan-out, the H2H
+        # parallel block) can't overwhelm the vendor's 100 req/min
+        # rate limit. Created in __init__ so a single shared budget
+        # spans the whole provider lifetime.
+        self._request_sem = asyncio.Semaphore(_REQUEST_CONCURRENCY)
         # Profile cache keyed by (tour, player_id) → the profile tuple.
         # Populated on the first `_player_profile` call for each player and
         # reused for the rest of the provider's lifetime. Two callers hit
@@ -292,39 +312,58 @@ class MatchStatTennisProvider:
         Mirrors the posture in `unusual_whales/client.py`: any failure
         (network, non-2xx, malformed JSON) returns None and lets the caller
         degrade gracefully — never raises through to abort the pipeline.
+
+        Concurrency: every call acquires `self._request_sem` so bursts
+        from `asyncio.gather` callers can't overwhelm the vendor's
+        100 req/min rate limit. Retries on 429 use exponential backoff
+        with jitter so simultaneously-throttled callers desynchronize
+        on the way back up — without jitter, all N concurrent retries
+        wake at the same moment and 429 again immediately.
         """
         if self._client is None:
             raise RuntimeError(
                 "MatchStatTennisProvider used outside of `async with` context"
             )
         url = f"{_BASE_URL}{path}"
-        for attempt in range(_RETRY_ATTEMPTS):
-            try:
-                resp = await self._client.get(url, params=params)
-                resp.raise_for_status()
-                return resp.json()
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code
-                if status == 404:
-                    log.debug("matchstat %s: 404", path)
+        async with self._request_sem:
+            for attempt in range(_RETRY_ATTEMPTS):
+                try:
+                    resp = await self._client.get(url, params=params)
+                    resp.raise_for_status()
+                    return resp.json()
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    if status == 404:
+                        log.debug("matchstat %s: 404", path)
+                        return None
+                    if status == 429 and attempt + 1 < _RETRY_ATTEMPTS:
+                        retry_after = e.response.headers.get("Retry-After")
+                        # Exponential backoff with jitter: ±50% of base.
+                        # Without jitter, gather()'d callers all get
+                        # 429'd at once, all back off `2^n`, all retry
+                        # at the same instant and 429 again. Jitter
+                        # spreads the wakeups across a window so the
+                        # rate-limit window drains.
+                        try:
+                            backoff = (
+                                float(retry_after)
+                                if retry_after
+                                else _RETRY_BASE_S * (2 ** attempt)
+                            )
+                        except ValueError:
+                            backoff = _RETRY_BASE_S * (2 ** attempt)
+                        wait = backoff * random.uniform(0.5, 1.5)
+                        log.debug(
+                            "matchstat %s: 429 sleeping %.1fs (attempt %d/%d)",
+                            path, wait, attempt + 1, _RETRY_ATTEMPTS,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    log.warning("matchstat %s: HTTP %s", path, status)
                     return None
-                if status == 429 and attempt + 1 < _RETRY_ATTEMPTS:
-                    retry_after = e.response.headers.get("Retry-After")
-                    try:
-                        wait = float(retry_after) if retry_after else _RETRY_BASE_S * (2 ** attempt)
-                    except ValueError:
-                        wait = _RETRY_BASE_S * (2 ** attempt)
-                    log.debug(
-                        "matchstat %s: 429 sleeping %.1fs (attempt %d/%d)",
-                        path, wait, attempt + 1, _RETRY_ATTEMPTS,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                log.warning("matchstat %s: HTTP %s", path, status)
-                return None
-            except Exception as e:  # noqa: BLE001
-                log.warning("matchstat %s: %s", path, type(e).__name__)
-                return None
+                except Exception as e:  # noqa: BLE001
+                    log.warning("matchstat %s: %s", path, type(e).__name__)
+                    return None
         return None
 
     # ----- Rankings index (name → id) -----
