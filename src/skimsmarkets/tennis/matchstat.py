@@ -247,6 +247,21 @@ class MatchStatTennisProvider:
             "atp": asyncio.Lock(),
             "wta": asyncio.Lock(),
         }
+        # Profile cache keyed by (tour, player_id) → the profile tuple.
+        # Populated on the first `_player_profile` call for each player and
+        # reused for the rest of the provider's lifetime. Two callers hit
+        # this cache: (1) the selection-stage warmup
+        # (`warm_form_for_selection`) pre-fetches form arrays for every
+        # tennis identity in the raw slate; (2) the full enrichment path's
+        # `_player_stats` re-uses those entries for players that survived
+        # the cap, eliminating the duplicate /player/profile call. Keyed
+        # by `(tour, pid)` — IDs are tour-scoped per the MatchStat URL
+        # shape `/tennis/v2/{tour}/player/profile/{id}`, so collisions
+        # across tours are theoretically possible.
+        self._profile_cache: dict[
+            tuple[str, int],
+            tuple[list[str], int | None, int | None, str | None],
+        ] = {}
 
     async def __aenter__(self) -> Self:
         headers = {
@@ -411,6 +426,91 @@ class MatchStatTennisProvider:
             return None
         return position, points
 
+    async def warm_form_for_selection(
+        self, identities: Iterable["TennisMatchIdentity"]
+    ) -> None:
+        """Pre-fetch `/player/profile` for every player across the given
+        identities and populate `self._profile_cache`.
+
+        Lets selection-stage scoring read form arrays via
+        `lookup_player_form` without triggering an HTTP per call. Both
+        sides of every identity are fanned out in parallel; players
+        already in the cache (e.g. someone who appears in two slate
+        events) skip re-fetching naturally via the cache check inside
+        `_player_profile`.
+
+        Pre-condition: the rankings index must already be warm for the
+        tours represented in `identities`. Selection orchestrator calls
+        `warm_for_selection(tours)` first, so this dependency holds in
+        practice. Identities that fail rank resolution (player outside
+        top-500) are silently skipped — the score cascade in
+        `_tennis_imbalance` already requires both ranks to compute
+        anything useful, so there's no point pre-fetching profiles for
+        unranked players.
+
+        Failure mode: any single `_player_profile` call that errors
+        out lands an empty tuple in the cache and lets the form
+        adjustment skip that event. We don't propagate exceptions so
+        a partial vendor outage degrades gracefully.
+        """
+        # Collect the unique (tour, pid) pairs we need profiles for.
+        # `_resolve` is sync and cheap (dict lookup); doing the
+        # collection up front lets us issue exactly one fetch per
+        # unique player even when an identity list contains repeats.
+        pending: set[tuple[str, int]] = set()
+        for ident in identities:
+            for nm in (ident.player_a, ident.player_b):
+                hit = self._resolve(ident.tour, nm)
+                if hit is None:
+                    continue
+                pid = hit[0]
+                if (ident.tour, pid) in self._profile_cache:
+                    continue
+                pending.add((ident.tour, pid))
+        if not pending:
+            return
+        log.info(
+            "matchstat: warming profile cache for %d players (selection)",
+            len(pending),
+        )
+        await asyncio.gather(
+            *(self._player_profile(tour, pid) for tour, pid in pending)
+        )
+
+    def lookup_player_form(
+        self, tour: str, name: str
+    ) -> tuple[str, int | None] | None:
+        """Sync `(last_10_form_string, best_rank)` lookup from the cache.
+
+        Returns None when:
+          - the player isn't in the rankings index for this tour
+          - `warm_form_for_selection` hasn't been called yet (cache miss)
+          - the cached profile has an empty form array (vendor returned
+            no recent matches for this player)
+        Callers (selection scoring) treat None as "no form signal" and
+        skip the form-alignment adjustment, falling back to the
+        points-ratio base score.
+
+        Form string is uppercased and capped at the last 10 entries
+        for consistency with the renderer's prompt-time form string —
+        same `"WWLWWLWWWL"` shape both layers consume.
+        """
+        hit = self._resolve(tour, name)
+        if hit is None:
+            return None
+        pid = hit[0]
+        cached = self._profile_cache.get((tour, pid))
+        if cached is None:
+            return None
+        form_arr, best_rank, _age, _plays = cached
+        if not form_arr:
+            return None
+        tail = form_arr[-10:]
+        form_str = "".join(c.upper() for c in tail if c in ("w", "l"))
+        if not form_str:
+            return None
+        return form_str, best_rank
+
     # ----- Per-player fetches -----
 
     async def _player_profile(
@@ -418,21 +518,37 @@ class MatchStatTennisProvider:
     ) -> tuple[list[str], int | None, int | None, str | None]:
         """Returns (form_array, best_rank, age_years, plays).
 
-        Single profile call with `include=form,ranking,information` covers
-        four needs: the recent W/L array, career-high ranking
+        Cache-then-fetch: results land in `self._profile_cache` keyed by
+        `(tour, pid)`. The selection-stage form warmup
+        (`warm_form_for_selection`) and the per-event enrichment path
+        (`_player_stats`) both call this method, so the cache turns
+        what would be 2× duplicate HTTP per surviving event into one.
+        Cache is provider-lifetime — a fresh `async with` block (one
+        per pipeline run) gets a fresh cache, which is desirable: form
+        data should not survive across runs.
+
+        Single profile call with `include=form,ranking,information`
+        covers four needs: the recent W/L array, career-high ranking
         (`bestRank.position`), birthdate (under `information.birthdate`,
         used to compute current age), and `information.plays`
         (handedness + backhand style). All free on the same response;
         no extra HTTP. The vendor ships `form` oldest → newest; we pass
         it through unchanged.
         """
+        cached = self._profile_cache.get((tour, pid))
+        if cached is not None:
+            return cached
         body = await self._get(
             f"/tennis/v2/{tour}/player/profile/{pid}",
             params={"include": "form,ranking,information"},
         )
         data = body.get("data") if isinstance(body, dict) else None
         if not isinstance(data, dict):
-            return [], None, None, None
+            empty: tuple[list[str], int | None, int | None, str | None] = (
+                [], None, None, None,
+            )
+            self._profile_cache[(tour, pid)] = empty
+            return empty
         form = data.get("form") or []
         if not isinstance(form, list):
             form = []
@@ -450,12 +566,14 @@ class MatchStatTennisProvider:
             raw_plays = info.get("plays")
             if isinstance(raw_plays, str) and raw_plays.strip():
                 plays = raw_plays.strip()
-        return (
+        result: tuple[list[str], int | None, int | None, str | None] = (
             [str(x) for x in form if isinstance(x, str)],
             best_rank,
             age_years,
             plays,
         )
+        self._profile_cache[(tour, pid)] = result
+        return result
 
     async def _player_recent_matches(
         self, tour: str, pid: int, name: str

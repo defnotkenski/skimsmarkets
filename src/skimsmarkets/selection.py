@@ -67,6 +67,25 @@ log = logging.getLogger(__name__)
 # ceiling.
 _TENNIS_POINTS_RATIO_CAP = 10.0
 
+# Form-alignment adjustment cap. When both players have a populated form
+# string from the matchstat profile cache, we add a signed bump to the
+# points-ratio base score equal to `cap × (high_points_form_wp -
+# low_points_form_wp)`. The `_FORM_ADJUSTMENT_CAP` value bounds the
+# adjustment in `[-cap, +cap]`. 0.2 is the starting value: it keeps
+# points-ratio as the dominant signal (a 10× points gap saturates at
+# 1.0; a perfect form contradiction can only pull that down to 0.8) but
+# lets form move the needle on close calls (events scoring 0.20-0.35 in
+# points-only mode are exactly the ones where form should sway things).
+_FORM_ADJUSTMENT_CAP = 0.2
+
+# Minimum form sample size before the adjustment fires. A 3-of-3 form
+# string is too noisy to read as confirmation/contradiction; we want at
+# least a half-decent sample. 5 matches is the floor — most active
+# tour players ship 10+ entries on a profile call, so this only filters
+# out genuinely thin records (recent debutants, returning-from-injury
+# players with one match logged).
+_MIN_FORM_SAMPLES = 5
+
 
 def _parse_team_record(record: str) -> tuple[int, int, int] | None:
     """Parse `"W-L"` or `"W-L-T"` into `(wins, losses, ties)`.
@@ -152,7 +171,7 @@ def _team_record_imbalance(event: PolymarketEvent) -> float | None:
 def _tennis_imbalance(
     event: PolymarketEvent, provider: TennisStatsProvider
 ) -> float | None:
-    """Log-points-ratio imbalance for a tennis event.
+    """Tennis imbalance score: points-ratio base, form-alignment adjustment.
 
     Decision tree mirrors the enrichment gate (`tennis_match_identity`):
       - Sport must be tennis with an ATP/WTA slug prefix.
@@ -161,14 +180,28 @@ def _tennis_imbalance(
         `(position, points)`.
     Any miss returns None and the caller falls back to other signals.
 
-    Score: `log10(max_points / min_points) / log10(cap)` clipped to
-    [0, 1]. Points ratio is the right scale because ATP/WTA points
+    Base score: `log10(max_points / min_points) / log10(cap)` clipped
+    to [0, 1]. Points ratio is the right scale because ATP/WTA points
     are roughly proportional to "tour-level wins weighted by tier" —
     a 2× points ratio is meaningfully lopsided regardless of which
     region of the rankings the players sit in (Sinner 14k vs Alcaraz
     13k is *not* lopsided despite being ranks 1 vs 2; Player-100
     1500pts vs Player-200 750pts *is* lopsided despite the players
     being merely "two journeymen").
+
+    Form adjustment (when both players have a cached form string with
+    ≥ `_MIN_FORM_SAMPLES` entries): compute each player's win-pct over
+    the last 10 matches, sign the gap by which player has more points,
+    and add `_FORM_ADJUSTMENT_CAP × (high_points_form_wp -
+    low_points_form_wp)` to the base score. Positive when form
+    confirms the points lead (favourite is also playing well → matchup
+    is even more lopsided than points alone); negative when form
+    contradicts (favourite is cold while the underdog is hot → matchup
+    is closer than points suggest). The cap keeps points dominant —
+    a 10× points gap saturates at 1.0 and can only be pulled down to
+    0.8 by a perfect form contradiction. Form data missing on either
+    side OR sample sizes below the floor → fall through to base score
+    unchanged (graceful degrade; never abort scoring on a vendor hiccup).
     """
     identity = tennis_match_identity(event)
     if identity is None:
@@ -182,7 +215,34 @@ def _tennis_imbalance(
     if points_a <= 0 or points_b <= 0:
         return None
     ratio = max(points_a, points_b) / min(points_a, points_b)
-    return min(1.0, math.log10(ratio) / math.log10(_TENNIS_POINTS_RATIO_CAP))
+    base_score = min(
+        1.0, math.log10(ratio) / math.log10(_TENNIS_POINTS_RATIO_CAP)
+    )
+
+    # Form-alignment adjustment. Skip silently when either side's form
+    # data is unavailable — base_score is already a defensible signal
+    # and asymmetric form data would be misleading.
+    a_form = provider.lookup_player_form(identity.tour, identity.player_a)
+    b_form = provider.lookup_player_form(identity.tour, identity.player_b)
+    if a_form is None or b_form is None:
+        return base_score
+    a_form_str, _a_best = a_form
+    b_form_str, _b_best = b_form
+    if (
+        len(a_form_str) < _MIN_FORM_SAMPLES
+        or len(b_form_str) < _MIN_FORM_SAMPLES
+    ):
+        return base_score
+    a_wp = a_form_str.count("W") / len(a_form_str)
+    b_wp = b_form_str.count("W") / len(b_form_str)
+    # Sign by which player has more points: alignment is positive when
+    # the higher-points player also has the better form.
+    if points_a >= points_b:
+        high_wp, low_wp = a_wp, b_wp
+    else:
+        high_wp, low_wp = b_wp, a_wp
+    adjustment = _FORM_ADJUSTMENT_CAP * (high_wp - low_wp)
+    return max(0.0, min(1.0, base_score + adjustment))
 
 
 def imbalance_score(
@@ -261,12 +321,22 @@ async def select_top_events(
     # Warm tennis index for every tour present in the slate. Stub
     # provider no-ops; no key configured = no warmup cost.
     tennis_tours: set[str] = set()
+    tennis_identities: list = []
     for ev in events:
         ident = tennis_match_identity(ev)
         if ident is not None:
             tennis_tours.add(ident.tour)
+            tennis_identities.append(ident)
     if tennis_tours:
         await tennis_provider.warm_for_selection(tennis_tours)
+        # Form warmup runs AFTER the rank index is warm because
+        # `warm_form_for_selection` resolves names via the index to
+        # find player IDs. The warm calls share `self._profile_cache`
+        # with the downstream `enrich_tennis_stats` pass — every
+        # event that survives the cap reuses these profile responses
+        # for free.
+        if tennis_identities:
+            await tennis_provider.warm_form_for_selection(tennis_identities)
 
     scored = [
         (ev, imbalance_score(ev, tennis_provider), _earliest_tipoff(ev))

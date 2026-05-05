@@ -78,6 +78,33 @@ class TennisStatsProvider(Protocol):
         """
         ...
 
+    async def warm_form_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        """Pre-fetch player profile (form + best_rank) for each player
+        named in `identities`. Selection scoring uses
+        `lookup_player_form` afterwards as a synchronous cache hit.
+
+        Idempotent — players already cached skip re-fetching. Real
+        adapters fan out one HTTP per unique (tour, player) pair under
+        their own concurrency cap; stubs no-op.
+        """
+        ...
+
+    def lookup_player_form(
+        self, tour: str, name: str
+    ) -> tuple[str, int | None] | None:
+        """Synchronous lookup of `(last_10_form_string, best_rank)`
+        from the warmed profile cache.
+
+        Returns None when the form data isn't available — either the
+        player wasn't in the rankings index, `warm_form_for_selection`
+        wasn't called for their identity, or the vendor returned no
+        recent matches. Selection callers treat None as "no form
+        signal" and skip the alignment adjustment.
+        """
+        ...
+
     async def __aenter__(self) -> Self: ...
 
     async def __aexit__(
@@ -122,6 +149,20 @@ class StubTennisStatsProvider:
     def lookup_player_rank(
         self, tour: str, name: str
     ) -> tuple[int, int] | None:
+        return None
+
+    async def warm_form_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        # No backing cache — selection scoring will see None for every
+        # `lookup_player_form` and fall back to the points-only base
+        # score. Iterate for signature symmetry.
+        for _ in identities:
+            pass
+
+    def lookup_player_form(
+        self, tour: str, name: str
+    ) -> tuple[str, int | None] | None:
         return None
 
     async def __aenter__(self) -> Self:
