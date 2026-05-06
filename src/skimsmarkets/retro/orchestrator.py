@@ -24,7 +24,6 @@ from skimsmarkets.retro.calibrate import (
     aggregate,
     collect_features,
     render_report,
-    write_report,
 )
 from skimsmarkets.retro.features import extract_features
 from skimsmarkets.retro.jsonl import (
@@ -117,9 +116,18 @@ def _features_with_post_match(
 
 
 def run_step_calibrate(
-    run_id: str | None = None, retro_id: str | None = None
-) -> tuple[CalibrateReport, Path]:
-    """Step 2 — print + write hit-rate tables. Returns (report, json_path).
+    run_id: str | None = None,
+) -> CalibrateReport:
+    """Step 2 — print hit-rate tables to stdout. Returns the report.
+
+    Intentionally does NOT persist anything to disk: the terminal
+    output is the artefact, and `--step all` folds the tables into
+    the combined `report.md`. A previous version wrote a per-call
+    `<retro_id>.calibrate.json` sidecar; the operator asked for it
+    to be dropped because it cluttered `logs/retro/` without adding
+    information not already in the markdown digest. If a
+    machine-readable form is needed later, re-add `write_json=True`
+    here and a `--write-json` flag on the CLI.
 
     Uses the same `collect_features` path Step 3 shares — keeps the
     feature-extraction definition single-source-of-truth.
@@ -131,11 +139,7 @@ def run_step_calibrate(
     )
     report = aggregate(feats)
     render_report(report)
-    rid = retro_id or _retro_id()
-    out_path = _retro_root() / f"{rid}.calibrate.json"
-    write_report(report, out_path)
-    log.info("retro calibrate written to %s", out_path)
-    return report, out_path
+    return report
 
 
 async def run_step_analyze(
@@ -143,14 +147,19 @@ async def run_step_analyze(
     sports_filter: set[str] | None = None,
     run_id: str | None = None,
     retro_id: str | None = None,
-) -> tuple[dict[str, RetroFindings], Path]:
+    write_json: bool = True,
+) -> tuple[dict[str, RetroFindings], Path | None]:
     """Step 3 — fetch post-match stats + run LLM pattern call per sport.
 
-    Returns `(findings_by_sport, json_path)`. Calibration is also
-    re-aggregated internally with post-match-enriched features so the
-    Step 3 LLM call sees divergence columns; the JSON output for
-    Step 2 still uses non-post-match features (they're the same
-    numbers — divergence doesn't change hit-rate cuts).
+    Returns `(findings_by_sport, json_path)` where `json_path` is None
+    when `write_json=False` (same `--step all` rationale as
+    `run_step_calibrate`).
+
+    Calibration is also re-aggregated internally with post-match-
+    enriched features so the Step 3 LLM call sees divergence columns;
+    the JSON output for Step 2 still uses non-post-match features
+    (they're the same numbers — divergence doesn't change hit-rate
+    cuts).
     """
     config = cfg.Config.from_env()
     async with build_tennis_provider(config) as provider:
@@ -162,6 +171,8 @@ async def run_step_analyze(
     anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
     findings = await analyze_all_sports(anthropic, feats, sports_filter)
 
+    if not write_json:
+        return findings, None
     rid = retro_id or _retro_id()
     out_path = _retro_root() / f"{rid}.findings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,12 +193,21 @@ async def run_step_all(
     """Steps 1 → 2 → 3, then write the combined `report.md`.
 
     Returns the report.md path so the CLI can print "open this file".
+    Intentionally suppresses the per-step JSON sidecars
+    (`<retro_id>.calibrate.json`, `<retro_id>.findings.json`) — the
+    combined `report.md` is the only artefact `--step all` produces,
+    keeping `logs/retro/` uncluttered for the most common invocation.
+    Operators who want the machine-readable JSON can run the steps
+    individually (`--step calibrate` / `--step analyze`).
     """
     rid = _retro_id()
     await run_step_resolve(run_id)
-    calibrate_report, _ = run_step_calibrate(run_id=run_id, retro_id=rid)
+    calibrate_report = run_step_calibrate(run_id=run_id)
     findings, _ = await run_step_analyze(
-        sports_filter=sports_filter, run_id=run_id, retro_id=rid,
+        sports_filter=sports_filter,
+        run_id=run_id,
+        retro_id=rid,
+        write_json=False,
     )
     md_path = _retro_root() / f"{rid}.report.md"
     write_md_report(md_path, calibrate_report, findings)

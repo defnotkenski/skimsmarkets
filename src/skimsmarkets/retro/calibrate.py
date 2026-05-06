@@ -11,11 +11,9 @@ for hit-rate questions. Per-sport breakdown plus an overall aggregate.
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
@@ -295,6 +293,3 @@ def render_report(report: CalibrateReport) -> None:
             console.print()
 
 
-def write_report(report: CalibrateReport, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report.to_dict(), indent=2))
