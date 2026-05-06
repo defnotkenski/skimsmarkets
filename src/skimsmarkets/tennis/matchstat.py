@@ -75,6 +75,7 @@ import httpx
 
 from skimsmarkets.tennis.identity import TennisMatchIdentity
 from skimsmarkets.tennis.models import (
+    PerMatchStats,
     TennisH2HMeeting,
     TennisHeadToHead,
     TennisInMatchupStats,
@@ -230,6 +231,60 @@ def _tier_from_rank_id(rid: Any) -> str | None:
     if n is None:
         return None
     return _RANK_ID_TO_TIER.get(n)
+
+
+def _safe_pct(numerator: Any, denominator: Any) -> float | None:
+    """Vendor ships fraction pairs like (47, 65) → 0.7231. None when the
+    denominator is missing, zero, or unparseable. Used by `PerMatchStats`
+    construction to convert vendor counters into ratios that line up
+    field-for-field with the career-baseline percentages on
+    `TennisPlayerStats`.
+    """
+    n = _coerce_int(numerator)
+    d = _coerce_int(denominator)
+    if n is None or d is None or d == 0:
+        return None
+    return n / d
+
+
+def _parse_match_stats_block(
+    row: dict[str, Any], subject_player_id: int
+) -> PerMatchStats | None:
+    """Build `PerMatchStats` from a single past-matches row's `stats` block.
+
+    The vendor structures `stats` as `{player1: {...}, player2: {...}}`
+    keyed by side, NOT by player id — so we read whichever side
+    corresponds to the subject (matched against `player1Id` on the row).
+    Returns None when the row carries no `stats` block (live-suspended
+    matches, walkovers, very old matches the vendor ingested without
+    box scores).
+    """
+    stats = row.get("stats")
+    if not isinstance(stats, dict):
+        return None
+    p1_id = _coerce_int(row.get("player1Id"))
+    is_subject_p1 = p1_id == subject_player_id
+    side = stats.get("player1" if is_subject_p1 else "player2")
+    if not isinstance(side, dict):
+        return None
+    return PerMatchStats(
+        first_serve_in_pct=_safe_pct(
+            side.get("firstServe"), side.get("firstServeOf")
+        ),
+        first_serve_win_pct=_safe_pct(
+            side.get("winningOnFirstServe"), side.get("winningOnFirstServeOf")
+        ),
+        second_serve_win_pct=_safe_pct(
+            side.get("winningOnSecondServe"), side.get("winningOnSecondServeOf")
+        ),
+        break_point_convert_pct=_safe_pct(
+            side.get("breakPointsConverted"),
+            side.get("breakPointsConvertedOf"),
+        ),
+        aces=_coerce_int(side.get("aces")),
+        double_faults=_coerce_int(side.get("doubleFaults")),
+        total_points_won=_coerce_int(side.get("totalPointsWon")),
+    )
 
 
 class _TokenBucket:
@@ -752,6 +807,97 @@ class MatchStatTennisProvider:
         # silent reordering bug if the IDs ever flip.
         del name
         return last_date, out
+
+    async def fetch_post_match_stats(
+        self,
+        tour: str,
+        player_id: int,
+        on_date: date,
+        opponent_name: str,
+    ) -> PerMatchStats | None:
+        """Pull box-score stats for one completed match (retro-only path).
+
+        Same `past-matches` endpoint the live pipeline already calls for
+        the recent-matches digest, but with `include=stat` so the vendor
+        attaches the per-match `stats.player1` / `stats.player2` block.
+        We pull one extra include relation here rather than mutating the
+        live `_MATCH_INCLUDE` constant: pre-match calls don't need the
+        stat payload (those rows are pre-event by definition) and
+        broadening the live include bloats every per-event response for
+        no live benefit.
+
+        Match-row identification: `on_date` (UTC date the match was
+        played) plus the opponent name. `opponent_name` is matched
+        case-insensitively after diacritic-stripping (vendor preserves
+        accents that gamma sometimes drops). Date match alone is the
+        fallback for the rare day where a player only has one match
+        — names from gamma occasionally differ enough from the vendor's
+        canonical form that even normalisation misses (different
+        transliteration). When multiple rows share the date and no
+        name match lands, we log and return None rather than guess.
+
+        Returns None on:
+          - vendor 404 / network failure (per `_get` posture)
+          - no row matching `on_date` (match not yet ingested by vendor;
+            common for very recent results)
+          - row found but `stats` block missing or empty (live-suspended
+            matches, walkovers)
+          - division by zero on every percentage (extremely rare —
+            vendor ships zero counts for both numerator and denominator
+            on aborted matches)
+
+        pageSize=20 covers ~3 weeks of typical tour activity, which is
+        plenty for retro fetches (we're always hitting matches that
+        are at most a few weeks old, before the operator runs the
+        retro analysis).
+        """
+        body = await self._get(
+            f"/tennis/v2/{tour}/player/past-matches/{player_id}",
+            params={"pageSize": 20, "include": "stat,tournament,round"},
+        )
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        target_opponent = _normalize_name(opponent_name)
+        # Pass 1: exact (date AND opponent-name) match. The desired
+        # outcome on every well-formed retro fetch.
+        date_matches: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_date = _parse_iso_date(row.get("date"))
+            if row_date != on_date:
+                continue
+            date_matches.append(row)
+            # Pull opponent name from whichever side ISN'T this player.
+            p1_id = _coerce_int(row.get("player1Id"))
+            opp_block = (
+                row.get("player2") if p1_id == player_id else row.get("player1")
+            )
+            if not isinstance(opp_block, dict):
+                continue
+            vendor_opp = opp_block.get("name")
+            if not isinstance(vendor_opp, str):
+                continue
+            if _normalize_name(vendor_opp) == target_opponent:
+                return _parse_match_stats_block(row, player_id)
+
+        # Pass 2: name didn't match but exactly one row shares the date.
+        # Vendor occasionally ships a transliteration we can't normalise
+        # (e.g. "Mensik" vs "Menšík" with non-trivial diacritic shape).
+        # Date alone is unique enough on a single player's match history
+        # at single-day granularity — players rarely play two matches
+        # on the same calendar day at tour level.
+        if len(date_matches) == 1:
+            return _parse_match_stats_block(date_matches[0], player_id)
+        if len(date_matches) > 1:
+            log.warning(
+                "matchstat post-match: %d rows on %s for player_id=%d, "
+                "no opponent-name match against %r — declining to guess",
+                len(date_matches), on_date.isoformat(), player_id, opponent_name,
+            )
+        return None
 
     async def _player_tier_records(
         self, tour: str, pid: int

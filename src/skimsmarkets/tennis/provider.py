@@ -25,8 +25,10 @@ from types import TracebackType
 from typing import Protocol, Self
 
 from skimsmarkets import config as cfg
+from datetime import date
+
 from skimsmarkets.tennis.identity import TennisMatchIdentity
-from skimsmarkets.tennis.models import TennisStatsContext
+from skimsmarkets.tennis.models import PerMatchStats, TennisStatsContext
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +107,26 @@ class TennisStatsProvider(Protocol):
         """
         ...
 
+    async def fetch_post_match_stats(
+        self,
+        tour: str,
+        player_id: int,
+        on_date: date,
+        opponent_name: str,
+    ) -> PerMatchStats | None:
+        """Pull per-match box-score stats for a single completed match.
+
+        Used by the retro / self-improvement layer (NOT the live pipeline)
+        to fetch the actual first-serve %, BP convert %, etc. that a
+        player produced on a specific date — for comparison against the
+        career baseline that was on `TennisPlayerStats` at prediction
+        time. Match-row identification: `on_date` plus opponent name
+        (case-insensitive, diacritic-stripped). Returns None when the
+        vendor has no row for that date or the row's stats block is
+        empty (live-suspended / walkover).
+        """
+        ...
+
     async def __aenter__(self) -> Self: ...
 
     async def __aexit__(
@@ -163,6 +185,15 @@ class StubTennisStatsProvider:
     def lookup_player_form(
         self, tour: str, name: str
     ) -> tuple[str, int | None] | None:
+        return None
+
+    async def fetch_post_match_stats(
+        self,
+        tour: str,
+        player_id: int,
+        on_date: date,
+        opponent_name: str,
+    ) -> PerMatchStats | None:
         return None
 
     async def __aenter__(self) -> Self:

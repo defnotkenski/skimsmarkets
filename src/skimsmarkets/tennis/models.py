@@ -270,6 +270,48 @@ class TennisPlayerStats(BaseModel):
         return _coerce_date(v)
 
 
+class PerMatchStats(BaseModel):
+    """Single-match box score for one player.
+
+    Sourced from MatchStat's `past-matches?include=stat,tournament,round`
+    response (the `stats.player1` / `stats.player2` blocks). Fetched by
+    the retro/self-improvement layer AFTER an event resolves, to compare
+    what the player ACTUALLY did that day against the career-baseline
+    `TennisPlayerStats` snapshot taken at prediction time. Pre-match
+    `tennis_stats` carries career means; this carries the single-match
+    realisation. Divergence between the two answers "did the player play
+    to baseline or did they over/underperform, and did our lenses see
+    any reason to expect that?"
+
+    Vendor ships fraction pairs (e.g. `winningOnFirstServe=47`,
+    `winningOnFirstServeOf=65`); we divide upfront and store ratios in
+    [0,1] for direct comparison with `TennisPlayerStats` fields. None
+    when the denominator was zero or null on the vendor row — common on
+    live-suspended matches and walkovers, never on completed matches in
+    practice.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Per-player percentages — same shape as the corresponding career
+    # baseline fields on `TennisPlayerStats`. Direct subtraction yields
+    # divergence in points (e.g. baseline 0.65 - actual 0.51 = 0.14
+    # underperformance on first-serve win %).
+    first_serve_in_pct: float | None = None
+    first_serve_win_pct: float | None = None
+    second_serve_win_pct: float | None = None
+    break_point_convert_pct: float | None = None
+    # Counts the vendor exposes that don't have a per-match denominator
+    # to convert into a ratio. Useful for the retro feature row even at
+    # raw count granularity (a 13-ace match vs 1-ace match is signal
+    # regardless of total points played). Aces / DFs are sometimes null
+    # on the vendor row for old matches; total points is always present
+    # on completed matches.
+    aces: int | None = None
+    double_faults: int | None = None
+    total_points_won: int | None = None
+
+
 class TennisHeadToHead(BaseModel):
     """Head-to-head history between the two players in this match.
 

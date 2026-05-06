@@ -150,6 +150,50 @@ async def _cmd_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_retro(args: argparse.Namespace) -> int:
+    """Self-improvement layer — read past JSONL run logs, resolve outcomes
+    against gamma, compute hit-rate cuts, and (Step 3) run a batched
+    LLM pattern call comparing wins vs losses.
+
+    Three steps; all three run by default. Outputs land in `logs/retro/`.
+    `--run-id` narrows to a single run log; without it every log under
+    `logs/runs/` is processed (resolution sidecars are idempotent so
+    reruns are cheap).
+
+    `--sport` filters the Step 3 LLM call only — Steps 1 & 2 always
+    cover everything in scope. Repeatable.
+    """
+    from skimsmarkets.retro.orchestrator import (
+        run_step_all,
+        run_step_analyze,
+        run_step_calibrate,
+        run_step_resolve,
+    )
+
+    sports_filter: set[str] | None = (
+        set(args.sport) if args.sport else None
+    )
+    if args.step == "resolve":
+        paths = await run_step_resolve(args.run_id)
+        print(f"wrote {len(paths)} resolution sidecar(s)")
+        return 0
+    if args.step == "calibrate":
+        run_step_calibrate(run_id=args.run_id)
+        return 0
+    if args.step == "analyze":
+        findings, path = await run_step_analyze(
+            sports_filter=sports_filter, run_id=args.run_id,
+        )
+        print(f"wrote findings for {len(findings)} sport(s) to {path}")
+        return 0
+    # default: all
+    md_path = await run_step_all(
+        sports_filter=sports_filter, run_id=args.run_id,
+    )
+    print(f"retro report: {md_path}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
@@ -159,7 +203,7 @@ async def _cmd_backtest(args: argparse.Namespace) -> int:
 # user invoked `skims` with bare slate flags (no subcommand) so we can default
 # to `rank`. Kept as a module-level constant so the default-injection in
 # `main()` and the subparser registration stay in sync.
-_SUBCOMMANDS = ("rank", "fetch", "backtest")
+_SUBCOMMANDS = ("rank", "fetch", "backtest", "retro")
 
 
 def _build_slate_parser() -> argparse.ArgumentParser:
@@ -223,7 +267,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     slate = _build_slate_parser()
-    sub = parser.add_subparsers(dest="command", metavar="{rank,fetch,backtest}")
+    sub = parser.add_subparsers(
+        dest="command", metavar="{rank,fetch,backtest,retro}"
+    )
 
     p_rank = sub.add_parser(
         "rank",
@@ -255,6 +301,47 @@ def _build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
 
+    p_retro = sub.add_parser(
+        "retro",
+        help=(
+            "Retro / self-improvement: resolve past predictions against "
+            "gamma, compute hit-rate cuts, and run an LLM pattern call."
+        ),
+    )
+    p_retro.add_argument(
+        "--step",
+        choices=("resolve", "calibrate", "analyze", "all"),
+        default="all",
+        help=(
+            "Which step to run. `all` (default) runs Step 1 → 2 → 3 in "
+            "sequence and writes a combined report.md. `resolve` only "
+            "writes the gamma-resolution sidecars (cheap, no LLM)."
+        ),
+    )
+    p_retro.add_argument(
+        "--run-id",
+        default=None,
+        metavar="RUN_ID",
+        help=(
+            "Operate on a single run log (e.g. `8f55201f`). When omitted, "
+            "every log under logs/runs/ is processed."
+        ),
+    )
+    p_retro.add_argument(
+        "--sport",
+        action="append",
+        default=[],
+        metavar="SPORT",
+        help=(
+            "Filter the Step 3 LLM call to one or more sport types "
+            "(e.g. `--sport tennis`). Repeatable. Steps 1 & 2 are NOT "
+            "filtered — they always cover everything resolved."
+        ),
+    )
+    p_retro.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+
     return parser
 
 
@@ -282,6 +369,7 @@ def main() -> int:
         "rank": _cmd_rank,
         "fetch": _cmd_fetch,
         "backtest": _cmd_backtest,
+        "retro": _cmd_retro,
     }
     return asyncio.run(dispatch[args.command](args))
 
