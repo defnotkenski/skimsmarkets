@@ -70,11 +70,14 @@ TENNIS_STATS_FETCH_SEM = 8
 CLOB_HISTORY_ENABLED = True
 
 
-# Valid `fetcher_provider` values. Kept as a tuple so misspellings on the CLI
-# or in env get caught with a clean error rather than failing later in
-# `build_provider`. Add new providers here when they ship.
+# Per-lens fetcher provider. Source of truth — flip the constant in
+# source rather than via env, so the setting is visible in code review
+# and easily greppable (same posture as `CLOB_HISTORY_ENABLED` above).
+# Validated against `FETCHER_PROVIDERS` at startup so a typo here fails
+# loudly rather than later in `build_provider`. Add new providers to the
+# tuple when they ship.
 FETCHER_PROVIDERS: tuple[str, ...] = ("grok", "gemini")
-DEFAULT_FETCHER_PROVIDER = "grok"
+FETCHER_PROVIDER = "gemini"
 
 
 @dataclass(frozen=True)
@@ -84,7 +87,7 @@ class Config:
     # need GOOGLE_API_KEY (and vice versa). Anthropic is always required —
     # reasoner / director / judge all use it regardless of fetcher choice.
     anthropic_api_key: str
-    fetcher_provider: str = DEFAULT_FETCHER_PROVIDER
+    fetcher_provider: str = FETCHER_PROVIDER
     xai_api_key: str | None = None
     google_api_key: str | None = None
     # Optional — UW enrichment is a nice-to-have, not a hard dependency. When
@@ -105,23 +108,19 @@ class Config:
     @classmethod
     def from_env(
         cls,
-        fetcher_provider: str | None = None,
         *,
         tennis_stats_disabled: bool = False,
     ) -> "Config":
         # Reads .env from the current directory (and parents) if present. Does not
         # override vars that are already set in the shell, so explicit exports win.
-        # `fetcher_provider` arg lets the CLI flag win over the env var without
-        # mutating the environment.
+        # `fetcher_provider` is hand-edited in this file's `FETCHER_PROVIDER`
+        # constant — there is no env var or CLI override. Validated here so a
+        # typo in the constant fails loudly at startup.
         load_dotenv()
-        provider = (
-            fetcher_provider
-            or os.environ.get("FETCHER_PROVIDER", "").strip()
-            or DEFAULT_FETCHER_PROVIDER
-        )
+        provider = FETCHER_PROVIDER
         if provider not in FETCHER_PROVIDERS:
             raise RuntimeError(
-                f"Unknown fetcher_provider {provider!r}. "
+                f"Unknown FETCHER_PROVIDER {provider!r} in config.py. "
                 f"Valid: {', '.join(FETCHER_PROVIDERS)}."
             )
         xai = os.environ.get("XAI_API_KEY", "").strip() or None

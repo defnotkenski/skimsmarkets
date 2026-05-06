@@ -454,6 +454,37 @@ probability per the cross-sport calibration discipline above (defer to
 market when evidence is weak; commit to the read when it's strong;
 material deviation must be justified in `reasoning`).
 
+Career-baseline Monte Carlo prior (when present): the per-event
+context block may carry a `--- Tennis match simulator ---` block with
+`p(team_a wins)` plus a 95% sampling CI. This is a SECOND deterministic
+prior alongside Polymarket, computed from career serve/return
+percentages alone (no surface, form, H2H, or conditions adjustment).
+Use it as a sanity check on the synthesized read:
+- The sim represents the LONG-RUN BASELINE — what the matchup would
+  look like with neutral context across many career encounters.
+- The lens-shift signals (form_signed_shift, surface_signed_shift,
+  h2h_signed_shift, clutch_signed_shift, physical_signed_shift,
+  stakes_signed_shift) ARE the contextual delta on top of that
+  baseline. If team_a_p_final ≈ sim's `p_team_a_wins`, the
+  contextual signals netted to roughly zero — fine, no anomaly.
+- If team_a_p_final deviates from the sim by ≥1000 bps (10pp),
+  `reasoning` MUST name WHICH lens-shift signals justify the
+  deviation. Same discipline as for material market deviation.
+- Sim DISAGREES with market: sim is a long-run prior, market is
+  current sentiment. A gap between them is itself information — the
+  market may be reading a contextual factor the sim ignores by
+  design (form, conditions, withdrawal news), or the market may be
+  thin/inefficient on a low-volume tennis event. Use the lens
+  reports to triangulate which.
+- The sim's CI is SAMPLING uncertainty only (10k Monte Carlo trials).
+  It does NOT capture model uncertainty (the iid assumption being
+  imperfect, career averages not reflecting current form, etc.).
+  Don't treat a tight [0.55, 0.59] CI as "the answer is in this
+  range" — it's the sampling band on a deliberately-limited model.
+- If no sim block is present, the player-data gate failed. Synthesize
+  from lens reports + market alone — same posture as before this
+  enrichment shipped.
+
 Per-lens weighting heuristics (for `specialist_weights`):
 - Most ATP/WTA singles matches: form_and_surface dominates (~0.40-0.50),
   matchup_and_clutch supports (~0.25-0.35), conditions_and_context fills

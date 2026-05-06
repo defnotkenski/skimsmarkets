@@ -17,7 +17,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skimsmarkets.clob import invert_sparkline as _invert_sparkline
-from skimsmarkets.tennis.models import TennisStatsContext
+from skimsmarkets.tennis.models import TennisSimulationContext, TennisStatsContext
 from skimsmarkets.unusual_whales.models import UnusualWhalesContext
 
 
@@ -623,11 +623,20 @@ class PolymarketEvent(BaseModel):
     # Attached post-validation by `enrich_tennis_stats()` for ATP/WTA singles
     # head-to-heads when a `TennisStatsProvider` returns an actionable
     # context. Always None for non-tennis events, doubles markets, and
-    # whenever the provider had no record / failed. Consumed only by the
-    # `tennis_form_and_surface` fetcher / reasoner — director and other
-    # lenses don't see it (lens-silo posture; see CLAUDE.md and the
-    # tennis package docstring).
+    # whenever the provider had no record / failed. Consumed by the
+    # `tennis_form_and_surface` fetcher/reasoner (full block) and the
+    # `tennis_conditions_and_context` fetcher/reasoner (narrow fatigue
+    # slice). Director sees neither — see CLAUDE.md and the tennis
+    # package docstring for the silo posture.
     tennis_stats: TennisStatsContext | None = None
+    # Attached post-validation by `enrich_tennis_simulation()` after
+    # `enrich_tennis_stats` populates the player career serve/return
+    # primitives this depends on. Director-only (same posture as
+    # `uw_context`) — a long-run statistical baseline lenses shouldn't
+    # second-guess at the lens layer. Always None for non-tennis events,
+    # tennis events without populated career serve/return % on both
+    # players, and whenever the gate failed.
+    tennis_simulation: TennisSimulationContext | None = None
 
     @field_validator("id", mode="before")
     @classmethod

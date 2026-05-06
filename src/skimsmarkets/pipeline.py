@@ -33,12 +33,13 @@ from skimsmarkets.clob import (
 )
 from skimsmarkets.polymarket.models import PolymarketEvent
 from skimsmarkets.selection import select_top_events
-from skimsmarkets.tennis import TennisStatsContext
+from skimsmarkets.tennis import TennisSimulationContext, TennisStatsContext
 from skimsmarkets.tennis.identity import tennis_match_identity
 from skimsmarkets.tennis.provider import (
     TennisStatsProvider,
     build_tennis_provider,
 )
+from skimsmarkets.tennis.simulation import simulate_for_event
 from skimsmarkets.unusual_whales import (
     GammaTokenResolver,
     UnusualWhalesClient,
@@ -95,6 +96,15 @@ class RunResult:
     # the API have the right facts?" separately from "did the fetcher
     # use them?".
     tennis_stats: dict[str, TennisStatsContext] = field(default_factory=dict)
+    # Per-event Monte Carlo simulation result, keyed event_id →
+    # TennisSimulationContext. Populated in `enrich_tennis_simulation`
+    # after `enrich_tennis_stats` ships the inputs. Director-only — the
+    # same persistence posture as `tennis_stats` so retro grading can
+    # ask "did the sim track the market or the director better in
+    # hindsight?" as a separate question from the director's read.
+    tennis_simulation: dict[str, TennisSimulationContext] = field(
+        default_factory=dict
+    )
     # Slate-level judge output keyed event_id → DefensibilityAssessment.
     # Populated by `judge_slate` after all per-event directors finish; left
     # empty when the judge call fails (leaderboard then falls back to the
@@ -749,6 +759,63 @@ async def enrich_tennis_stats(
     )
 
 
+def enrich_tennis_simulation(
+    events: list[PolymarketEvent],
+    errors: list[ErrorRecord],
+) -> None:
+    """Attach `event.tennis_simulation` for tennis events whose
+    `tennis_stats` carries the career serve/return primitives the sim
+    needs.
+
+    Pure-CPU work: the sim runs against data already on the event
+    (no HTTP, no semaphore). Sub-second per event for the default
+    10k-trial count, so there's no need to fan out concurrently —
+    a simple sync loop keeps the pipeline ordering predictable.
+    Failure at the per-event scope records an
+    `ErrorRecord(stage="tennis_simulation")` and leaves
+    `tennis_simulation=None` on that event; the run continues with
+    other events unaffected. Same fail-silent posture as the
+    enrichment stages above.
+
+    Director-only by design — see CLAUDE.md and
+    `TennisSimulationContext` docstring. Lenses don't see this
+    attachment.
+    """
+    if not events:
+        return
+    attached = 0
+    for event in events:
+        if event.tennis_stats is None:
+            # Not a tennis event with vendor data, or vendor returned
+            # empty — sim has nothing to compute against.
+            continue
+        try:
+            ctx = simulate_for_event(event.tennis_stats, slug=event.slug)
+        except Exception as e:  # noqa: BLE001
+            errors.append(
+                ErrorRecord(
+                    event_id=event.id,
+                    stage="tennis_simulation",
+                    error=f"{type(e).__name__}: {e}",
+                    sport_type=event.sport_type,
+                )
+            )
+            log.warning(
+                "tennis_simulation failed for %s: %s",
+                event.id,
+                type(e).__name__,
+            )
+            continue
+        if ctx is not None:
+            event.tennis_simulation = ctx
+            attached += 1
+    log.info(
+        "attached tennis simulation to %d/%d events (career-baseline iid)",
+        attached,
+        len(events),
+    )
+
+
 async def _run_lenses(
     provider: FetcherProvider,
     anthropic: AsyncAnthropic,
@@ -876,6 +943,11 @@ def _persist_run(result: RunResult) -> None:
                 # fetcher use them?". Null on non-tennis events and on
                 # tennis events the stub / vendor failed to populate.
                 ts = result.tennis_stats.get(p.event_id)
+                # Career-baseline Monte Carlo sim — top-level too so
+                # retro grading can ask "did the long-run baseline track
+                # outcomes better than the director?" without joining
+                # against a sidecar.
+                tsim = result.tennis_simulation.get(p.event_id)
                 # `lens_names` is derived from the keys of the prediction's
                 # specialist_reports (which match the LensSet's declared
                 # lens names by construction). Stable order via sorting
@@ -934,6 +1006,9 @@ def _persist_run(result: RunResult) -> None:
                     ),
                     "tennis_stats": (
                         ts.model_dump(mode="json") if ts is not None else None
+                    ),
+                    "tennis_simulation": (
+                        tsim.model_dump(mode="json") if tsim is not None else None
                     ),
                     "notebooks": notebooks_for_event,
                     "specialist_reports": reports_for_event,
@@ -1024,7 +1099,6 @@ async def run_pipeline(
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
-    fetcher_provider: str | None = None,
     tennis_stats_disabled: bool = False,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon,
@@ -1041,13 +1115,13 @@ async def run_pipeline(
       Empty = umbrella `tag_slug=sports` (current default).
     - `slugs`: explicit list of event slugs to include (bypasses the horizon
       filter so a specific event always lands).
-    - `fetcher_provider`: 'grok' or 'gemini'. None = use FETCHER_PROVIDER env
-      var, defaulting to 'grok'. The provider runs the per-lens Stage A
-      (fetcher) for every event in the slate; reasoner / director / judge
-      are always Claude regardless.
+
+    The fetcher provider runs the per-lens Stage A for every event in the
+    slate. Reasoner / director / judge are always Claude regardless. The
+    provider choice is hand-edited in `config.py` (`FETCHER_PROVIDER`
+    constant, default `gemini`) — no env var, no per-invocation override.
     """
     config = cfg.Config.from_env(
-        fetcher_provider=fetcher_provider,
         tennis_stats_disabled=tennis_stats_disabled,
     )
     run_id = uuid.uuid4().hex[:8]
@@ -1169,6 +1243,12 @@ async def run_pipeline(
         # The provider is always non-None (factory returns the stub when no
         # key is configured), so this is safe without an `if enabled` branch.
         await enrich_tennis_stats(tennis_provider, events, tennis_sem, result.errors)
+        # Career-baseline Monte Carlo sim — pure CPU on the inputs
+        # `enrich_tennis_stats` just attached. Director-only feed, so
+        # this MUST run before the lens chain so the director's
+        # per-event context block can render the simulation block
+        # alongside the UW block. Lens fetchers don't see it.
+        enrich_tennis_simulation(events, result.errors)
         # Snapshot the per-event tennis context onto the RunResult so
         # `_persist_run` can write it to the JSONL row even though the
         # event itself isn't carried into persistence (only the resulting
@@ -1177,6 +1257,8 @@ async def run_pipeline(
         for ev in events:
             if ev.tennis_stats is not None:
                 result.tennis_stats[ev.id] = ev.tennis_stats
+            if ev.tennis_simulation is not None:
+                result.tennis_simulation[ev.id] = ev.tennis_simulation
 
         provider = build_provider(config.fetcher_provider, config)
         result.fetcher_provider = provider.name

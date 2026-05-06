@@ -52,6 +52,15 @@ def _defensibility_stars(score: float) -> str:
     branch — fire emojis carry their own heat semantics, and most terminals
     render emoji glyphs through their own font where rich's color codes
     don't apply consistently anyway.
+
+    Cell width is padded to a constant 5-slot (10-cell) shape: each
+    filled position is one 🔥 (wcwidth=2), each empty position is two
+    ASCII spaces (wcwidth=1+1=2). Without the padding, a 1-flame row
+    and a 5-flame row produce different cell widths and Rich's
+    border alignment goes ragged on some terminals (font-fallback
+    width drift compounds the issue). Padded form keeps both Rich's
+    measurement AND the terminal's rendered width constant across
+    rows.
     """
     if score >= 0.85:
         filled = 5
@@ -63,7 +72,7 @@ def _defensibility_stars(score: float) -> str:
         filled = 2
     else:
         filled = 1
-    return "🔥" * filled
+    return "🔥" * filled + "  " * (5 - filled)
 
 
 def _pick_favorite(event: PolymarketEvent) -> PolymarketMarket:

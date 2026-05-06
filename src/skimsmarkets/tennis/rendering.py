@@ -5,20 +5,30 @@ formatting, kept out of the agent modules so the rendering can be
 unit-tested without spinning up a fetcher and so any future consumer
 (CLI debug, JSONL pretty-print) shares the same shape.
 
-Rendered block goes onto the per-event user message of the
-`tennis_form_and_surface` fetcher only, appended after
-`render_context(event)` and the lens's `render_fetcher_hint(...)`
-output. The reasoner sees the same string because reasoners receive the
-same event context the fetcher does (`agents/reasoners.py`).
+Two renderers, one source of truth:
+- `render_tennis_stats_block` — FULL stats block (rankings, surface
+  splits, career serve/return, tier records, titles, H2H). Goes onto
+  the `tennis_form_and_surface` fetcher's per-event user message.
+- `render_tennis_fatigue_block` — NARROW fatigue-only slice (days
+  since last match, match count in last 14d). Goes onto the
+  `tennis_conditions_and_context` fetcher's per-event user message.
+  Derives both primitives from `last_match_date` + `recent_matches`
+  fields the form/surface block already carries — same source data,
+  different scoped view tailored to the conditions lens's job.
 
-Token budget: aim for ~300–400 tokens per match. Heavy tier additions
-(per-surface H2H, recent meetings list, recent-match digest, career
-titles, matchup-conditioned bo3/bo5 + serve + BP) push past the
-previous 150–300 budget, but each line is suppressed independently when
-its data is absent so thinly-covered players still render compactly.
+Reasoners see the same strings because reasoners receive the same
+event context their fetchers do (`agents/reasoners.py`).
+
+Token budget for the FULL block: ~300–400 tokens per match. The
+fatigue block is ~30–40 tokens per match. Each line is suppressed
+independently when its data is absent so thinly-covered players still
+render compactly (or, for the fatigue block, the whole block returns
+None when both players lack `last_match_date`).
 """
 
 from __future__ import annotations
+
+from datetime import UTC, date, datetime, timedelta
 
 from skimsmarkets.tennis.models import (
     TennisH2HMeeting,
@@ -26,6 +36,7 @@ from skimsmarkets.tennis.models import (
     TennisInMatchupStats,
     TennisPlayerStats,
     TennisRecentMatch,
+    TennisSimulationContext,
     TennisStatsContext,
 )
 
@@ -329,3 +340,89 @@ def render_tennis_stats_block(ctx: TennisStatsContext) -> str:
     if ctx.head_to_head is not None:
         lines.extend(_fmt_h2h(ctx.head_to_head, ctx.player_a.name, ctx.player_b.name))
     return "\n".join(lines)
+
+
+def _fatigue_lines(
+    label: str, p: TennisPlayerStats, today: date, cutoff: date
+) -> list[str]:
+    """Two indented lines per player: days-since-last-match and 14d
+    match count. Per-line suppression when one input is absent. Returns
+    [] when neither line has data — caller drops the player header.
+    """
+    last = p.last_match_date
+    recent = p.recent_matches
+    if last is None and not recent:
+        return []
+    out: list[str] = [f"  {label}: {p.name}"]
+    if last is not None:
+        # Bound days_since_last_match at 0 in case the vendor ships a
+        # future-dated row (shouldn't happen, but cheap defensive).
+        delta = max(0, (today - last).days)
+        out.append(
+            f"    days_since_last_match: {delta} "
+            f"(last match {last.isoformat()})"
+        )
+    if recent:
+        # Count matches whose date falls within the trailing 14d window.
+        # Skip rows whose `date` is None — the vendor occasionally ships
+        # a digest row with the date stripped, and counting it would
+        # over-state load.
+        count = sum(
+            1 for m in recent if m.date is not None and m.date >= cutoff
+        )
+        out.append(f"    match_count_last_14d: {count}")
+    return out
+
+
+def render_tennis_simulation_block(ctx: TennisSimulationContext) -> str:
+    """Compact career-baseline Monte Carlo render for the director's
+    user message.
+
+    Director-only — same posture as `render_uw_block`. Lenses don't see
+    this. Format mirrors the labelled-header convention used elsewhere
+    so the director can grep the block by its leading parenthesis.
+    """
+    n_str = f"{ctx.n_sims:,}"
+    p = ctx.p_team_a_wins
+    lo = ctx.ci_low
+    hi = ctx.ci_high
+    pa_serve = ctx.point_win_pct_a_serving
+    pb_serve = ctx.point_win_pct_b_serving
+    return (
+        f"--- Tennis match simulator (provider: {ctx.provider}, n={n_str}) ---\n"
+        f"  bo{ctx.best_of}; p(team_a wins) = {p:.3f} "
+        f"[95% sampling CI {lo:.3f}-{hi:.3f}]\n"
+        f"  point-win on team_a's serve: {pa_serve:.3f}; "
+        f"on team_b's serve: {pb_serve:.3f}\n"
+        f"  assumptions: {ctx.assumptions}"
+    )
+
+
+def render_tennis_fatigue_block(
+    ctx: TennisStatsContext, *, now: datetime | None = None
+) -> str | None:
+    """Compact fatigue-primitives render for the
+    `tennis_conditions_and_context` fetcher.
+
+    Derives two primitives per player from data the form/surface block
+    already carries (`last_match_date`, `recent_matches`):
+    `days_since_last_match` and `match_count_last_14d`. The conditions
+    lens uses these as deterministic inputs to its
+    `physical_signed_shift` rather than re-discovering them via web
+    search.
+
+    Returns `None` when both players lack `last_match_date` AND have no
+    `recent_matches` — there's no point appending an empty header.
+    Per-line suppression when one player's data is partial.
+
+    `now` defaults to `datetime.now(UTC)` and is injectable for
+    deterministic tests / snapshot-style debugging.
+    """
+    today = (now or datetime.now(UTC)).date()
+    cutoff = today - timedelta(days=14)
+    a = _fatigue_lines("Player A", ctx.player_a, today, cutoff)
+    b = _fatigue_lines("Player B", ctx.player_b, today, cutoff)
+    if not a and not b:
+        return None
+    header = "--- Tennis fatigue (computed from MatchStat recent-matches feed) ---"
+    return "\n".join([header] + a + b)

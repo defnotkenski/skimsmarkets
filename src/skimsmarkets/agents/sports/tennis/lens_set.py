@@ -5,26 +5,26 @@ Each `LensSpec` carries:
   system block, parameterized by the provider's tool prose.
 - `reasoner_system` — the cached system prompt for the Claude reasoner.
 - `report_schema` — the Pydantic class the reasoner returns.
-- `render_extras` — per-lens user-message append. ONLY
-  `tennis_form_and_surface` reads the structured tennis_stats block;
-  the matchup and conditions lenses see the same data only via the
-  fetcher's notebook (they don't get the structured payload separately,
-  to keep the lens silos honest).
+- `render_extras` — per-lens user-message append. Two lenses currently
+  wire one: `tennis_form_and_surface` gets the FULL stats block;
+  `tennis_conditions_and_context` gets a NARROW fatigue-only slice.
+  `tennis_matchup_and_clutch` has no structured render and pulls its
+  primitives via the fetcher's web search.
 - `fetcher_sport_hint` / `reasoner_sport_hint` — per-lens sport-specific
   guidance, ride on the user message (never the cached system block).
 
-Why does only `tennis_form_and_surface` see the structured tennis_stats?
-The block contains form/surface stats AND matchup-conditioned stats AND
-some primitives the conditions lens cares about (last_match_date for
-fatigue). Splitting it three ways would either duplicate the rendering
-across all three lenses (token-cost overhead, breaks the silo by giving
-every lens the same external structured payload) or require a
-per-lens-tailored slice of the block (renderer complexity for marginal
-gain). The tradeoff: form_and_surface gets the full block (it owns the
-plurality of fields anyway); the other two lenses get those fields via
-their own search using the same vendor's web pages, which is
-substantively the same information through the fetcher's tool path.
-This preserves the lens-silo posture from CLAUDE.md.
+Why two `render_extras` callables on the same data source?
+Same source, two scoped views. The full block contains form/surface
+stats, matchup-conditioned stats, and primitives the conditions lens
+also cares about (`last_match_date`, `recent_matches` for fatigue).
+Piping the FULL block to all three lenses would breach the silo
+without buying material data; routing nothing to conditions wastes
+the fatigue primitives the vendor already ships. The split:
+form_and_surface gets the full block (it owns the plurality of
+fields); conditions gets a narrow fatigue-only render derived from
+the same source data; matchup_and_clutch gets nothing structured and
+web-searches its primitives via the fetcher. This preserves the
+silo posture from CLAUDE.md — each lens sees only what it needs.
 """
 
 from __future__ import annotations
@@ -45,23 +45,50 @@ from skimsmarkets.agents.sports.tennis.schemas import (
     TennisMatchupClutchReport,
 )
 from skimsmarkets.polymarket.models import PolymarketEvent
-from skimsmarkets.tennis import render_tennis_stats_block
+from skimsmarkets.tennis import (
+    render_tennis_fatigue_block,
+    render_tennis_stats_block,
+)
 
 
 def _render_tennis_stats_extras(event: PolymarketEvent) -> str | None:
     """Per-lens user-message append for `tennis_form_and_surface`.
 
-    Returns the rendered structured tennis-stats block when present,
-    `None` otherwise. The form_and_surface lens consumes the plurality
-    of these fields (rankings, surface splits, recent matches, career
-    serve/return %, tier records, career titles); piping the same block
-    to the matchup and conditions lenses would breach the silo posture
-    without buying material lens-specific data — those lenses pull
-    their own primitives via the fetcher's web search.
+    Returns the FULL tennis-stats block when present, `None`
+    otherwise. The form_and_surface lens consumes the plurality of
+    these fields (rankings, surface splits, recent matches, career
+    serve/return %, tier records, career titles); piping the full
+    block to the matchup lens would breach the silo without buying
+    material lens-specific data — that lens pulls its own primitives
+    via the fetcher's web search. The conditions lens gets a narrower
+    slice via `_render_tennis_fatigue_extras`.
     """
     if event.tennis_stats is None:
         return None
     return render_tennis_stats_block(event.tennis_stats)
+
+
+def _render_tennis_fatigue_extras(event: PolymarketEvent) -> str | None:
+    """Per-lens user-message append for `tennis_conditions_and_context`.
+
+    Returns a narrow fatigue-only render — `days_since_last_match`
+    and `match_count_last_14d` per player — derived from
+    `last_match_date` + `recent_matches` on the same
+    `TennisStatsContext` the form/surface block reads. The conditions
+    lens uses these as deterministic fatigue inputs to its
+    `physical_signed_shift` rather than re-discovering them via web
+    search. Web search still owns the fatigue inputs not on
+    MatchStat's surface (travel/timezone, retirement frequency,
+    medical timeouts in recent matches) — see
+    `_FETCHER_HINT_CONDITIONS_AND_CONTEXT`.
+
+    Returns `None` when both players lack both `last_match_date` and
+    `recent_matches`, or when the event has no `tennis_stats` context
+    attached at all.
+    """
+    if event.tennis_stats is None:
+        return None
+    return render_tennis_fatigue_block(event.tennis_stats)
 
 
 # Per-lens fetcher sport-hint bodies. Form/surface/serve metrics +
@@ -144,10 +171,17 @@ Tennis conditions-and-context specifics:
   swing. Body-part / surface interaction shapes magnitude: shoulder /
   wrist issues spike serve breakdown (bigger on hard / grass); lower-
   body issues are bigger on clay (longer rallies, more sliding).
-- Fatigue from prior round is real and quantifiable: sets/games/minutes
-  played in this tournament so far, time since last match (long
-  layoff = rust risk; back-to-back days = cumulative fatigue), travel
-  since last event.
+- Fatigue from prior round is real and quantifiable. `days_since_last_match`
+  and `match_count_last_14d` per player are PRE-COMPUTED in the
+  structured Tennis-fatigue block on this user message — use those
+  primitives directly, don't re-discover them via web search.
+  back-to-back days = cumulative fatigue (look for ≤1d gap and ≥4
+  matches in last 14d); long layoff = rust risk (≥10d gap is
+  meaningful). Web-search ONLY for fatigue inputs NOT in the
+  structured block: tournament-cumulative sets/games/minutes
+  played-so-far, travel/timezone shift since last tournament,
+  retirement frequency in trailing 90d, and medical timeouts taken in
+  recent matches — these are off MatchStat's surface.
 - Stakes and motivation: defending finalist points, race-to-Finals
   cutoff (October-November), defending the title, first-time
   finalist nerves, post-Slam letdown, end-of-season tank.
@@ -288,6 +322,7 @@ TENNIS_LENS_SET = LensSet(
             fetcher_system_builder=tennis_conditions_and_context_notebook_system,
             reasoner_system=TENNIS_CONDITIONS_AND_CONTEXT_REASONER_SYSTEM,
             report_schema=TennisConditionsContextReport,
+            render_extras=_render_tennis_fatigue_extras,
             fetcher_sport_hint=_FETCHER_HINT_CONDITIONS_AND_CONTEXT,
             reasoner_sport_hint=_REASONER_HINT_CONDITIONS_AND_CONTEXT,
         ),

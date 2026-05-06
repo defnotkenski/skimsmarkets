@@ -19,9 +19,9 @@ from __future__ import annotations
 
 from datetime import date as _date_t
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Field-name aliasing: several models below have a `date` field. The
 # bare `date` type from `datetime` would shadow the field annotation at
@@ -356,3 +356,62 @@ class TennisStatsContext(BaseModel):
         if h2h is not None and (h2h.a_wins > 0 or h2h.b_wins > 0):
             return True
         return False
+
+
+class TennisSimulationContext(BaseModel):
+    """Per-event Monte Carlo career-baseline simulation result.
+
+    Director-only — same architectural posture as `UnusualWhalesContext`.
+    Computed deterministically (fixed seed per event) from the career
+    serve/return primitives on `TennisStatsContext` at pipeline time
+    in `enrich_tennis_simulation`. The director uses this as a SECOND
+    deterministic prior alongside Polymarket bid/ask; lenses don't see
+    it (a long-run baseline shouldn't be second-guessed at the lens
+    layer — that's the director's synthesis job).
+
+    Intentionally limited to iid + career-baseline so it doesn't fight
+    the lenses' jobs — surface, form, conditions, and H2H remain the
+    lens layer's responsibility. The sim is "the long-run prior," the
+    lenses produce "the contextual delta," and the director synthesizes
+    both.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Versioned provider tag so a future v2 (e.g. Klaassen-Magnus tour-
+    # adjusted, or surface-conditioned) can co-exist on JSONL rows
+    # without an ambiguous "monte_carlo" string. v1 = symmetric-average
+    # point-win formula, no surface/form adjustments.
+    provider: Literal["monte_carlo_v1"] = "monte_carlo_v1"
+    computed_at: datetime
+    p_team_a_wins: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of n_sims where team_a won the match. Career-baseline "
+            "iid prior; ignores surface, form, conditions, H2H."
+        ),
+    )
+    # 95% sampling-uncertainty CI from the Wilson interval. Captures
+    # noise in the Monte Carlo estimator ONLY — does NOT capture model
+    # uncertainty (the iid assumption being wrong, career != current
+    # form, etc.). Director should treat the CI as a rough sampling
+    # band, not a true uncertainty quantification.
+    ci_low: float = Field(ge=0.0, le=1.0)
+    ci_high: float = Field(ge=0.0, le=1.0)
+    n_sims: int = Field(ge=1)
+    best_of: Literal[3, 5]
+    point_win_pct_a_serving: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="P(team_a wins a point on team_a's serve).",
+    )
+    point_win_pct_b_serving: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="P(team_b wins a point on team_b's serve).",
+    )
+    # One-line plain-English description of what this number does and
+    # doesn't account for. Surfaces in the rendered block so the
+    # director can't confuse the sim with a contextual probability.
+    assumptions: str

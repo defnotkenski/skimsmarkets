@@ -92,7 +92,6 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
         horizon_hours=opts.horizon_hours,
         slugs=opts.slugs or None,
         sports=opts.sports or None,
-        fetcher_provider=args.fetcher_provider,
         tennis_stats_disabled=args.no_tennis_stats,
     )
     print_run_summary(result)
@@ -230,19 +229,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "rank",
         parents=[slate],
         help="Build the slate and run the full ranking pipeline (default).",
-    )
-    p_rank.add_argument(
-        "--fetcher-provider",
-        choices=cfg.FETCHER_PROVIDERS,
-        default=None,
-        metavar="PROVIDER",
-        help=(
-            "Per-lens fetcher provider. 'grok' uses xai_sdk + grok-4.20-multi-agent "
-            "(agent_count=4 ensemble); 'gemini' uses google-genai + gemini-3.1-pro "
-            "single-pass (no x_search — Twitter lookups go through site:x.com on "
-            "google_search). Overrides the FETCHER_PROVIDER env var; falls back to "
-            f"'{cfg.DEFAULT_FETCHER_PROVIDER}' when neither is set."
-        ),
     )
     p_rank.add_argument(
         "--no-tennis-stats",
