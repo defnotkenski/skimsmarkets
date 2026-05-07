@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # this are left out of the slate. 24h catches "today's slate"; use 48-72 on the
 # CLI to pull in tomorrow. Enforced server-side via Polymarket's startTimeMax,
 # so events outside the window never hit the matcher/LLM path.
-DEFAULT_HORIZON_HOURS = 6
+DEFAULT_HORIZON_HOURS = 8
 
 # Max implied probability for the event's favorite. Events whose favorite
 # is priced at or above this on the YES mid (`(bid+ask)/2`) are dropped
