@@ -35,6 +35,77 @@ _WTA_SLUG_PREFIX = "wta-"
 # pairs as singletons; we punt rather than try to look up four players.
 _DOUBLES_HINT_TOKENS: tuple[str, ...] = ("/", "&", " and ")
 
+# Slug-prefix → surface mapping for the major tournaments. Polymarket
+# tennis volume concentrates here (4 Slams + ATP/WTA Masters/1000
+# swing), so a hardcoded table covers most events without needing a
+# vendor lookup. Lower-tier 250 / 500 events miss this map and fall
+# through to the modal-recent-surface fallback at the call site —
+# graceful degrade, never abort scoring on an unrecognised slug.
+#
+# Keys match the slug remainder AFTER the `atp-` / `wta-` tour
+# prefix is stripped. Year suffixes (e.g. `-2026-...`) follow
+# naturally because the matcher uses startswith. Multiple aliases
+# per tournament cover the spelling variants Polymarket has used
+# historically.
+_SLUG_SURFACE_MAP: dict[str, str] = {
+    "australian-open": "hard",
+    "aus-open": "hard",
+    "french-open": "clay",
+    "roland-garros": "clay",
+    "wimbledon": "grass",
+    "us-open": "hard",
+    "indian-wells": "hard",
+    "miami-open": "hard",
+    "miami": "hard",
+    "monte-carlo": "clay",
+    "madrid-open": "clay",
+    "madrid": "clay",
+    "italian-open": "clay",
+    "rome-open": "clay",
+    "rome": "clay",
+    "canadian-open": "hard",
+    "canada-open": "hard",
+    "national-bank-open": "hard",
+    "cincinnati-open": "hard",
+    "cincinnati": "hard",
+    "shanghai-masters": "hard",
+    "shanghai": "hard",
+    "paris-masters": "hard",
+    "paris-rolex": "hard",
+}
+
+# Slug-prefix → tournament tier. Same key vocabulary as
+# `_SLUG_SURFACE_MAP` so the two cascades read off the same matched
+# slug remainder. Tiers come from `_RANK_ID_TO_TIER` in
+# `tennis/matchstat.py` so downstream consumers (recent-match rows,
+# the multiplier table in `selection.py`) share one vocabulary.
+_SLUG_TIER_MAP: dict[str, str] = {
+    "australian-open": "grand_slam",
+    "aus-open": "grand_slam",
+    "french-open": "grand_slam",
+    "roland-garros": "grand_slam",
+    "wimbledon": "grand_slam",
+    "us-open": "grand_slam",
+    "indian-wells": "masters",
+    "miami-open": "masters",
+    "miami": "masters",
+    "monte-carlo": "masters",
+    "madrid-open": "masters",
+    "madrid": "masters",
+    "italian-open": "masters",
+    "rome-open": "masters",
+    "rome": "masters",
+    "canadian-open": "masters",
+    "canada-open": "masters",
+    "national-bank-open": "masters",
+    "cincinnati-open": "masters",
+    "cincinnati": "masters",
+    "shanghai-masters": "masters",
+    "shanghai": "masters",
+    "paris-masters": "masters",
+    "paris-rolex": "masters",
+}
+
 
 class TennisMatchIdentity(BaseModel):
     """The two players plus tour, ready for the vendor lookup.
@@ -73,6 +144,72 @@ def _tour_from_slug(slug: str) -> Literal["atp", "wta"] | None:
         return "atp"
     if slug.startswith(_WTA_SLUG_PREFIX):
         return "wta"
+    return None
+
+
+def _slug_remainder(slug: str) -> str:
+    """Strip the `atp-` / `wta-` prefix; return `""` for non-tour slugs.
+
+    Used by both `_slug_surface` and `_slug_tier` so they match against
+    the same canonical post-prefix string. Empty string when the slug
+    isn't tour-prefixed at all — both downstream parsers treat that as
+    "no match".
+    """
+    if slug.startswith(_ATP_SLUG_PREFIX):
+        return slug[len(_ATP_SLUG_PREFIX):]
+    if slug.startswith(_WTA_SLUG_PREFIX):
+        return slug[len(_WTA_SLUG_PREFIX):]
+    return ""
+
+
+def _slug_surface(slug: str) -> str | None:
+    """Hardcoded slug-prefix → surface lookup for the major tournaments.
+
+    Returns one of the `_COURT_ID_TO_SURFACE` values
+    ("hard"/"clay"/"grass") for the 4 Slams + ATP/WTA Masters/1000
+    swing, or None when the slug doesn't match any known major.
+    Selection-stage callers fall back to a modal-recent-surface
+    inference when this returns None — see
+    `_resolve_event_surface` in `selection.py`.
+
+    Match logic: strip the tour prefix, then check whether the
+    remainder STARTS WITH any key in `_SLUG_SURFACE_MAP`. `startswith`
+    (rather than equality) handles year/round suffixes like
+    `-2026-sinner-vs-alcaraz` that follow the tournament name in
+    real Polymarket slugs.
+
+    Multiple aliases collapse to the same canonical surface — Rome
+    is `italian-open` on some payloads, `rome-open` on others, etc.
+    Iteration order in `_SLUG_SURFACE_MAP` doesn't matter because
+    the keys don't overlap (no key is a prefix of another for the
+    populated tournaments).
+    """
+    remainder = _slug_remainder(slug)
+    if not remainder:
+        return None
+    for key, surface in _SLUG_SURFACE_MAP.items():
+        if remainder.startswith(key):
+            return surface
+    return None
+
+
+def _slug_tier(slug: str) -> str | None:
+    """Hardcoded slug-prefix → tournament tier lookup.
+
+    Returns one of `"grand_slam"` / `"masters"` for the 4 Slams +
+    ATP/WTA Masters/1000 swing, None for everything else (250s,
+    500s, qualifiers, futures, exhibitions). Companion to
+    `_slug_surface` — same key vocabulary, same `startswith` matcher.
+    Selection-stage callers fall back to the favorite's most recent
+    cached match tier when this returns None — see
+    `_resolve_event_tier` in `selection.py`.
+    """
+    remainder = _slug_remainder(slug)
+    if not remainder:
+        return None
+    for key, tier in _SLUG_TIER_MAP.items():
+        if remainder.startswith(key):
+            return tier
     return None
 
 

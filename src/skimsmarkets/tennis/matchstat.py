@@ -83,6 +83,11 @@ from skimsmarkets.tennis.models import (
     TennisRecentMatch,
     TennisStatsContext,
 )
+from skimsmarkets.tennis.provider import (
+    MatchHistoryRow,
+    _match_completeness,
+    _parse_set_scores,
+)
 
 log = logging.getLogger(__name__)
 
@@ -148,6 +153,23 @@ _MATCH_INCLUDE = "tournament,round"
 # extra in case the vendor omits a row.
 _RECENT_MATCH_PAGE_SIZE = 5
 _RECENT_MEETING_PAGE_SIZE = 3
+
+# Selection-stage past-matches page size. Larger than the live recent-
+# matches budget because the variance estimator divides by N — pinning
+# to 5 leaves the dispersion metric at the noise floor, while 10 gives
+# the selector enough denominator to discriminate steady vs streaky
+# players. Downstream `_player_recent_matches` slices the cached list
+# down to its own `_RECENT_MATCH_PAGE_SIZE` for the prompt block.
+_SELECTION_MATCH_PAGE_SIZE = 10
+# Include relations for the selection-stage warmup. `stat` brings the
+# per-match box-score block (first-serve %, etc.) used by the variance
+# estimator; `tournament,round` brings the surface / tier / round name
+# downstream `TennisRecentMatch` consumers expect. The live
+# `_RECENT_MATCH_PAGE_SIZE` path uses `_MATCH_INCLUDE` (no `stat`)
+# because it doesn't need the box-score block; the cache fallback in
+# `_player_recent_matches` keeps that lighter shape so small slates
+# (no warmup, fits under cap) pay the same HTTP cost as before.
+_SELECTION_MATCH_INCLUDE = "stat,tournament,round"
 
 _RETRY_ATTEMPTS = 5
 _RETRY_BASE_S = 1.0
@@ -398,6 +420,34 @@ class MatchStatTennisProvider:
         self._profile_cache: dict[
             tuple[str, int],
             tuple[list[str], int | None, int | None, str | None],
+        ] = {}
+        # Per-player past-matches cache keyed by (tour, pid) → parsed
+        # `MatchHistoryRow` list. Populated by
+        # `warm_match_history_for_selection` at slate-time pre-cap, read
+        # synchronously by `lookup_player_match_history` at selector
+        # scoring time, and re-read by `_player_recent_matches` at
+        # post-cap enrichment time so the warmup HTTP isn't wasted.
+        # Empty list (rather than missing key) marks a player whose
+        # vendor lookup ran but returned no usable rows — distinguishes
+        # "warmup didn't fire for this player" from "warmup fired but
+        # found nothing", so the live fallback only runs for the former.
+        self._past_matches_cache: dict[tuple[str, int], list[MatchHistoryRow]] = {}
+        # Per-player surface-summary cache keyed by (tour, pid) → the
+        # `(ytd_pair, surface_dict)` shape `_player_surface_year_record`
+        # already returns. Populated by
+        # `warm_surface_summary_for_selection` at slate-time pre-cap;
+        # read synchronously by `lookup_player_surface_record` at
+        # selector scoring time, and re-read by
+        # `_player_surface_year_record` at post-cap enrichment so the
+        # warmup HTTP isn't wasted on survivors. The presence of the
+        # key (regardless of contents) marks "warmup ran for this
+        # player" — distinguishes from a true cache miss.
+        self._surface_cache: dict[
+            tuple[str, int],
+            tuple[
+                tuple[int, int] | None,
+                dict[str, tuple[int, int]] | None,
+            ],
         ] = {}
 
     async def __aenter__(self) -> Self:
@@ -736,76 +786,248 @@ class MatchStatTennisProvider:
         self._profile_cache[(tour, pid)] = result
         return result
 
+    @staticmethod
+    def _parse_match_history_row(
+        row: dict[str, Any], pid: int
+    ) -> MatchHistoryRow | None:
+        """Vendor past-matches row → `MatchHistoryRow`.
+
+        Single source of truth for past-matches parsing. Both the
+        selector's warmup (`warm_match_history_for_selection`) and the
+        live recent-matches path (`_player_recent_matches`) consume the
+        same parsed rows, which guarantees `match_completeness` and
+        per-row `first_serve_win_pct` are computed identically wherever
+        the row was first seen.
+
+        Returns None when the row can't be attributed (no opponent name)
+        — pretty much never happens on the live vendor but guard
+        anyway. `match_completeness` and `first_serve_win_pct` may be
+        None on a returned row when the score is aborted or the stat
+        block is absent; consumers filter at aggregation time, not
+        here, because TennisRecentMatch construction still wants the
+        row for its scoreline + surface + opponent info.
+        """
+        p1 = row.get("player1") if isinstance(row.get("player1"), dict) else {}
+        p2 = row.get("player2") if isinstance(row.get("player2"), dict) else {}
+        p1_id = _coerce_int(row.get("player1Id"))
+        is_subject_p1 = p1_id == pid
+        opp_block = p2 if is_subject_p1 else p1
+        opp_name = opp_block.get("name") if isinstance(opp_block, dict) else None
+        if not isinstance(opp_name, str) or not opp_name:
+            return None
+        winner_id = _coerce_int(row.get("match_winner"))
+        won = winner_id == pid
+        row_date = _parse_iso_date(row.get("date"))
+        tourn = row.get("tournament") if isinstance(row.get("tournament"), dict) else {}
+        surface = _surface_from_court_id(tourn.get("courtId"))
+        tier = _tier_from_rank_id(tourn.get("rankId"))
+        tname = tourn.get("name")
+        tournament_name = (
+            tname.strip() if isinstance(tname, str) and tname.strip() else None
+        )
+        rnd = row.get("round") if isinstance(row.get("round"), dict) else {}
+        rname = rnd.get("name")
+        round_name = (
+            rname.strip() if isinstance(rname, str) and rname.strip() else None
+        )
+        result = row.get("result")
+        score = result.strip() if isinstance(result, str) and result.strip() else None
+
+        # Match completeness (winner's share of total games). Symmetric
+        # in p1/p2 — independent of `won`.
+        completeness: float | None = None
+        score_pair = _parse_set_scores(score)
+        if score_pair is not None:
+            completeness = _match_completeness(*score_pair)
+
+        # Per-match first-serve-win % from the stat block. Only present
+        # when the warmup-include path fetched this row (live no-stat
+        # path leaves the field absent and we degrade to None
+        # silently). Subject's side: `player1` block when subject is
+        # p1, else `player2`.
+        first_serve_win_pct: float | None = None
+        stats = row.get("stats")
+        if isinstance(stats, dict):
+            side = stats.get("player1" if is_subject_p1 else "player2")
+            if isinstance(side, dict):
+                first_serve_win_pct = _safe_pct(
+                    side.get("winningOnFirstServe"),
+                    side.get("winningOnFirstServeOf"),
+                )
+
+        return MatchHistoryRow(
+            date=row_date,
+            opponent_name=opp_name.strip(),
+            won=won,
+            raw_score=score,
+            surface=surface,
+            round=round_name,
+            tournament_name=tournament_name,
+            tournament_tier=tier,
+            match_completeness=completeness,
+            first_serve_win_pct=first_serve_win_pct,
+        )
+
+    async def _fetch_past_matches_rows(
+        self,
+        tour: str,
+        pid: int,
+        *,
+        page_size: int,
+        include: str,
+    ) -> list[MatchHistoryRow]:
+        """One past-matches HTTP → list of parsed `MatchHistoryRow`s.
+
+        Failure / empty response → `[]` so the caller can distinguish
+        "fetched but found nothing" (stays empty in the cache) from
+        "haven't fetched yet" (key absent in cache). Used by both the
+        selection-stage warmup (`include=stat,...`, pageSize=10) and
+        the post-cap fallback inside `_player_recent_matches`
+        (lighter `tournament,round`-only include, pageSize=5) — same
+        endpoint, same parser, different inclusiveness.
+        """
+        body = await self._get(
+            f"/tennis/v2/{tour}/player/past-matches/{pid}",
+            params={"pageSize": page_size, "include": include},
+        )
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return []
+        out: list[MatchHistoryRow] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            parsed = self._parse_match_history_row(row, pid)
+            if parsed is not None:
+                out.append(parsed)
+        return out
+
+    async def warm_match_history_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        """Pre-fetch `/past-matches?include=stat,...` for every player
+        across `identities` and populate `self._past_matches_cache`.
+
+        Selection-stage scoring reads the cache synchronously via
+        `lookup_player_match_history` to compute a consistency /
+        variance metric. Same dedup-by-unique-player pattern as
+        `warm_form_for_selection` — collect the unique (tour, pid)
+        pairs after rank resolution, fan out one HTTP per unique
+        player, skip pairs already cached.
+
+        Pre-condition: rankings index warm. Identities that don't
+        resolve are silently skipped — selector requires both ranks
+        to compute a score, so unranked players don't need a history
+        cache anyway.
+
+        Cache reuse downstream: the post-cap `_player_recent_matches`
+        path also reads this cache, so the warmup HTTP serves both the
+        selector's variance estimator AND the eventual prompt's
+        recent-matches digest.
+        """
+        pending: set[tuple[str, int]] = set()
+        for ident in identities:
+            for nm in (ident.player_a, ident.player_b):
+                hit = self._resolve(ident.tour, nm)
+                if hit is None:
+                    continue
+                pid = hit[0]
+                if (ident.tour, pid) in self._past_matches_cache:
+                    continue
+                pending.add((ident.tour, pid))
+        if not pending:
+            return
+        log.info(
+            "matchstat: warming past-matches cache for %d players (selection)",
+            len(pending),
+        )
+
+        async def _one(tour: str, pid: int) -> None:
+            rows = await self._fetch_past_matches_rows(
+                tour,
+                pid,
+                page_size=_SELECTION_MATCH_PAGE_SIZE,
+                include=_SELECTION_MATCH_INCLUDE,
+            )
+            self._past_matches_cache[(tour, pid)] = rows
+
+        await asyncio.gather(*(_one(tour, pid) for tour, pid in pending))
+
+    def lookup_player_match_history(
+        self, tour: str, name: str
+    ) -> list[MatchHistoryRow] | None:
+        """Sync per-match history lookup from the warmed cache.
+
+        Returns None when:
+          - the player isn't in the rankings index for this tour
+          - `warm_match_history_for_selection` hasn't been called for
+            their identity (cache miss — distinguished from a populated
+            empty list)
+          - the warmup ran but the vendor returned no rows
+        Selection callers treat None / empty as "no consistency signal"
+        and skip the consistency adjustment.
+        """
+        hit = self._resolve(tour, name)
+        if hit is None:
+            return None
+        pid = hit[0]
+        cached = self._past_matches_cache.get((tour, pid))
+        if cached is None or not cached:
+            return None
+        return cached
+
     async def _player_recent_matches(
         self, tour: str, pid: int, name: str
     ) -> tuple[date | None, list[TennisRecentMatch]]:
         """Pull the last N matches; return `(last_match_date, recent_matches)`.
 
-        Single call replaces what used to be a pageSize=1 "just the date"
-        lookup. The first row's date doubles as `last_match_date`; the
-        rest of the rows feed `TennisPlayerStats.recent_matches` with
-        opp / score / round / surface / tier so the prompt can show
-        recent quality instead of just a W/L pattern.
+        Reads from `self._past_matches_cache` first when populated by
+        the selection-stage warmup — same vendor data, parsed once,
+        reused for the prompt block. Cache miss falls back to the
+        original lighter HTTP (no `include=stat`) so small slates
+        that didn't trigger selection warmup pay the same cost as
+        before. The first row's date doubles as `last_match_date`;
+        rows feed `TennisPlayerStats.recent_matches`.
 
-        `pid` and `name` are the subject player; we pick opponent vs
-        subject by comparing `player1Id`/`player2Id` against `pid`,
-        which is robust to whichever side the vendor lists the subject
-        on.
+        `name` is unused at parse time but kept in the signature so the
+        call site reads as "fetch recent matches for this player by
+        name" and avoids a silent reordering bug if the IDs ever flip.
         """
-        body = await self._get(
-            f"/tennis/v2/{tour}/player/past-matches/{pid}",
-            params={"pageSize": _RECENT_MATCH_PAGE_SIZE, "include": _MATCH_INCLUDE},
-        )
-        rows = body.get("data") if isinstance(body, dict) else None
-        if not isinstance(rows, list) or not rows:
-            return None, []
-        last_date: date | None = None
-        out: list[TennisRecentMatch] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            row_date = _parse_iso_date(row.get("date"))
-            if last_date is None and row_date is not None:
-                last_date = row_date
-            p1 = row.get("player1") if isinstance(row.get("player1"), dict) else {}
-            p2 = row.get("player2") if isinstance(row.get("player2"), dict) else {}
-            p1_id = _coerce_int(row.get("player1Id"))
-            is_subject_p1 = p1_id == pid
-            opp_block = p2 if is_subject_p1 else p1
-            opp_name = opp_block.get("name") if isinstance(opp_block, dict) else None
-            if not isinstance(opp_name, str) or not opp_name:
-                # Skip rows we can't attribute — pretty much never
-                # happens on the live vendor but guard anyway.
-                continue
-            winner_id = _coerce_int(row.get("match_winner"))
-            won = winner_id == pid
-            tourn = row.get("tournament") if isinstance(row.get("tournament"), dict) else {}
-            surface = _surface_from_court_id(tourn.get("courtId"))
-            tier = _tier_from_rank_id(tourn.get("rankId"))
-            tname = tourn.get("name")
-            tournament_name = tname.strip() if isinstance(tname, str) and tname.strip() else None
-            rnd = row.get("round") if isinstance(row.get("round"), dict) else {}
-            rname = rnd.get("name")
-            round_name = rname.strip() if isinstance(rname, str) and rname.strip() else None
-            result = row.get("result")
-            score = result.strip() if isinstance(result, str) and result.strip() else None
-            out.append(
-                TennisRecentMatch(
-                    date=row_date,
-                    opponent_name=opp_name.strip(),
-                    won=won,
-                    result=score,
-                    surface=surface,
-                    round=round_name,
-                    tournament_name=tournament_name,
-                    tournament_tier=tier,
-                )
+        del name  # see docstring — call-site readability only.
+
+        rows = self._past_matches_cache.get((tour, pid))
+        if rows is None:
+            rows = await self._fetch_past_matches_rows(
+                tour,
+                pid,
+                page_size=_RECENT_MATCH_PAGE_SIZE,
+                include=_MATCH_INCLUDE,
             )
-        # `name` is unused at parse time but kept in the signature so the
-        # caller can pass it explicitly — it makes the call site read as
-        # "fetch recent matches for this player by name" and avoids a
-        # silent reordering bug if the IDs ever flip.
-        del name
+            # Populate the cache so a downstream lookup doesn't re-fetch.
+            # The fallback rows lack the `stat` block (no
+            # first_serve_win_pct), but for the recent-matches prompt
+            # block that doesn't matter — the variance estimator that
+            # cared already ran by the time we land here.
+            self._past_matches_cache[(tour, pid)] = rows
+        if not rows:
+            return None, []
+
+        last_date: date | None = next(
+            (r.date for r in rows if r.date is not None), None
+        )
+        out: list[TennisRecentMatch] = [
+            TennisRecentMatch(
+                date=r.date,
+                opponent_name=r.opponent_name,
+                won=r.won,
+                result=r.raw_score,
+                surface=r.surface,
+                round=r.round,
+                tournament_name=r.tournament_name,
+                tournament_tier=r.tournament_tier,
+            )
+            for r in rows[:_RECENT_MATCH_PAGE_SIZE]
+        ]
         return last_date, out
 
     async def fetch_post_match_stats(
@@ -1079,20 +1301,23 @@ class MatchStatTennisProvider:
             out[tier_key] = won
         return out or None
 
-    async def _player_surface_year_record(
+    async def _fetch_surface_summary(
         self, tour: str, pid: int
     ) -> tuple[
         tuple[int, int] | None,
         dict[str, tuple[int, int]] | None,
     ]:
-        """Aggregate the most recent year's surface-summary into
-        `(ytd_total, surface_dict)`.
+        """One surface-summary HTTP → `(ytd_pair, surface_dict)`.
 
-        Vendor returns one row per year, each with a list of per-court
-        win/loss counts. We take the FIRST year (vendor sorts
+        Pure parsing helper, separate from cache lookup. Used by both
+        the selection-stage warmup (`warm_surface_summary_for_selection`)
+        and the cache-miss fallback inside `_player_surface_year_record`.
+
+        Vendor returns one row per year with a list of per-court
+        win/loss counts. We take the most recent year (vendor sorts
         descending; we double-check with `max(year)` as a fallback).
-        Hard + I.hard collapse into a single "hard" entry to match the
-        sport-hint vocabulary.
+        Hard + I.hard collapse into a single "hard" entry to match
+        the sport-hint vocabulary.
         """
         body = await self._get(f"/tennis/v2/{tour}/player/surface-summary/{pid}")
         data = body.get("data") if isinstance(body, dict) else None
@@ -1125,6 +1350,113 @@ class MatchStatTennisProvider:
             prev_w, prev_l = merged.get(key, (0, 0))
             merged[key] = (prev_w + wins, prev_l + losses)
         return (ytd_w, ytd_l), merged or None
+
+    async def _player_surface_year_record(
+        self, tour: str, pid: int
+    ) -> tuple[
+        tuple[int, int] | None,
+        dict[str, tuple[int, int]] | None,
+    ]:
+        """Cache-then-fetch wrapper around `_fetch_surface_summary`.
+
+        Consults `self._surface_cache` first when populated by the
+        selection-stage warmup — same vendor data, parsed once,
+        reused for the prompt block. Cache miss falls back to a
+        direct fetch and populates the cache so a second consumer
+        within the same run doesn't re-fetch.
+        """
+        cached = self._surface_cache.get((tour, pid))
+        if cached is not None:
+            return cached
+        result = await self._fetch_surface_summary(tour, pid)
+        self._surface_cache[(tour, pid)] = result
+        return result
+
+    async def warm_surface_summary_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        """Pre-fetch `/player/surface-summary/{id}` for every player
+        across `identities` and populate `self._surface_cache`.
+
+        Same dedup-by-unique-player pattern as
+        `warm_form_for_selection` and
+        `warm_match_history_for_selection`. Selection-stage scoring
+        reads the cache via `lookup_player_surface_record` to compute
+        a surface-specialism adjustment. Pre-condition: rankings
+        index warm. Cache reuse downstream:
+        `_player_surface_year_record` consults this cache before
+        re-fetching, so the warmup HTTP serves both the selector's
+        specialism estimator AND the eventual prompt's surface block.
+        """
+        pending: set[tuple[str, int]] = set()
+        for ident in identities:
+            for nm in (ident.player_a, ident.player_b):
+                hit = self._resolve(ident.tour, nm)
+                if hit is None:
+                    continue
+                pid = hit[0]
+                if (ident.tour, pid) in self._surface_cache:
+                    continue
+                pending.add((ident.tour, pid))
+        if not pending:
+            return
+        log.info(
+            "matchstat: warming surface-summary cache for %d players (selection)",
+            len(pending),
+        )
+
+        async def _one(tour: str, pid: int) -> None:
+            self._surface_cache[(tour, pid)] = await self._fetch_surface_summary(
+                tour, pid
+            )
+
+        await asyncio.gather(*(_one(tour, pid) for tour, pid in pending))
+
+    def lookup_player_surface_record(
+        self, tour: str, name: str
+    ) -> tuple[
+        tuple[int, int] | None, dict[str, tuple[int, int]] | None
+    ] | None:
+        """Sync `(ytd_pair, surface_dict)` lookup from the warmed cache.
+
+        Returns None when the player isn't in the rankings index or
+        the surface warmup hasn't run for them. Both inner pair
+        components are independently None when the vendor returned
+        an empty section. Selection callers treat outer-None as
+        "no surface signal" and skip the surface tier.
+        """
+        hit = self._resolve(tour, name)
+        if hit is None:
+            return None
+        pid = hit[0]
+        cached = self._surface_cache.get((tour, pid))
+        if cached is None:
+            return None
+        return cached
+
+    def lookup_player_profile_extras(
+        self, tour: str, name: str
+    ) -> tuple[int | None, int | None] | None:
+        """Sync `(age_years, best_rank)` lookup from the warmed
+        profile cache.
+
+        Reads the same cache slot `lookup_player_form` reads — no
+        extra HTTP, just a different view of the warmed profile.
+        Returns None when the player isn't in the rankings index or
+        `warm_form_for_selection` hasn't been called for their
+        identity. Inner pair components are independently None when
+        the vendor's profile response was missing the underlying
+        field (no birthdate, no career-high rank).
+        """
+        hit = self._resolve(tour, name)
+        if hit is None:
+            return None
+        pid = hit[0]
+        cached = self._profile_cache.get((tour, pid))
+        if cached is None:
+            return None
+        _form_arr, best_rank, age_years, _plays = cached
+        return age_years, best_rank
 
     async def _player_stats(
         self,

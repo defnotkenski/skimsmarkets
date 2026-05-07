@@ -69,11 +69,20 @@ class CalibrateReport:
     """Top-level shape: an Overall section + per-sport sections, each
     carrying the three cut tables. Sports without any settled events
     are omitted from the per-sport block (no point rendering an empty
-    table)."""
+    table).
+
+    `n_predictions_total` counts UNIQUE markets after the dedup pass
+    in `collect_features` — same `market_slug` predicted across
+    multiple runs collapses to one row (the chronologically earliest
+    instance wins). `n_duplicates_dropped` carries the count of
+    same-slug rows the dedup discarded so the operator can see how
+    load-bearing dedup was on this particular run.
+    """
 
     n_predictions_total: int = 0
     n_settled: int = 0
     n_correct: int = 0
+    n_duplicates_dropped: int = 0
     overall_cuts: list[CutTable] = field(default_factory=list)
     per_sport_cuts: dict[str, list[CutTable]] = field(default_factory=dict)
 
@@ -82,6 +91,7 @@ class CalibrateReport:
             "n_predictions_total": self.n_predictions_total,
             "n_settled": self.n_settled,
             "n_correct": self.n_correct,
+            "n_duplicates_dropped": self.n_duplicates_dropped,
             "overall_cuts": [c.to_dict() for c in self.overall_cuts],
             "per_sport_cuts": {
                 sport: [c.to_dict() for c in cuts]
@@ -158,9 +168,21 @@ def _aggregate_one_cut(
     return CutTable(name=name, buckets=[buckets[label] for label in order])
 
 
-def aggregate(feats: list[EventFeatures]) -> CalibrateReport:
-    """Build the full report from a flat feature list."""
-    report = CalibrateReport(n_predictions_total=len(feats))
+def aggregate(
+    feats: list[EventFeatures],
+    *,
+    n_duplicates_dropped: int = 0,
+) -> CalibrateReport:
+    """Build the full report from a flat feature list.
+
+    `n_duplicates_dropped` is plumbed through from `collect_features`
+    (the dedup happens there, not here) so the report can surface
+    "we dropped N duplicate predictions" alongside the deduped totals.
+    """
+    report = CalibrateReport(
+        n_predictions_total=len(feats),
+        n_duplicates_dropped=n_duplicates_dropped,
+    )
     settled = [f for f in feats if f.settled and f.won is not None]
     report.n_settled = len(settled)
     report.n_correct = sum(1 for f in settled if f.won is True)
@@ -206,8 +228,8 @@ def aggregate(feats: list[EventFeatures]) -> CalibrateReport:
     return report
 
 
-def collect_features() -> list[EventFeatures]:
-    """Walk every run log + sidecar and produce the flat feature list.
+def collect_features() -> tuple[list[EventFeatures], int]:
+    """Walk every run log + sidecar; return `(deduped_features, n_dropped)`.
 
     Joins prediction rows to their resolution by (sidecar slug). When
     a sidecar is missing for a run, predictions from that run come
@@ -215,9 +237,29 @@ def collect_features() -> list[EventFeatures]:
     anyway). Step 3 fetches its own post-match data, so this function
     deliberately returns features WITHOUT post-match divergence
     populated — Step 2 doesn't use it.
+
+    **Dedup**: same `market_slug` can appear across multiple runs (the
+    operator runs `skims rank` repeatedly before a match settles, all
+    snapshots land in `logs/runs/`). Counting each instance in the
+    hit-rate cuts double-counts settled outcomes. We dedup by
+    `market_slug` keeping the chronologically EARLIEST prediction —
+    the most-defensible anchor for hit-rate calibration because it
+    was made with the least market-price drift since prediction time.
+    `list_run_files` sorts mtime-DESCENDING (newest first), so we
+    iterate `reversed(...)` to walk oldest → newest, and the first
+    occurrence of each slug wins the dedup race.
+
+    Returned tuple's second element is the count of rows dropped by
+    dedup, plumbed through to `aggregate(...)` so the report can
+    surface it alongside the deduped totals.
     """
     feats: list[EventFeatures] = []
-    for run_path in list_run_files():
+    seen_slugs: set[str] = set()
+    duplicates_dropped = 0
+    # Oldest-first so the earliest prediction for each market wins
+    # dedup. `list_run_files` returns mtime-descending; reverse for
+    # ascending traversal without re-sorting.
+    for run_path in reversed(list_run_files()):
         sidecar = resolutions_sidecar_path(run_path)
         outcomes_by_slug: dict[str, ResolvedOutcome] = {}
         if sidecar.exists():
@@ -236,9 +278,19 @@ def collect_features() -> list[EventFeatures]:
                         continue
                     outcomes_by_slug[outcome.slug] = outcome
         for row in iter_predictions(run_path):
+            if row.market_slug in seen_slugs:
+                duplicates_dropped += 1
+                continue
+            seen_slugs.add(row.market_slug)
             outcome = outcomes_by_slug.get(row.market_slug)
             feats.append(extract_features(row, outcome, post_match=None))
-    return feats
+    if duplicates_dropped > 0:
+        log.info(
+            "calibrate: dedup'd %d duplicate prediction rows by market_slug "
+            "(kept earliest)",
+            duplicates_dropped,
+        )
+    return feats, duplicates_dropped
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +330,16 @@ def render_report(report: CalibrateReport) -> None:
         if report.n_settled > 0
         else "n/a"
     )
+    dupe_note = (
+        f" (dedup'd {report.n_duplicates_dropped} duplicate "
+        f"prediction{'s' if report.n_duplicates_dropped != 1 else ''})"
+        if report.n_duplicates_dropped > 0
+        else ""
+    )
     console.print(
         f"[bold]Retro calibrate[/bold] — "
-        f"{report.n_settled} settled / {report.n_predictions_total} total, "
-        f"{report.n_correct} correct ({overall_rate})"
+        f"{report.n_settled} settled / {report.n_predictions_total} unique markets"
+        f"{dupe_note}, {report.n_correct} correct ({overall_rate})"
     )
     console.print()
     for cut in report.overall_cuts:

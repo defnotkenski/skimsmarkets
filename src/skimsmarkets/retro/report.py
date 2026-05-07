@@ -75,11 +75,18 @@ def write_report(
         if calibrate.n_settled > 0
         else "n/a"
     )
+    dupe_note = (
+        f" (dedup'd {calibrate.n_duplicates_dropped} duplicate "
+        f"prediction{'s' if calibrate.n_duplicates_dropped != 1 else ''} "
+        f"by market_slug — kept earliest per market)"
+        if calibrate.n_duplicates_dropped > 0
+        else ""
+    )
     sections = [
         f"# Retro report — {datetime.now().isoformat(timespec='seconds')}",
         "",
         f"**Overall:** {calibrate.n_settled} settled / "
-        f"{calibrate.n_predictions_total} total, "
+        f"{calibrate.n_predictions_total} unique markets{dupe_note}, "
         f"{calibrate.n_correct} correct ({overall_rate})",
         "",
         "## Step 2 — Hit-rate cuts",

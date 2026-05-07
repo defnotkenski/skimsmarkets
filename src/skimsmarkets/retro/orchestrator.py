@@ -74,18 +74,34 @@ async def run_step_resolve(run_id: str | None = None) -> list[Path]:
 def _features_with_post_match(
     post_match_by_event: dict | None = None,
     run_id: str | None = None,
-) -> list[EventFeatures]:
+) -> tuple[list[EventFeatures], int]:
     """Build the feature list, optionally joining post-match data.
+    Returns `(deduped_features, n_dropped)`.
 
     `post_match_by_event` is keyed by `event_id`; when None, features
     have no post-match divergence populated (Step 2 doesn't need it).
     `run_id` filters to a single run (used by `--run-id` invocations).
+
+    **Dedup**: same `market_slug` can appear across multiple runs.
+    Counting each instance double-counts settled outcomes in hit-rate
+    cuts AND feeds the same divergence to the Step 3 LLM analyzer
+    multiple times. Dedup by `market_slug`, keeping the
+    chronologically EARLIEST prediction (oldest-run wins). `run_id`
+    filtered invocations dedup within one run (no-op since a single
+    run shouldn't have duplicate slugs); the cross-run case (no
+    `run_id`) is where dedup actually fires. Mirrors
+    `calibrate.collect_features` so both paths report consistent
+    market counts.
     """
     feats: list[EventFeatures] = []
+    seen_slugs: set[str] = set()
+    duplicates_dropped = 0
     paths = (
         [run_path_for_id(run_id)]
         if run_id is not None
-        else list_run_files()
+        # Oldest-first so the earliest prediction wins dedup.
+        # `list_run_files` returns mtime-descending; reverse here.
+        else list(reversed(list_run_files()))
     )
     for run_path in paths:
         if not run_path.exists():
@@ -105,6 +121,10 @@ def _features_with_post_match(
                         continue
                     outcomes_by_slug[outcome.slug] = outcome
         for row in iter_predictions(run_path):
+            if row.market_slug in seen_slugs:
+                duplicates_dropped += 1
+                continue
+            seen_slugs.add(row.market_slug)
             outcome = outcomes_by_slug.get(row.market_slug)
             pm = (
                 post_match_by_event.get(row.event_id)
@@ -112,7 +132,13 @@ def _features_with_post_match(
                 else None
             )
             feats.append(extract_features(row, outcome, pm))
-    return feats
+    if duplicates_dropped > 0:
+        log.info(
+            "retro: dedup'd %d duplicate prediction rows by market_slug "
+            "(kept earliest)",
+            duplicates_dropped,
+        )
+    return feats, duplicates_dropped
 
 
 def run_step_calibrate(
@@ -130,14 +156,17 @@ def run_step_calibrate(
     here and a `--write-json` flag on the CLI.
 
     Uses the same `collect_features` path Step 3 shares — keeps the
-    feature-extraction definition single-source-of-truth.
+    feature-extraction definition single-source-of-truth. Both paths
+    now dedup by `market_slug` (keeping the earliest prediction per
+    market) so hit-rate cuts don't double-count rows that appear in
+    multiple JSONL run files.
     """
-    feats = (
+    feats, duplicates_dropped = (
         _features_with_post_match(run_id=run_id)
         if run_id is not None
         else collect_features()
     )
-    report = aggregate(feats)
+    report = aggregate(feats, n_duplicates_dropped=duplicates_dropped)
     render_report(report)
     return report
 
@@ -165,7 +194,7 @@ async def run_step_analyze(
     async with build_tennis_provider(config) as provider:
         post_match = await fetch_post_match_for_settled(provider)
 
-    feats = _features_with_post_match(
+    feats, _duplicates_dropped = _features_with_post_match(
         post_match_by_event=post_match, run_id=run_id
     )
     anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
