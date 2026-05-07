@@ -33,7 +33,12 @@ from skimsmarkets.clob import (
 )
 from skimsmarkets.polymarket.models import PolymarketEvent
 from skimsmarkets.selection import select_top_events
-from skimsmarkets.tennis import TennisSimulationContext, TennisStatsContext
+from skimsmarkets.tennis import (
+    TennisGbtContext,
+    TennisSimulationContext,
+    TennisStatsContext,
+)
+from skimsmarkets.tennis.gbt import predict_for_event as gbt_predict_for_event
 from skimsmarkets.tennis.identity import tennis_match_identity
 from skimsmarkets.tennis.provider import (
     TennisStatsProvider,
@@ -105,6 +110,14 @@ class RunResult:
     tennis_simulation: dict[str, TennisSimulationContext] = field(
         default_factory=dict
     )
+    # Per-event GBT prediction, keyed event_id → TennisGbtContext.
+    # Populated in `enrich_tennis_gbt` after `enrich_tennis_simulation`.
+    # Director-only — same persistence posture as `tennis_simulation`
+    # so retro grading can ask "did the GBT prior track outcomes
+    # better than the sim or the director?" as a separate question.
+    # Empty when no GBT artefact / parquet have been built (no spike
+    # training has occurred yet) — silent degrade, no error rows.
+    tennis_gbt: dict[str, TennisGbtContext] = field(default_factory=dict)
     # Slate-level judge output keyed event_id → DefensibilityAssessment.
     # Populated by `judge_slate` after all per-event directors finish; left
     # empty when the judge call fails (leaderboard then falls back to the
@@ -816,6 +829,58 @@ def enrich_tennis_simulation(
     )
 
 
+def enrich_tennis_gbt(
+    events: list[PolymarketEvent],
+    errors: list[ErrorRecord],
+) -> None:
+    """Attach `event.tennis_gbt` for tennis events whose `tennis_stats`
+    carries the player MatchStat ids the GBT predictor needs.
+
+    Pure-CPU (no HTTP) — same posture as `enrich_tennis_simulation`.
+    The GBT predictor is responsible for its own gating: missing
+    artefact / parquet, cold-start (< MIN_PRIORS_PER_SIDE), or
+    unresolvable player ids all produce None silently. Failure at the
+    per-event scope records an `ErrorRecord(stage="tennis_gbt")` and
+    leaves `tennis_gbt=None` on that event; the run continues with
+    other events unaffected. Same fail-silent posture as the
+    simulation enrichment above.
+
+    Director-only by design — see CLAUDE.md and `TennisGbtContext`
+    docstring. Lenses don't see this attachment.
+    """
+    if not events:
+        return
+    attached = 0
+    for event in events:
+        if event.tennis_stats is None:
+            continue
+        try:
+            ctx = gbt_predict_for_event(event)
+        except Exception as e:  # noqa: BLE001
+            errors.append(
+                ErrorRecord(
+                    event_id=event.id,
+                    stage="tennis_gbt",
+                    error=f"{type(e).__name__}: {e}",
+                    sport_type=event.sport_type,
+                )
+            )
+            log.warning(
+                "tennis_gbt failed for %s: %s",
+                event.id,
+                type(e).__name__,
+            )
+            continue
+        if ctx is not None:
+            event.tennis_gbt = ctx
+            attached += 1
+    log.info(
+        "attached tennis GBT prior to %d/%d events",
+        attached,
+        len(events),
+    )
+
+
 async def _run_lenses(
     provider: FetcherProvider,
     anthropic: AsyncAnthropic,
@@ -948,6 +1013,10 @@ def _persist_run(result: RunResult) -> None:
                 # outcomes better than the director?" without joining
                 # against a sidecar.
                 tsim = result.tennis_simulation.get(p.event_id)
+                # GBT third prior — same persistence posture as the sim.
+                # Retro grading can ask GBT-vs-sim-vs-director-vs-market
+                # as four separate questions without joining.
+                tgbt = result.tennis_gbt.get(p.event_id)
                 # `lens_names` is derived from the keys of the prediction's
                 # specialist_reports (which match the LensSet's declared
                 # lens names by construction). Stable order via sorting
@@ -1009,6 +1078,9 @@ def _persist_run(result: RunResult) -> None:
                     ),
                     "tennis_simulation": (
                         tsim.model_dump(mode="json") if tsim is not None else None
+                    ),
+                    "tennis_gbt": (
+                        tgbt.model_dump(mode="json") if tgbt is not None else None
                     ),
                     "notebooks": notebooks_for_event,
                     "specialist_reports": reports_for_event,
@@ -1249,6 +1321,12 @@ async def run_pipeline(
         # per-event context block can render the simulation block
         # alongside the UW block. Lens fetchers don't see it.
         enrich_tennis_simulation(events, result.errors)
+        # GBT prior — third deterministic prior alongside market + sim.
+        # Pure-CPU; reads the historical parquet built by
+        # `skims gbt backfill` and the catboost artefact built by
+        # `skims gbt train`. Silent degrade when either is missing
+        # (fresh checkout, no spike training yet).
+        enrich_tennis_gbt(events, result.errors)
         # Snapshot the per-event tennis context onto the RunResult so
         # `_persist_run` can write it to the JSONL row even though the
         # event itself isn't carried into persistence (only the resulting
@@ -1259,6 +1337,8 @@ async def run_pipeline(
                 result.tennis_stats[ev.id] = ev.tennis_stats
             if ev.tennis_simulation is not None:
                 result.tennis_simulation[ev.id] = ev.tennis_simulation
+            if ev.tennis_gbt is not None:
+                result.tennis_gbt[ev.id] = ev.tennis_gbt
 
         provider = build_provider(config.fetcher_provider, config)
         result.fetcher_provider = provider.name

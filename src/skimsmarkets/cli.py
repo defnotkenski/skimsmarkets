@@ -150,6 +150,63 @@ async def _cmd_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_gbt(args: argparse.Namespace) -> int:
+    """Tennis GBT spike — backfill MatchStat box-score history and train
+    the catboost prior. Two subcommands:
+
+    - `backfill` (offline, ~50–80s for top-50 × 2 tours × 3 pages):
+       hits MatchStat past-matches with `?include=stat,tournament,round`
+       for every top-N player on each tour, dedups by `match.id`, and
+       writes `data/tennis_gbt/raw_matches.parquet` plus a small
+       profile lookup. Idempotent — overwrites both files.
+    - `train` (offline, fast feature build then ~10–15min with sim
+       compare): walks the parquet chronologically with point-in-time
+       discipline, fits catboost on the walk-forward train fold,
+       evaluates on the holdout fold, and writes
+       `models/tennis_gbt_spike.cbm` + a metrics scorecard.
+    """
+    if args.gbt_command == "backfill":
+        from skimsmarkets.tennis.gbt_backfill import run_backfill_cli
+        matches_path, profiles_path = await run_backfill_cli(
+            tours=list(args.tour) or ["atp", "wta"],
+            top_n=args.top,
+            pages=args.pages,
+            page_size=args.page_size,
+        )
+        print(f"wrote {matches_path}")
+        print(f"wrote {profiles_path}")
+        return 0
+    if args.gbt_command == "train":
+        from skimsmarkets.tennis.gbt_train import run_train_cli
+        metrics = run_train_cli(
+            features_only=args.features_only,
+            skip_sim_compare=args.skip_sim_compare,
+        )
+        # Print a one-line scorecard summary; full metrics persist to
+        # the .metrics.json sidecar for retro inspection.
+        if "holdout" in metrics:
+            h = metrics["holdout"]
+            print(
+                f"holdout n={metrics['holdout_n']}  "
+                f"brier={h['brier']:.4f}  "
+                f"log_loss={h['log_loss']:.4f}  "
+                f"auc={h.get('auc') or float('nan'):.4f}"
+            )
+            if "sim_compare" in metrics:
+                sc = metrics["sim_compare"]
+                print(
+                    f"GBT vs sim (n_paired={sc['n_paired']}): "
+                    f"GBT brier={sc['gbt_brier']:.4f}  "
+                    f"sim brier={sc['sim_brier']:.4f}  "
+                    f"delta={sc['gbt_brier'] - sc['sim_brier']:+.4f}"
+                )
+        else:
+            print(f"feature-only smoke: {metrics}")
+        return 0
+    print(f"unknown gbt subcommand: {args.gbt_command}", file=sys.stderr)
+    return 1
+
+
 async def _cmd_retro(args: argparse.Namespace) -> int:
     """Self-improvement layer — read past JSONL run logs, resolve outcomes
     against gamma, compute hit-rate cuts, and (Step 3) run a batched
@@ -203,7 +260,7 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
 # user invoked `skims` with bare slate flags (no subcommand) so we can default
 # to `rank`. Kept as a module-level constant so the default-injection in
 # `main()` and the subparser registration stay in sync.
-_SUBCOMMANDS = ("rank", "fetch", "backtest", "retro")
+_SUBCOMMANDS = ("rank", "fetch", "backtest", "retro", "gbt")
 
 
 def _build_slate_parser() -> argparse.ArgumentParser:
@@ -268,7 +325,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     slate = _build_slate_parser()
     sub = parser.add_subparsers(
-        dest="command", metavar="{rank,fetch,backtest,retro}"
+        dest="command", metavar="{rank,fetch,backtest,retro,gbt}"
     )
 
     p_rank = sub.add_parser(
@@ -342,6 +399,74 @@ def _build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
 
+    # `skims gbt` — tennis GBT feasibility-spike commands.
+    p_gbt = sub.add_parser(
+        "gbt",
+        help=(
+            "Tennis GBT spike: backfill MatchStat history and train the "
+            "catboost prior. Outputs land in `data/tennis_gbt/` (raw "
+            "matches, gitignored) and `models/` (model artefact, "
+            "committed to repo)."
+        ),
+    )
+    gbt_sub = p_gbt.add_subparsers(
+        dest="gbt_command", metavar="{backfill,train}"
+    )
+
+    p_backfill = gbt_sub.add_parser(
+        "backfill",
+        help=(
+            "Hit MatchStat past-matches for top-N players × tour and "
+            "write `data/tennis_gbt/raw_matches.parquet`."
+        ),
+    )
+    p_backfill.add_argument(
+        "--tour", action="append", default=[], metavar="TOUR",
+        help="Tour to backfill (atp/wta). Repeatable. Default: both.",
+    )
+    p_backfill.add_argument(
+        "--top", type=int, default=50,
+        help="Top-N players per tour (default: 50).",
+    )
+    p_backfill.add_argument(
+        "--pages", type=int, default=3,
+        help="Past-matches pages per player (default: 3, ~300 matches).",
+    )
+    p_backfill.add_argument(
+        "--page-size", type=int, default=100,
+        help="Past-matches page size (vendor cap is generous; default: 100).",
+    )
+    p_backfill.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+
+    p_train = gbt_sub.add_parser(
+        "train",
+        help=(
+            "Walk-forward train the catboost prior on the backfilled "
+            "parquet and write `models/tennis_gbt_spike.cbm` + metrics."
+        ),
+    )
+    p_train.add_argument(
+        "--features-only", action="store_true",
+        help=(
+            "Build the training table and exit (no fit) — smoke-test "
+            "the feature pipeline without paying the catboost training "
+            "cost."
+        ),
+    )
+    p_train.add_argument(
+        "--skip-sim-compare", action="store_true",
+        help=(
+            "Skip the iid Monte Carlo baseline comparison (which runs "
+            "thousands of sims and adds ~5-10 min). Useful for fast "
+            "iteration on hyperparameters."
+        ),
+    )
+    p_train.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+
     return parser
 
 
@@ -370,6 +495,7 @@ def main() -> int:
         "fetch": _cmd_fetch,
         "backtest": _cmd_backtest,
         "retro": _cmd_retro,
+        "gbt": _cmd_gbt,
     }
     return asyncio.run(dispatch[args.command](args))
 

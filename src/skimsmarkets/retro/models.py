@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from skimsmarkets.tennis.models import (
     PerMatchStats,
+    TennisGbtContext,
     TennisSimulationContext,
     TennisStatsContext,
 )
@@ -65,6 +66,7 @@ class PredictionRow(BaseModel):
     defensibility_flags: list[str] = Field(default_factory=list)
     tennis_stats: TennisStatsContext | None = None
     tennis_simulation: TennisSimulationContext | None = None
+    tennis_gbt: TennisGbtContext | None = None
     # `notebooks` and `specialist_reports` are intentionally NOT decoded
     # to typed objects — their concrete shapes vary by lens set and
     # carrying the full `LensSpec.report_schema` resolution into the

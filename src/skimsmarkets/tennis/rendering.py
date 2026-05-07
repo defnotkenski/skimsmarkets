@@ -31,6 +31,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 
 from skimsmarkets.tennis.models import (
+    TennisGbtContext,
     TennisH2HMeeting,
     TennisHeadToHead,
     TennisInMatchupStats,
@@ -395,6 +396,34 @@ def render_tennis_simulation_block(ctx: TennisSimulationContext) -> str:
         f"  point-win on team_a's serve: {pa_serve:.3f}; "
         f"on team_b's serve: {pb_serve:.3f}\n"
         f"  assumptions: {ctx.assumptions}"
+    )
+
+
+def render_tennis_gbt_block(ctx: TennisGbtContext) -> str:
+    """Compact GBT-prediction render for the director's user message.
+
+    Director-only — same posture as `render_tennis_simulation_block`.
+    Lenses don't see this. Format mirrors the labelled-header
+    convention so the director can grep the block by its leading
+    parenthesis.
+
+    Top features render as a one-line list of `name=±contribution`
+    tokens; the sign tells the director which side the model leaned
+    toward (positive = team_a if anchor==team_a, but the contribution
+    is anchor-relative so we annotate that explicitly).
+    """
+    p = ctx.p_team_a_wins
+    feat_bits: list[str] = []
+    for f in ctx.top_features:
+        sign = "+" if f.contribution >= 0 else "−"
+        feat_bits.append(f"{f.name}={sign}{abs(f.contribution):.3f}")
+    feat_line = ("  top features (anchor-relative log-odds): " + "  ".join(feat_bits)) if feat_bits else ""
+    return (
+        f"--- Tennis GBT prior (provider: {ctx.provider}, version: {ctx.model_version}) ---\n"
+        f"  p(team_a wins) = {p:.3f}\n"
+        f"  prior matches: a={ctx.n_prior_matches_a}  b={ctx.n_prior_matches_b}\n"
+        + (feat_line + "\n" if feat_line else "")
+        + f"  assumptions: {ctx.assumptions}"
     )
 
 

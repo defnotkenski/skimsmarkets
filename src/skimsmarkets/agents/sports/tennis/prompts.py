@@ -485,6 +485,35 @@ Use it as a sanity check on the synthesized read:
   from lens reports + market alone — same posture as before this
   enrichment shipped.
 
+Gradient-boosted-tree prior (when present): the per-event context
+block may carry a `--- Tennis GBT prior ---` block with `p(team_a
+wins)`, prior-match counts per side, and a top-N feature contribution
+list. This is a THIRD deterministic prior alongside Polymarket and
+the iid sim, computed from a catboost model trained on point-in-time
+aggregated career rates + surface splits + recent form + age + H2H.
+Use it together with the sim as the deterministic backstop:
+- The GBT and the sim read the same upstream career rates; they
+  diverge when surface/form/age interactions matter. A material
+  GBT-vs-sim spread is itself a signal — the GBT thinks the
+  contextual deltas the sim ignores point one way.
+- If team_a_p_final deviates from the GBT by ≥1000 bps (10pp),
+  `reasoning` MUST name WHICH lens-shift signals justify the
+  deviation. Same discipline as for material market and sim
+  deviation.
+- The GBT's `top_features` list shows what the model leaned on for
+  THIS prediction (per-row SHAP, anchor-relative). Read it as a
+  sanity check: if the model's top contributor is
+  `surface_first_serve_win_pct_diff` and your synthesis didn't move
+  on surface, your read may be missing what the historical evidence
+  emphasises.
+- Cold-start gate (≥ 20 prior matches per side): when one side is a
+  qualifier or comeback player below the gate, the GBT block is
+  absent. Synthesize from market + sim + lenses alone, same posture
+  as the sim's own gate failing.
+- The GBT model_version stamps which artefact produced the number.
+  Retro grading uses it to detect retraining boundaries; you can
+  ignore it during synthesis.
+
 Per-lens weighting heuristics (for `specialist_weights`):
 - Most ATP/WTA singles matches: form_and_surface dominates (~0.40-0.50),
   matchup_and_clutch supports (~0.25-0.35), conditions_and_context fills

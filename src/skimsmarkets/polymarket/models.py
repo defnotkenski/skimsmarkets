@@ -17,7 +17,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from skimsmarkets.clob import invert_sparkline as _invert_sparkline
-from skimsmarkets.tennis.models import TennisSimulationContext, TennisStatsContext
+from skimsmarkets.tennis.models import (
+    TennisGbtContext,
+    TennisSimulationContext,
+    TennisStatsContext,
+)
 from skimsmarkets.unusual_whales.models import UnusualWhalesContext
 
 
@@ -637,6 +641,15 @@ class PolymarketEvent(BaseModel):
     # tennis events without populated career serve/return % on both
     # players, and whenever the gate failed.
     tennis_simulation: TennisSimulationContext | None = None
+    # Attached post-validation by `enrich_tennis_gbt()` after
+    # `enrich_tennis_stats` populates the player MatchStat ids the
+    # GBT predictor uses to look up historical aggregates. Director-
+    # only (same posture as `tennis_simulation`) — a finite-window
+    # historical prior the lenses shouldn't second-guess. Always None
+    # for non-tennis events, tennis events whose players miss the
+    # cold-start gate, and runs where the GBT artefact / parquet
+    # are absent (no spike training has occurred yet).
+    tennis_gbt: TennisGbtContext | None = None
 
     @field_validator("id", mode="before")
     @classmethod

@@ -400,6 +400,83 @@ class TennisStatsContext(BaseModel):
         return False
 
 
+class TennisGbtFeatureContribution(BaseModel):
+    """One feature-importance row for the director-facing top-N display.
+
+    Sourced from catboost's `get_feature_importance(type=PredictionValuesChange)`
+    re-evaluated on the slate row (so the importance is local to THIS
+    prediction, not the global model). The director uses the top 3-5 to
+    explain "what the model leaned on for this match" — e.g. a +0.12
+    contribution from `surface_first_serve_win_pct_diff` says the model's
+    surface-conditioned serve read tilted toward the anchor.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    contribution: float = Field(
+        description=(
+            "Signed contribution to the anchor-side log-odds. Positive "
+            "pushes toward the anchor (lower MatchStat id), negative "
+            "toward the opponent."
+        )
+    )
+
+
+class TennisGbtContext(BaseModel):
+    """Per-event gradient-boosted-tree prediction.
+
+    Director-only — same architectural posture as `TennisSimulationContext`.
+    Computed deterministically from the career box-score primitives on
+    `TennisStatsContext` at pipeline time in `enrich_tennis_gbt`. The
+    director uses this as a THIRD deterministic prior alongside Polymarket
+    bid/ask and the iid Monte Carlo sim; lenses don't see it.
+
+    Where the sim asks "what's the long-run rate from career averages?"
+    the GBT asks "given the full feature vector — career rates, surface
+    conditioning, recent form, age — what does history say P(team_a
+    wins) is?" The two diverge usefully when surface or form actually
+    matter, and the director's anti-anchoring instructions explain
+    material divergence in `reasoning`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # Versioned tag so a future v2 (e.g. recency-weighted, surface
+    # submodels) can co-exist on JSONL rows without ambiguity.
+    provider: Literal["gbt_spike_v1"] = "gbt_spike_v1"
+    computed_at: datetime
+    # Model artifact identity. The training script stamps the hash of
+    # the artifact bytes here so retro grading can detect retraining
+    # boundaries on the time axis.
+    model_version: str
+    p_team_a_wins: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Model probability that team_a wins, mapped from the "
+            "anchor-relative prediction by the slate-time predictor."
+        ),
+    )
+    # Per-side prior-match counts. The cold-start gate drops events
+    # where either side has < 20 priors; persisting the counts lets
+    # retro grading see how thin the model's evidence base was for
+    # marginal cases (e.g. comeback player with a 12-match window).
+    n_prior_matches_a: int = Field(ge=0)
+    n_prior_matches_b: int = Field(ge=0)
+    # Top-N feature contributions by absolute value. Ordered descending
+    # by |contribution|. Capped at 5 — the director doesn't need a full
+    # SHAP plot, just the model's top reads.
+    top_features: list[TennisGbtFeatureContribution] = Field(
+        default_factory=list
+    )
+    # One-line description of model scope, mirrors the sim's
+    # `assumptions` field. Surfaces in the rendered block so the
+    # director treats the GBT as a finite-window historical prior, not
+    # a contextual probability.
+    assumptions: str
+
+
 class TennisSimulationContext(BaseModel):
     """Per-event Monte Carlo career-baseline simulation result.
 

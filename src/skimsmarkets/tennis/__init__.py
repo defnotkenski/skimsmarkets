@@ -40,6 +40,8 @@ submodule:
 """
 
 from skimsmarkets.tennis.models import (
+    TennisGbtContext,
+    TennisGbtFeatureContribution,
     TennisH2HMeeting,
     TennisHeadToHead,
     TennisInMatchupStats,
@@ -50,6 +52,7 @@ from skimsmarkets.tennis.models import (
 )
 from skimsmarkets.tennis.rendering import (
     render_tennis_fatigue_block,
+    render_tennis_gbt_block,
     render_tennis_simulation_block,
     render_tennis_stats_block,
 )
@@ -60,6 +63,8 @@ from skimsmarkets.tennis.simulation import (
 )
 
 __all__ = [
+    "TennisGbtContext",
+    "TennisGbtFeatureContribution",
     "TennisH2HMeeting",
     "TennisHeadToHead",
     "TennisInMatchupStats",
@@ -69,6 +74,7 @@ __all__ = [
     "TennisStatsContext",
     "detect_best_of",
     "render_tennis_fatigue_block",
+    "render_tennis_gbt_block",
     "render_tennis_simulation_block",
     "render_tennis_stats_block",
     "simulate_for_event",

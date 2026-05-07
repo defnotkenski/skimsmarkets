@@ -17,7 +17,10 @@ from skimsmarkets.agents.sport_hints import render_director_sport_hint
 from skimsmarkets.agents.sports import DIRECTOR_SHARED_PREAMBLE
 from skimsmarkets.agents.sports.base import LensSet
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
-from skimsmarkets.tennis import render_tennis_simulation_block
+from skimsmarkets.tennis import (
+    render_tennis_gbt_block,
+    render_tennis_simulation_block,
+)
 from skimsmarkets.unusual_whales import render_uw_block
 
 log = logging.getLogger(__name__)
@@ -143,6 +146,13 @@ def _render_event_context_block(event: PolymarketEvent) -> str:
     if event.tennis_simulation is not None:
         lines.append("")
         lines.append(render_tennis_simulation_block(event.tennis_simulation))
+    # GBT third prior, also director-only — same posture as the sim.
+    # Trained on point-in-time aggregated career rates + surface splits
+    # + recent form + age + H2H. Director uses it as a finite-window
+    # historical prior alongside the market and the iid sim.
+    if event.tennis_gbt is not None:
+        lines.append("")
+        lines.append(render_tennis_gbt_block(event.tennis_gbt))
     return "\n".join(lines)
 
 
