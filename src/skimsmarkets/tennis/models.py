@@ -263,6 +263,33 @@ class TennisPlayerStats(BaseModel):
     # (futures, challengers, team_cup) skipped — not load-bearing for
     # tour-level Polymarket markets.
     career_titles: dict[str, int] | None = None
+    # Career-aggregate clutch records, derived by parsing past-matches
+    # score strings (provider.parse_score_details). Sample-size visible
+    # so the lens render can show e.g. `tiebreaks=42-31` — Claude
+    # calibrates clutch shifts around denominators, not raw rates.
+    # Distinct from `TennisHeadToHead.{a,b}_in_matchup` which is the
+    # OPPONENT-conditioned slice; these are career-aggregate, span the
+    # last 50 past-matches the provider pulls. `(wins, total)` pairs.
+    # All None when past-matches lacks score strings (older rows
+    # occasionally drop them) — the renderer suppresses absent lines.
+    career_tiebreak_record: tuple[int, int] | None = None
+    career_decider_record: tuple[int, int] | None = None
+    # `comeback`: matches won given set 1 lost. Denominator counts only
+    # matches where this player lost set 1 — an absent denominator is
+    # itself signal (player rarely loses set 1) but we surface the
+    # ratio anyway since a pure denominator delta is hard to read.
+    career_comeback_record: tuple[int, int] | None = None
+    # `close_match`: final-set margin ≤2 OR final set was a tiebreak.
+    # Captures matches decided by small-edge skill rather than gulfs in
+    # quality.
+    career_close_match_record: tuple[int, int] | None = None
+    # Recency-windowed BP-save (last 180 days). Complements the career
+    # `break_point_save_pct` (no time bound) by surfacing form arcs:
+    # 75% recent vs 65% career flags an upswing the GBT's career
+    # feature would smooth over. Computed from per-match BP counters
+    # in past-matches.stats — same data the existing career rate uses,
+    # filtered by date.
+    break_point_save_pct_180d: float | None = None
 
     @field_validator("last_match_date", mode="before")
     @classmethod

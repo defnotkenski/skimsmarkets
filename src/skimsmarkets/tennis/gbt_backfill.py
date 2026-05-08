@@ -227,6 +227,18 @@ def _flatten_match(row: dict[str, Any], tour: str) -> dict[str, Any] | None:
     s1 = (stats.get("player1") or {}) if isinstance(stats, dict) else {}
     s2 = (stats.get("player2") or {}) if isinstance(stats, dict) else {}
 
+    # Score string (e.g. "7-6(3) 6-4"). Persisted raw so the feature
+    # builder can call `parse_score_details` and derive
+    # tiebreak/decider/comeback/close-match aggregates point-in-time.
+    # Older rows occasionally drop the field — the feature builder
+    # treats None as "no clutch signal for this match" and skips it
+    # without bumping any denominators.
+    score_raw = row.get("result")
+    score = (
+        score_raw.strip()
+        if isinstance(score_raw, str) and score_raw.strip()
+        else None
+    )
     out: dict[str, Any] = {
         "match_id": mid,
         "tour": tour,
@@ -240,6 +252,7 @@ def _flatten_match(row: dict[str, Any], tour: str) -> dict[str, Any] | None:
         "p2_id": p2_id,
         "p2_name": p2.get("name"),
         "winner_side": winner_side,  # 1 if p1 won, 2 if p2 won
+        "score": score,
     }
     # Per-side raw counters. Counts (aces, dfs, total points won) and
     # the numerator/denominator pairs that the feature builder

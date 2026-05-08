@@ -195,10 +195,11 @@ _TIER_MULTIPLIER_MASTERS = 1.05
 _INFO_DENSITY_CAP = 0.1
 
 # Recent-match count where info-density saturates to "fully readable".
-# Warmup pulls page_size=10 per player (`_SELECTION_MATCH_PAGE_SIZE`),
-# so 8 represents an active player with ~80% cache fill. Below this we
-# scale linearly down to 0. Bottlenecked by the worse-served side: a
-# 10-match cache vs a 2-match cache reads as info-poor matchup.
+# 8 active matches in a player's recent history is enough for the
+# lens chains to read form trajectory, surface depth, and matchup
+# context. Below this we scale linearly down to 0. Bottlenecked by
+# the worse-served side: a deep-cache vs sparse-cache matchup reads
+# as info-poor.
 _INFO_DENSITY_RECENT_HIGH = 8
 
 # Surface-specific match count where surface-density saturates.

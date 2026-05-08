@@ -5,26 +5,32 @@ Each `LensSpec` carries:
   system block, parameterized by the provider's tool prose.
 - `reasoner_system` — the cached system prompt for the Claude reasoner.
 - `report_schema` — the Pydantic class the reasoner returns.
-- `render_extras` — per-lens user-message append. Two lenses currently
-  wire one: `tennis_form_and_surface` gets the FULL stats block;
-  `tennis_conditions_and_context` gets a NARROW fatigue-only slice.
-  `tennis_matchup_and_clutch` has no structured render and pulls its
-  primitives via the fetcher's web search.
+- `render_extras` — per-lens user-message append. All three lenses
+  wire one, each scoped to what that lens owns. See the rendering
+  module's docstring for the field inventory per block.
 - `fetcher_sport_hint` / `reasoner_sport_hint` — per-lens sport-specific
   guidance, ride on the user message (never the cached system block).
 
-Why two `render_extras` callables on the same data source?
-Same source, two scoped views. The full block contains form/surface
-stats, matchup-conditioned stats, and primitives the conditions lens
-also cares about (`last_match_date`, `recent_matches` for fatigue).
-Piping the FULL block to all three lenses would breach the silo
-without buying material data; routing nothing to conditions wastes
-the fatigue primitives the vendor already ships. The split:
-form_and_surface gets the full block (it owns the plurality of
-fields); conditions gets a narrow fatigue-only render derived from
-the same source data; matchup_and_clutch gets nothing structured and
-web-searches its primitives via the fetcher. This preserves the
-silo posture from CLAUDE.md — each lens sees only what it needs.
+Why three `render_extras` callables on one `TennisStatsContext`?
+Same source, three scoped views. The vendor payload spans
+form/surface primitives, matchup-conditioned + clutch primitives,
+and fatigue primitives. Piping the full payload to all three lenses
+would breach the silo and waste tokens; piping nothing to two of
+them would force them to web-search data we already paid to fetch.
+The split:
+- `tennis_form_and_surface` gets `render_tennis_form_block` —
+  rankings, surface splits, recent form, career serve/return, tier
+  records, career titles. Excludes H2H + clutch primitives.
+- `tennis_matchup_and_clutch` gets `render_tennis_matchup_block` —
+  H2H counts + per-surface H2H + recent meetings +
+  matchup-conditioned per-player records (deciders, tiebreaks,
+  set-1 conversions, in-matchup serve/BP) + career BP-save / BP-
+  convert + handedness.
+- `tennis_conditions_and_context` gets `render_tennis_fatigue_block` —
+  `days_since_last_match` + `match_count_last_14d` per player.
+
+Each lens sees only what it owns; this preserves the silo posture
+from CLAUDE.md.
 """
 
 from __future__ import annotations
@@ -47,25 +53,37 @@ from skimsmarkets.agents.sports.tennis.schemas import (
 from skimsmarkets.polymarket.models import PolymarketEvent
 from skimsmarkets.tennis import (
     render_tennis_fatigue_block,
-    render_tennis_stats_block,
+    render_tennis_form_block,
+    render_tennis_matchup_block,
 )
 
 
-def _render_tennis_stats_extras(event: PolymarketEvent) -> str | None:
+def _render_tennis_form_extras(event: PolymarketEvent) -> str | None:
     """Per-lens user-message append for `tennis_form_and_surface`.
 
-    Returns the FULL tennis-stats block when present, `None`
-    otherwise. The form_and_surface lens consumes the plurality of
-    these fields (rankings, surface splits, recent matches, career
-    serve/return %, tier records, career titles); piping the full
-    block to the matchup lens would breach the silo without buying
-    material lens-specific data — that lens pulls its own primitives
-    via the fetcher's web search. The conditions lens gets a narrower
-    slice via `_render_tennis_fatigue_extras`.
+    Returns the form-scoped block (rankings, surface splits, recent
+    form, career serve/return, tier records, career titles) when
+    `tennis_stats` is present. Excludes H2H and clutch primitives —
+    those go to the matchup lens via `_render_tennis_matchup_extras`.
     """
     if event.tennis_stats is None:
         return None
-    return render_tennis_stats_block(event.tennis_stats)
+    return render_tennis_form_block(event.tennis_stats)
+
+
+def _render_tennis_matchup_extras(event: PolymarketEvent) -> str | None:
+    """Per-lens user-message append for `tennis_matchup_and_clutch`.
+
+    Returns the matchup-scoped block (H2H + matchup-conditioned
+    per-player records + career BP-save / BP-convert + handedness)
+    when `tennis_stats` is present AND something clutch-relevant is
+    populated. Returns `None` for first-time meetings between two
+    players who lack BP/handedness data — the lens falls back to
+    web-search-only in that case (same posture as before this fix).
+    """
+    if event.tennis_stats is None:
+        return None
+    return render_tennis_matchup_block(event.tennis_stats)
 
 
 def _render_tennis_fatigue_extras(event: PolymarketEvent) -> str | None:
@@ -305,7 +323,7 @@ TENNIS_LENS_SET = LensSet(
             fetcher_system_builder=tennis_form_and_surface_notebook_system,
             reasoner_system=TENNIS_FORM_AND_SURFACE_REASONER_SYSTEM,
             report_schema=TennisFormSurfaceReport,
-            render_extras=_render_tennis_stats_extras,
+            render_extras=_render_tennis_form_extras,
             fetcher_sport_hint=_FETCHER_HINT_FORM_AND_SURFACE,
             reasoner_sport_hint=_REASONER_HINT_FORM_AND_SURFACE,
         ),
@@ -314,6 +332,7 @@ TENNIS_LENS_SET = LensSet(
             fetcher_system_builder=tennis_matchup_and_clutch_notebook_system,
             reasoner_system=TENNIS_MATCHUP_AND_CLUTCH_REASONER_SYSTEM,
             report_schema=TennisMatchupClutchReport,
+            render_extras=_render_tennis_matchup_extras,
             fetcher_sport_hint=_FETCHER_HINT_MATCHUP_AND_CLUTCH,
             reasoner_sport_hint=_REASONER_HINT_MATCHUP_AND_CLUTCH,
         ),

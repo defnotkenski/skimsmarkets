@@ -11,22 +11,25 @@ wiring.
 Scope is narrow on purpose:
 - Only ATP/WTA singles head-to-heads. Doubles, qualifiers, and mixed-tour
   novelty markets fall through `tennis_match_identity` to None.
-- The `tennis_form_and_surface` lens consumes the FULL stats block —
-  rankings, surface splits, career serve/return, tier records, titles,
-  H2H — because that lens owns the plurality of the fields and the
-  full block IS its structured payload. Routed via
-  `render_tennis_stats_block`.
+- The `tennis_form_and_surface` lens consumes a form-scoped block —
+  rankings, surface splits, recent form, career serve/return, tier
+  records, career titles. Routed via `render_tennis_form_block`. It
+  EXCLUDES H2H and clutch primitives — those are matchup-owned.
+- The `tennis_matchup_and_clutch` lens consumes a matchup-scoped
+  block — H2H counts + per-surface H2H + recent meetings +
+  matchup-conditioned per-player records (deciders, tiebreaks,
+  set-1 conversions, in-matchup serve/BP) + career BP-save / BP-
+  convert + handedness. Routed via `render_tennis_matchup_block`.
+  Returns None when nothing clutch-relevant is populated.
 - The `tennis_conditions_and_context` lens consumes a NARROW
   fatigue-only slice — `days_since_last_match`,
   `match_count_last_14d` per player — derived from
   `last_match_date` + `recent_matches` (same source data, different
-  scoped view). Routed via `render_tennis_fatigue_block`. The
-  conditions lens needs the fatigue primitives but not the full
-  payload; web-search owns the fatigue inputs not on MatchStat's
-  surface (travel/timezone, retirement frequency, medical timeouts).
-- The `tennis_matchup_and_clutch` lens and the director don't
-  receive any structured tennis-stats render. The matchup lens
-  web-searches H2H/style-fit primitives via its own fetcher.
+  scoped view). Routed via `render_tennis_fatigue_block`. Web-search
+  owns the fatigue inputs not on MatchStat's surface
+  (travel/timezone, retirement frequency, medical timeouts).
+- The director receives the simulator + GBT priors but no raw
+  tennis-stats render — the lens reports synthesise that data.
 
 Import shape — only models and rendering are re-exported here.
 `identity` and `provider` import `PolymarketEvent` from
@@ -52,9 +55,10 @@ from skimsmarkets.tennis.models import (
 )
 from skimsmarkets.tennis.rendering import (
     render_tennis_fatigue_block,
+    render_tennis_form_block,
     render_tennis_gbt_block,
+    render_tennis_matchup_block,
     render_tennis_simulation_block,
-    render_tennis_stats_block,
 )
 from skimsmarkets.tennis.simulation import (
     detect_best_of,
@@ -74,9 +78,10 @@ __all__ = [
     "TennisStatsContext",
     "detect_best_of",
     "render_tennis_fatigue_block",
+    "render_tennis_form_block",
     "render_tennis_gbt_block",
+    "render_tennis_matchup_block",
     "render_tennis_simulation_block",
-    "render_tennis_stats_block",
     "simulate_for_event",
     "simulate_match",
 ]

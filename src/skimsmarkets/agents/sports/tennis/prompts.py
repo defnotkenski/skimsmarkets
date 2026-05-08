@@ -28,9 +28,9 @@ in your output. Your job is to gather evidence on (a) how well each player is
 playing right now and (b) how well that quality translates to THIS match's
 surface.
 
-If the event context contains a `--- Tennis stats (vendor: ...) ---` block,
-those numbers are pre-fetched from a structured tennis-stats vendor and are
-AUTHORITATIVE for what they cover. Per player it ships:
+If the event context contains a `--- Tennis form & surface (vendor: ...) ---`
+block, those numbers are pre-fetched from a structured tennis-stats vendor
+and are AUTHORITATIVE for what they cover. Per player it ships:
 - current singles rank + points; career-high rank
 - YTD W-L; surface-conditioned W-L (hard / clay / grass / carpet)
 - last-10 form string (oldest→newest); date of last match played
@@ -57,7 +57,9 @@ Web-search ONLY for things the block doesn't cover for THIS lens:
   performing them right now.
 
 What this lens does NOT own (do not duplicate work the other tennis lenses do):
-- H2H counts, in-matchup clutch, handedness matchup → tennis_matchup_and_clutch.
+- H2H counts, matchup-conditioned clutch, career BP-save / BP-convert,
+  handedness — these ride on a separate `--- Tennis matchup & clutch
+  (vendor: ...) ---` block delivered to tennis_matchup_and_clutch.
 - Court conditions, weather, fatigue from prior rounds, stakes, current
   niggling injuries → tennis_conditions_and_context.
 
@@ -79,8 +81,9 @@ You are a TENNIS MATCHUP-AND-CLUTCH FETCHER. Set
 evidence on (a) how this specific matchup plays tactically and (b) who
 handles pressure better in this matchup.
 
-If the event context contains a `--- Tennis stats (vendor: ...) ---` block,
-the matchup data it ships is AUTHORITATIVE for what it covers. Per matchup:
+If the event context contains a `--- Tennis matchup & clutch (vendor: ...)
+---` block, the data it ships is AUTHORITATIVE for what it covers. Per
+matchup:
 - total head-to-head counts + per-surface H2H counts
 - 3 most recent meetings (date, winner, surface, round, score)
 - in-matchup decider/tiebreak/bo3/bo5 records (player A and player B
@@ -93,6 +96,10 @@ the matchup data it ships is AUTHORITATIVE for what it covers. Per matchup:
 Per player the block also ships handedness (`plays`: right-handed / left-
 handed) and career BP-save / BP-convert percentages — these belong to
 THIS lens, not the form lens, because they're style/clutch primitives.
+
+The block may be absent for first-time meetings between two players who
+also lack handedness AND career BP rates — fall back to web search in
+that case (same posture as before structured matchup data shipped).
 
 Copy these verbatim into `research_notes` and lift each numeric entry into
 `computed_numbers` (e.g. `h2h_count_alcaraz_djokovic`, `decider_record_alcaraz_vs_djokovic`,

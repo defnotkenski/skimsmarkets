@@ -67,7 +67,7 @@ import logging
 import random
 import unicodedata
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import TracebackType
 from typing import Any, Self
 
@@ -87,6 +87,7 @@ from skimsmarkets.tennis.provider import (
     MatchHistoryRow,
     _match_completeness,
     _parse_set_scores,
+    parse_score_details,
 )
 
 log = logging.getLogger(__name__)
@@ -148,28 +149,35 @@ _TITLE_TIERS_KEEP: dict[int, str] = {
 # parser stay in sync.
 _MATCH_INCLUDE = "tournament,round"
 
-# Recent-match / recent-meeting page sizes. Kept conservative — the
-# renderer caps at 3 rows for prompt-token reasons, but we pull a couple
-# extra in case the vendor omits a row.
-_RECENT_MATCH_PAGE_SIZE = 5
+# How many rows to slice for the recent-matches prompt digest. Distinct
+# from the FETCH page size below — the digest stays compact for prompt
+# tokens, while the fetch pulls more to feed the variance estimator and
+# career-aggregate clutch computation.
+_RECENT_MATCH_DIGEST_SIZE = 5
 _RECENT_MEETING_PAGE_SIZE = 3
 
-# Selection-stage past-matches page size. Larger than the live recent-
-# matches budget because the variance estimator divides by N — pinning
-# to 5 leaves the dispersion metric at the noise floor, while 10 gives
-# the selector enough denominator to discriminate steady vs streaky
-# players. Downstream `_player_recent_matches` slices the cached list
-# down to its own `_RECENT_MATCH_PAGE_SIZE` for the prompt block.
-_SELECTION_MATCH_PAGE_SIZE = 10
-# Include relations for the selection-stage warmup. `stat` brings the
-# per-match box-score block (first-serve %, etc.) used by the variance
-# estimator; `tournament,round` brings the surface / tier / round name
-# downstream `TennisRecentMatch` consumers expect. The live
-# `_RECENT_MATCH_PAGE_SIZE` path uses `_MATCH_INCLUDE` (no `stat`)
-# because it doesn't need the box-score block; the cache fallback in
-# `_player_recent_matches` keeps that lighter shape so small slates
-# (no warmup, fits under cap) pay the same HTTP cost as before.
-_SELECTION_MATCH_INCLUDE = "stat,tournament,round"
+# Unified past-matches fetch size. Sized for the longest-tail consumer:
+# career-aggregate clutch (tiebreak / decider / comeback / close-match
+# rates on `TennisPlayerStats`) needs ~50 matches for stable
+# denominators. The variance estimator and recent-matches digest both
+# slice from this same cached list — denominator-larger is monotonically
+# better for the variance estimator and the digest still slices to
+# `_RECENT_MATCH_DIGEST_SIZE` for the prompt. Vendor caps at 100/page;
+# 50 stays well under and keeps response payloads manageable.
+_PAST_MATCHES_FETCH_SIZE = 50
+# Include relations for past-matches. `stat` brings per-match box-score
+# (first-serve %, BP convert / face counts, used by the variance
+# estimator and clutch aggregator); `tournament,round` brings surface /
+# tier / round name for `TennisRecentMatch`. Always-on now — both the
+# selector warmup and the live recent-matches path share this shape so
+# the cache populated by either is immediately reusable by the other.
+_PAST_MATCHES_INCLUDE = "stat,tournament,round"
+
+# Recency window for the BP-save 180d feature on `TennisPlayerStats`.
+# Layered over the existing career BP-save % (no time bound) so the
+# lens / GBT can read recent-form arcs (e.g. 75% recent vs 65% career
+# = upswing).
+_BP_SAVE_RECENCY_DAYS = 180
 
 _RETRY_ATTEMPTS = 5
 _RETRY_BASE_S = 1.0
@@ -800,6 +808,91 @@ class MatchStatTennisProvider:
         return result
 
     @staticmethod
+    def _compute_career_clutch(
+        rows: Iterable[MatchHistoryRow], today: date
+    ) -> dict[str, Any]:
+        """Aggregate `MatchHistoryRow`s into the 5 career-aggregate
+        clutch fields on `TennisPlayerStats`.
+
+        Walks each row, parses its score via `parse_score_details`,
+        rotates winner-relative facts onto the subject's perspective
+        (the row already carries `won` for the subject), and folds into
+        running counters.
+
+        BP-save 180d counters use the row's pre-derived `bp_saved` /
+        `bp_faced` (subject's perspective; computed at row-parse time
+        from the OPPONENT's BP-convert counters since the vendor only
+        ships convert per row). Filtered by `date >= today - 180d`.
+
+        Each output record is suppressed (set to None in the dict) when
+        its denominator is 0 — a player who's never been to a decider
+        gets `career_decider_record=None`, not `(0, 0)`, so the lens
+        renderer's "suppress empty lines" gate works without per-line
+        null-checks downstream.
+        """
+        tb_won = tb_played = 0
+        dec_won = dec_played = 0
+        cb_won = cb_total = 0
+        cm_won = cm_played = 0
+        bp_saved_180d = bp_faced_180d = 0
+        recency_cutoff = today - timedelta(days=_BP_SAVE_RECENCY_DAYS)
+        for r in rows:
+            details = parse_score_details(r.raw_score, r.best_of, r.winner_side)
+            if details is not None:
+                # Decider — winner of the decider IS the match winner, so
+                # subject's decider win == subject's match win when the
+                # match went the distance.
+                if details.went_to_decider:
+                    dec_played += 1
+                    if r.won:
+                        dec_won += 1
+                # Tiebreaks — rotate winner-relative TB count onto subject.
+                tb_played += details.n_tiebreaks_played
+                subject_tbs_won = (
+                    details.winner_tiebreaks_won
+                    if r.won
+                    else details.n_tiebreaks_played - details.winner_tiebreaks_won
+                )
+                tb_won += subject_tbs_won
+                # Close matches.
+                if details.is_close_match:
+                    cm_played += 1
+                    if r.won:
+                        cm_won += 1
+                # Comeback — subject lost set 1 AND won match. The
+                # denominator is matches where subject lost set 1
+                # (the "given a set-1 deficit" condition).
+                subject_won_set_one = (
+                    details.winner_won_set_one
+                    if r.won
+                    else not details.winner_won_set_one
+                )
+                if not subject_won_set_one:
+                    cb_total += 1
+                    if r.won:
+                        cb_won += 1
+            # BP-save recency window — independent of score parse;
+            # derived at row-parse time from opponent's BP-convert
+            # counters.
+            if (
+                r.date is not None
+                and r.date >= recency_cutoff
+                and r.bp_saved is not None
+                and r.bp_faced is not None
+            ):
+                bp_saved_180d += r.bp_saved
+                bp_faced_180d += r.bp_faced
+        return {
+            "career_tiebreak_record": (tb_won, tb_played) if tb_played else None,
+            "career_decider_record": (dec_won, dec_played) if dec_played else None,
+            "career_comeback_record": (cb_won, cb_total) if cb_total else None,
+            "career_close_match_record": (cm_won, cm_played) if cm_played else None,
+            "break_point_save_pct_180d": (
+                bp_saved_180d / bp_faced_180d if bp_faced_180d else None
+            ),
+        }
+
+    @staticmethod
     def _parse_match_history_row(
         row: dict[str, Any], pid: int
     ) -> MatchHistoryRow | None:
@@ -830,6 +923,18 @@ class MatchStatTennisProvider:
             return None
         winner_id = _coerce_int(row.get("match_winner"))
         won = winner_id == pid
+        p2_id = _coerce_int(row.get("player2Id"))
+        # Side index (1 or 2) of the match winner relative to row p1/p2.
+        # `parse_score_details` needs this to identify which side's
+        # set-1 / tiebreak counts to treat as "winner's". None on
+        # walkover/abandoned rows where `match_winner` doesn't match
+        # either player_id.
+        if winner_id == p1_id:
+            winner_side: int | None = 1
+        elif winner_id == p2_id:
+            winner_side = 2
+        else:
+            winner_side = None
         row_date = _parse_iso_date(row.get("date"))
         tourn = row.get("tournament") if isinstance(row.get("tournament"), dict) else {}
         surface = _surface_from_court_id(tourn.get("courtId"))
@@ -859,14 +964,27 @@ class MatchStatTennisProvider:
         # silently). Subject's side: `player1` block when subject is
         # p1, else `player2`.
         first_serve_win_pct: float | None = None
+        bp_saved: int | None = None
+        bp_faced: int | None = None
         stats = row.get("stats")
         if isinstance(stats, dict):
             side = stats.get("player1" if is_subject_p1 else "player2")
+            opp = stats.get("player2" if is_subject_p1 else "player1")
             if isinstance(side, dict):
                 first_serve_win_pct = _safe_pct(
                     side.get("winningOnFirstServe"),
                     side.get("winningOnFirstServeOf"),
                 )
+            # Subject's BP-faced equals opponent's BP-convert
+            # opportunities; subject's BP-saved is the count NOT
+            # converted. Vendor ships only the converted side per row,
+            # so we derive saved arithmetically from the opponent block.
+            if isinstance(opp, dict):
+                opp_conv = _coerce_int(opp.get("breakPointsConverted"))
+                opp_conv_of = _coerce_int(opp.get("breakPointsConvertedOf"))
+                if opp_conv is not None and opp_conv_of is not None:
+                    bp_faced = opp_conv_of
+                    bp_saved = opp_conv_of - opp_conv
 
         return MatchHistoryRow(
             date=row_date,
@@ -879,6 +997,10 @@ class MatchStatTennisProvider:
             tournament_tier=tier,
             match_completeness=completeness,
             first_serve_win_pct=first_serve_win_pct,
+            best_of=_coerce_int(row.get("best_of")),
+            winner_side=winner_side,
+            bp_saved=bp_saved,
+            bp_faced=bp_faced,
         )
 
     async def _fetch_past_matches_rows(
@@ -959,8 +1081,8 @@ class MatchStatTennisProvider:
             rows = await self._fetch_past_matches_rows(
                 tour,
                 pid,
-                page_size=_SELECTION_MATCH_PAGE_SIZE,
-                include=_SELECTION_MATCH_INCLUDE,
+                page_size=_PAST_MATCHES_FETCH_SIZE,
+                include=_PAST_MATCHES_INCLUDE,
             )
             self._past_matches_cache[(tour, pid)] = rows
 
@@ -1013,14 +1135,13 @@ class MatchStatTennisProvider:
             rows = await self._fetch_past_matches_rows(
                 tour,
                 pid,
-                page_size=_RECENT_MATCH_PAGE_SIZE,
-                include=_MATCH_INCLUDE,
+                page_size=_PAST_MATCHES_FETCH_SIZE,
+                include=_PAST_MATCHES_INCLUDE,
             )
             # Populate the cache so a downstream lookup doesn't re-fetch.
-            # The fallback rows lack the `stat` block (no
-            # first_serve_win_pct), but for the recent-matches prompt
-            # block that doesn't matter — the variance estimator that
-            # cared already ran by the time we land here.
+            # The selector warmup uses the same fetch shape, so a cache
+            # populated by either path is immediately reusable by the
+            # other (variance estimator, clutch aggregator, digest).
             self._past_matches_cache[(tour, pid)] = rows
         if not rows:
             return None, []
@@ -1039,7 +1160,7 @@ class MatchStatTennisProvider:
                 tournament_name=r.tournament_name,
                 tournament_tier=r.tournament_tier,
             )
-            for r in rows[:_RECENT_MATCH_PAGE_SIZE]
+            for r in rows[:_RECENT_MATCH_DIGEST_SIZE]
         ]
         return last_date, out
 
@@ -1052,14 +1173,11 @@ class MatchStatTennisProvider:
     ) -> PerMatchStats | None:
         """Pull box-score stats for one completed match (retro-only path).
 
-        Same `past-matches` endpoint the live pipeline already calls for
-        the recent-matches digest, but with `include=stat` so the vendor
-        attaches the per-match `stats.player1` / `stats.player2` block.
-        We pull one extra include relation here rather than mutating the
-        live `_MATCH_INCLUDE` constant: pre-match calls don't need the
-        stat payload (those rows are pre-event by definition) and
-        broadening the live include bloats every per-event response for
-        no live benefit.
+        Same `past-matches` endpoint and include shape as the live
+        pipeline (`_PAST_MATCHES_INCLUDE`) — both paths need the per-
+        match `stats.player1` / `stats.player2` block, the live path for
+        career-aggregate clutch + variance estimation and the retro
+        path for the post-match `PerMatchStats` row.
 
         Match-row identification: `on_date` (UTC date the match was
         played) plus the opponent name. `opponent_name` is matched
@@ -1084,11 +1202,14 @@ class MatchStatTennisProvider:
         pageSize=20 covers ~3 weeks of typical tour activity, which is
         plenty for retro fetches (we're always hitting matches that
         are at most a few weeks old, before the operator runs the
-        retro analysis).
+        retro analysis). Distinct from the live path's
+        `_PAST_MATCHES_FETCH_SIZE` (50) because retro doesn't need
+        career-aggregate denominators — just the one row matching
+        `on_date`.
         """
         body = await self._get(
             f"/tennis/v2/{tour}/player/past-matches/{player_id}",
-            params={"pageSize": 20, "include": "stat,tournament,round"},
+            params={"pageSize": 20, "include": _PAST_MATCHES_INCLUDE},
         )
         rows = body.get("data") if isinstance(body, dict) else None
         if not isinstance(rows, list) or not rows:
@@ -1598,6 +1719,16 @@ class MatchStatTennisProvider:
             tail = form_arr[-10:]
             last_10_form = "".join(c.upper() for c in tail if c in ("w", "l"))
 
+        # Career-aggregate clutch — read from the past-matches cache the
+        # `_player_recent_matches` call above just populated. Pure post-
+        # processing of cached rows; no extra HTTP. Today() pinned to
+        # UTC for the recency-window computation so the 180d cutoff is
+        # stable across timezones.
+        cached_rows = self._past_matches_cache.get((tour, pid)) or []
+        clutch_aggregates = self._compute_career_clutch(
+            cached_rows, datetime.now(UTC).date()
+        )
+
         return TennisPlayerStats(
             name=name,
             api_player_id=str(pid),
@@ -1614,6 +1745,7 @@ class MatchStatTennisProvider:
             career_titles=career_titles,
             **match_stats,
             **tier_records,
+            **clutch_aggregates,
         )
 
     # ----- H2H -----

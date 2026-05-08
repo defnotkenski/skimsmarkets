@@ -42,6 +42,10 @@ log = logging.getLogger(__name__)
 # Vendor score tokens look like "6-4", "7-6(3)" — the parenthetical is the
 # tiebreak mini-score and is irrelevant for the games-total we compute.
 _SCORE_TOKEN = re.compile(r"^(\d+)-(\d+)(?:\(\d+\))?$")
+# Same shape as _SCORE_TOKEN but capturing the parenthetical so per-set
+# parsing can flag tiebreaks. Stays separate so the games-total path
+# above can stay tight.
+_SCORE_TOKEN_WITH_TB = re.compile(r"^(\d+)-(\d+)(?:\((\d+)\))?$")
 # Substrings that mark a score string as an aborted match. We search
 # case-folded; the vendor mixes "ret.", "RET", "W/O", "Walkover" across
 # different rows.
@@ -106,6 +110,101 @@ def _match_completeness(p1_games: int, p2_games: int) -> float | None:
 
 
 @dataclass(frozen=True)
+class ScoreDetails:
+    """Per-set facts derivable from a single score string.
+
+    Used by both the live provider (career-aggregate clutch on
+    `TennisPlayerStats`) and the GBT feature builder (career-aggregate
+    clutch features). Same parsing semantics on both paths so a player's
+    career tiebreak rate matches across the lens render and the model
+    feature.
+
+    `final_set_margin` is the absolute games gap in the LAST set. For a
+    match decided by retirement / walkover the parser returns None
+    upstream — this dataclass is only constructed for completed matches
+    with at least one parseable set token.
+    """
+
+    n_sets: int
+    went_to_decider: bool
+    n_tiebreaks_played: int
+    # Match-winner-relative tiebreak count. Aggregators rotate this onto
+    # the subject's perspective via `subject_is_winner`: subject_tbs_won
+    # = winner_tiebreaks_won if subject_is_winner else
+    # (n_tiebreaks_played - winner_tiebreaks_won).
+    winner_tiebreaks_won: int
+    winner_won_set_one: bool
+    final_set_margin: int
+    is_close_match: bool
+
+
+def parse_score_details(
+    score: str | None, best_of: int | None, winner_side: int | None
+) -> ScoreDetails | None:
+    """Extract per-set facts from a vendor score string.
+
+    Returns None on aborted / malformed scores (re-uses the same
+    `_ABORTED_MARKERS` filter `_parse_set_scores` does). Returns None
+    when `winner_side` isn't 1 or 2 — without a labelled winner we
+    can't tell whether set 1 was a comeback or a closeout.
+
+    `went_to_decider` defaults to False when `best_of` is missing,
+    which is conservative: a match marked as a decider only when we
+    KNOW it went the distance feeds cleaner training signal than one
+    that guesses based on set count alone (a 3-set match could be
+    bo3 final-set OR bo5 mid-match — though the latter is rare in
+    completed-match data).
+
+    `is_close_match`: final-set margin ≤2 OR final set was a tiebreak.
+    Captures the matches where small-edge skill (clutch, BP-save under
+    pressure) flips the outcome.
+    """
+    if not score or winner_side not in (1, 2):
+        return None
+    lower = score.lower()
+    if any(marker in lower for marker in _ABORTED_MARKERS):
+        return None
+    sets_p1: list[int] = []
+    sets_p2: list[int] = []
+    tiebreak_set_indices: list[int] = []
+    for tok in score.split():
+        m = _SCORE_TOKEN_WITH_TB.match(tok)
+        if m is None:
+            continue
+        sets_p1.append(int(m.group(1)))
+        sets_p2.append(int(m.group(2)))
+        if m.group(3) is not None:
+            tiebreak_set_indices.append(len(sets_p1) - 1)
+    if not sets_p1:
+        return None
+    n_sets = len(sets_p1)
+    set1_winner_side = 1 if sets_p1[0] > sets_p2[0] else 2
+    winner_won_set_one = set1_winner_side == winner_side
+    final_p1, final_p2 = sets_p1[-1], sets_p2[-1]
+    final_set_margin = abs(final_p1 - final_p2)
+    final_set_was_tb = max(final_p1, final_p2) == 7 and min(final_p1, final_p2) == 6
+    is_close_match = final_set_margin <= 2 or final_set_was_tb
+    went_to_decider = best_of is not None and n_sets == best_of
+    # Tiebreak-set winner is whichever side has more games in that set —
+    # tiebreak sets always end 7-6, so the side with 7 won the TB.
+    winner_tiebreaks_won = sum(
+        1
+        for i in tiebreak_set_indices
+        if (sets_p1[i] > sets_p2[i] and winner_side == 1)
+        or (sets_p2[i] > sets_p1[i] and winner_side == 2)
+    )
+    return ScoreDetails(
+        n_sets=n_sets,
+        went_to_decider=went_to_decider,
+        n_tiebreaks_played=len(tiebreak_set_indices),
+        winner_tiebreaks_won=winner_tiebreaks_won,
+        winner_won_set_one=winner_won_set_one,
+        final_set_margin=final_set_margin,
+        is_close_match=is_close_match,
+    )
+
+
+@dataclass(frozen=True)
 class MatchHistoryRow:
     """One past-match row, parsed once for selector consumption.
 
@@ -138,6 +237,23 @@ class MatchHistoryRow:
     tournament_tier: str | None
     match_completeness: float | None
     first_serve_win_pct: float | None
+    # `best_of` is needed by `parse_score_details` to label deciders
+    # correctly. Lifted from the row's top-level `best_of` (vendor ships
+    # 3 or 5; missing on a few older rows).
+    best_of: int | None
+    # 1 or 2, indicating which side (relative to the row's p1/p2)
+    # won the match. Needed so the clutch aggregator can call
+    # `parse_score_details` with the score's native side convention. The
+    # subject's `won` is independent (depends on subject-is-p1) and is
+    # already carried.
+    winner_side: int | None
+    # Subject's BP-saved / BP-faced for THIS match. Derived from the
+    # OPPONENT'S box score (subject's BPs faced == opponent's BP-convert
+    # opportunities; subject's BPs saved == opponent's BP-convert
+    # opportunities − opponent's BPs converted). Both None when the row
+    # lacks a stat block (live-suspended matches and very old rows).
+    bp_saved: int | None
+    bp_faced: int | None
 
 
 class TennisStatsProvider(Protocol):

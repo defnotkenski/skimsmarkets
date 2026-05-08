@@ -42,6 +42,7 @@ from skimsmarkets.tennis.matchstat import (
     _COURT_ID_TO_SURFACE,
     _RANK_ID_TO_TIER,
 )
+from skimsmarkets.tennis.provider import ScoreDetails, parse_score_details
 
 log = logging.getLogger(__name__)
 
@@ -175,6 +176,27 @@ class PlayerHistory:
     bp_converted: float = 0.0
     bp_chances: float = 0.0
 
+    # Career-aggregate clutch counters, recency-weighted on the same
+    # HALF_LIFE_DAYS schedule as the rate counters above. Derived from
+    # the per-row score string via `parse_score_details`. Each pair is
+    # numerator / denominator so partial aggregations stay unbiased
+    # under the shared decay multiplier.
+    # - tiebreak: subject's TBs won / played (across all matches)
+    # - decider: subject's deciding-set wins / matches that went the
+    #   distance (n_sets == best_of)
+    # - comeback: subject's match wins given subject lost set 1 / total
+    #   matches where subject lost set 1
+    # - close_match: subject's wins / total close matches (close =
+    #   final-set margin ≤ 2 OR final set was a tiebreak)
+    tiebreak_won: float = 0.0
+    tiebreak_played: float = 0.0
+    decider_won: float = 0.0
+    decider_played: float = 0.0
+    comeback_won: float = 0.0
+    comeback_set1_lost: float = 0.0
+    close_match_won: float = 0.0
+    close_match_played: float = 0.0
+
     # Win/loss totals — UNDECAYED. `matches` drives the cold-start
     # gate (`MIN_PRIORS_PER_SIDE`), where every prior should count
     # equally regardless of age — that's a coverage signal, not a
@@ -245,6 +267,14 @@ class PlayerHistory:
         self.bp_faced *= factor
         self.bp_converted *= factor
         self.bp_chances *= factor
+        self.tiebreak_won *= factor
+        self.tiebreak_played *= factor
+        self.decider_won *= factor
+        self.decider_played *= factor
+        self.comeback_won *= factor
+        self.comeback_set1_lost *= factor
+        self.close_match_won *= factor
+        self.close_match_played *= factor
         # Surface-bucket counters too — the surface_winrate /
         # surface_first_serve_win_pct features should be
         # recency-weighted on the same schedule as the global rates.
@@ -278,6 +308,12 @@ class PlayerHistory:
         opp_won_second_serve_of: int | None,
         opp_bp_converted: int | None,
         opp_bp_converted_of: int | None,
+        # Pre-parsed `ScoreDetails` (perspective: match-winner-relative)
+        # from the row's score string. Caller calls `parse_score_details`
+        # once with the row's `winner_side`. None when the row's score
+        # is missing or unparseable (older rows occasionally drop scores
+        # — we just skip the clutch counters for that match).
+        score_details: ScoreDetails | None = None,
     ) -> None:
         """Fold one prior match's contribution into the running totals.
 
@@ -336,6 +372,37 @@ class PlayerHistory:
         prior_w, prior_t = self.h2h.get(opponent_id, (0, 0))
         self.h2h[opponent_id] = (prior_w + (1 if won else 0), prior_t + 1)
 
+        # Clutch counters — only when the score parsed cleanly.
+        # `score_details` is match-winner-relative; rotate onto subject
+        # using `won`. Recency-weighted on the same schedule as the rate
+        # counters (decay applied via `_decay_to` above).
+        if score_details is not None:
+            if score_details.went_to_decider:
+                self.decider_played += 1.0
+                if won:
+                    self.decider_won += 1.0
+            self.tiebreak_played += score_details.n_tiebreaks_played
+            subject_tbs_won = (
+                score_details.winner_tiebreaks_won
+                if won
+                else score_details.n_tiebreaks_played
+                - score_details.winner_tiebreaks_won
+            )
+            self.tiebreak_won += subject_tbs_won
+            if score_details.is_close_match:
+                self.close_match_played += 1.0
+                if won:
+                    self.close_match_won += 1.0
+            subject_won_set_one = (
+                score_details.winner_won_set_one
+                if won
+                else not score_details.winner_won_set_one
+            )
+            if not subject_won_set_one:
+                self.comeback_set1_lost += 1.0
+                if won:
+                    self.comeback_won += 1.0
+
         # Recent / counts.
         self.recent.append(won)
         self.matches += 1
@@ -379,6 +446,22 @@ class PlayerHistory:
 
     def career_bp_convert_pct(self) -> float | None:
         return _safe_div(self.bp_converted, self.bp_chances)
+
+    def career_tiebreak_winrate(self) -> float | None:
+        return _safe_div(self.tiebreak_won, self.tiebreak_played)
+
+    def career_decider_winrate(self) -> float | None:
+        return _safe_div(self.decider_won, self.decider_played)
+
+    def career_comeback_winrate(self) -> float | None:
+        """Subject's match wins given subject lost set 1, divided by
+        the count of matches where subject lost set 1. Differs from
+        the H2H lens's matchup-conditioned comeback rate (which is
+        opponent-conditioned and lives on `TennisInMatchupStats`)."""
+        return _safe_div(self.comeback_won, self.comeback_set1_lost)
+
+    def career_close_match_winrate(self) -> float | None:
+        return _safe_div(self.close_match_won, self.close_match_played)
 
     def surface_first_serve_win_pct(self, surface: str | None) -> float | None:
         bucket = self.by_surface.get(surface)
@@ -466,6 +549,17 @@ def _add_match_from_row(store: HistoryStore, row: pd.Series) -> None:
     p1_won = winner_side == 1
     p2_won = winner_side == 2
 
+    # Parse the score string ONCE per row; pass the result to both
+    # add_match calls. The parser returns winner-relative facts; each
+    # PlayerHistory rotates onto subject perspective via `won`.
+    score_raw = row.get("score") if isinstance(row, dict) else (
+        row["score"] if "score" in row.index else None
+    )
+    if isinstance(score_raw, float) and pd.isna(score_raw):
+        score_raw = None
+    best_of = _row_get_int(row, "best_of")
+    score_details = parse_score_details(score_raw, best_of, winner_side)
+
     h1.add_match(
         match_date=on_date,
         won=p1_won,
@@ -485,6 +579,7 @@ def _add_match_from_row(store: HistoryStore, row: pd.Series) -> None:
         opp_won_second_serve_of=_row_get_int(row, "p2_won_second_serve_of"),
         opp_bp_converted=_row_get_int(row, "p2_bp_converted"),
         opp_bp_converted_of=_row_get_int(row, "p2_bp_converted_of"),
+        score_details=score_details,
     )
     h2.add_match(
         match_date=on_date,
@@ -505,6 +600,7 @@ def _add_match_from_row(store: HistoryStore, row: pd.Series) -> None:
         opp_won_second_serve_of=_row_get_int(row, "p1_won_second_serve_of"),
         opp_bp_converted=_row_get_int(row, "p1_bp_converted"),
         opp_bp_converted_of=_row_get_int(row, "p1_bp_converted_of"),
+        score_details=score_details,
     )
 
 
@@ -552,6 +648,17 @@ NUMERIC_FEATURE_COLUMNS: tuple[str, ...] = (
     "career_second_serve_return_win_pct_diff",
     "career_bp_save_pct_diff",
     "career_bp_convert_pct_diff",
+    # Career-aggregate clutch — derived from per-match score strings
+    # via `parse_score_details`. All recency-weighted on the same
+    # HALF_LIFE_DAYS schedule as the rate counters above. Distinct from
+    # the H2H lens's matchup-conditioned clutch (which is per-opponent
+    # and lives on `TennisInMatchupStats`); these are career-aggregate
+    # signals — "this player wins tiebreaks generally" rather than "vs
+    # this opponent".
+    "career_tiebreak_winrate_diff",
+    "career_decider_winrate_diff",
+    "career_comeback_winrate_diff",
+    "career_close_match_winrate_diff",
     "surface_first_serve_win_pct_diff",
     "surface_record_diff",
     "last_n_winrate_diff",
@@ -628,6 +735,22 @@ def compute_features(
         "career_bp_convert_pct_diff": _diff_or_nan(
             anchor_history.career_bp_convert_pct(),
             opponent_history.career_bp_convert_pct(),
+        ),
+        "career_tiebreak_winrate_diff": _diff_or_nan(
+            anchor_history.career_tiebreak_winrate(),
+            opponent_history.career_tiebreak_winrate(),
+        ),
+        "career_decider_winrate_diff": _diff_or_nan(
+            anchor_history.career_decider_winrate(),
+            opponent_history.career_decider_winrate(),
+        ),
+        "career_comeback_winrate_diff": _diff_or_nan(
+            anchor_history.career_comeback_winrate(),
+            opponent_history.career_comeback_winrate(),
+        ),
+        "career_close_match_winrate_diff": _diff_or_nan(
+            anchor_history.career_close_match_winrate(),
+            opponent_history.career_close_match_winrate(),
         ),
         "surface_first_serve_win_pct_diff": _diff_or_nan(
             anchor_history.surface_first_serve_win_pct(surface),

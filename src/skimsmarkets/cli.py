@@ -209,42 +209,34 @@ async def _cmd_gbt(args: argparse.Namespace) -> int:
 
 async def _cmd_retro(args: argparse.Namespace) -> int:
     """Self-improvement layer — read past JSONL run logs, resolve outcomes
-    against gamma, compute hit-rate cuts, and (Step 3) run a batched
-    LLM pattern call comparing wins vs losses.
+    against gamma, compute hit-rate cuts, and run a batched LLM pattern
+    call comparing wins vs losses.
 
-    Three steps; all three run by default. Outputs land in `logs/retro/`.
-    `--run-id` narrows to a single run log; without it every log under
+    Two steps: `calibrate` (cuts only) or `analyze` (default — cuts +
+    post-match + LLM findings, joined into one `report.md`). Each step
+    auto-refreshes gamma resolution sidecars at the start — no manual
+    resolve step needed. Outputs land in `logs/retro/`. `--run-id`
+    narrows to a single run log; without it every log under
     `logs/runs/` is processed (resolution sidecars are idempotent so
     reruns are cheap).
 
-    `--sport` filters the Step 3 LLM call only — Steps 1 & 2 always
-    cover everything in scope. Repeatable.
+    `--sport` filters the analyze LLM call only — calibrate cuts and
+    the implicit resolve step always cover everything in scope.
+    Repeatable.
     """
     from skimsmarkets.retro.orchestrator import (
-        run_step_all,
         run_step_analyze,
         run_step_calibrate,
-        run_step_resolve,
     )
 
     sports_filter: set[str] | None = (
         set(args.sport) if args.sport else None
     )
-    if args.step == "resolve":
-        paths = await run_step_resolve(args.run_id)
-        print(f"wrote {len(paths)} resolution sidecar(s)")
-        return 0
     if args.step == "calibrate":
-        run_step_calibrate(run_id=args.run_id)
+        await run_step_calibrate(run_id=args.run_id)
         return 0
-    if args.step == "analyze":
-        findings, path = await run_step_analyze(
-            sports_filter=sports_filter, run_id=args.run_id,
-        )
-        print(f"wrote findings for {len(findings)} sport(s) to {path}")
-        return 0
-    # default: all
-    md_path = await run_step_all(
+    # default: analyze (full pass — cuts + post-match + LLM + report.md)
+    md_path = await run_step_analyze(
         sports_filter=sports_filter, run_id=args.run_id,
     )
     print(f"retro report: {md_path}")
@@ -367,12 +359,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_retro.add_argument(
         "--step",
-        choices=("resolve", "calibrate", "analyze", "all"),
-        default="all",
+        choices=("calibrate", "analyze"),
+        default="analyze",
         help=(
-            "Which step to run. `all` (default) runs Step 1 → 2 → 3 in "
-            "sequence and writes a combined report.md. `resolve` only "
-            "writes the gamma-resolution sidecars (cheap, no LLM)."
+            "Which step to run. `analyze` (default) is the full pass: "
+            "renders calibrate hit-rate cuts to the terminal, fetches "
+            "post-match stats, runs the LLM pattern call per sport, and "
+            "writes a combined `report.md`. `calibrate` is the "
+            "lightweight cuts-only path. Both auto-refresh gamma "
+            "resolutions first (idempotent) so output always reflects "
+            "the latest settlements."
         ),
     )
     p_retro.add_argument(
@@ -390,9 +386,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="SPORT",
         help=(
-            "Filter the Step 3 LLM call to one or more sport types "
-            "(e.g. `--sport tennis`). Repeatable. Steps 1 & 2 are NOT "
-            "filtered — they always cover everything resolved."
+            "Filter the analyze LLM call to one or more sport types "
+            "(e.g. `--sport tennis`). Repeatable. Calibrate cuts and "
+            "the implicit resolve step are NOT filtered — they always "
+            "cover everything in scope."
         ),
     )
     p_retro.add_argument(

@@ -36,7 +36,6 @@ from skimsmarkets.retro.jsonl import (
 from skimsmarkets.retro.models import (
     EventFeatures,
     ResolvedOutcome,
-    RetroFindings,
 )
 from skimsmarkets.retro.post_match import fetch_post_match_for_settled
 from skimsmarkets.retro.report import write_report as write_md_report
@@ -141,10 +140,18 @@ def _features_with_post_match(
     return feats, duplicates_dropped
 
 
-def run_step_calibrate(
+async def run_step_calibrate(
     run_id: str | None = None,
 ) -> CalibrateReport:
     """Step 2 — print hit-rate tables to stdout. Returns the report.
+
+    Auto-runs Step 1 (`run_step_resolve`) first so the calibrate cuts
+    always reflect the freshest gamma settlements without the operator
+    needing a separate `--step resolve` invocation. Resolve is
+    idempotent (skips slugs already settled in the sidecar), so this
+    only fetches gamma for predictions that don't yet have a settled
+    outcome cached. The standalone `--step resolve` command is still
+    available for batch refresh without the calibrate render.
 
     Intentionally does NOT persist anything to disk: the terminal
     output is the artefact, and `--step all` folds the tables into
@@ -161,6 +168,7 @@ def run_step_calibrate(
     market) so hit-rate cuts don't double-count rows that appear in
     multiple JSONL run files.
     """
+    await run_step_resolve(run_id)
     feats, duplicates_dropped = (
         _features_with_post_match(run_id=run_id)
         if run_id is not None
@@ -175,21 +183,31 @@ async def run_step_analyze(
     *,
     sports_filter: set[str] | None = None,
     run_id: str | None = None,
-    retro_id: str | None = None,
-    write_json: bool = True,
-) -> tuple[dict[str, RetroFindings], Path | None]:
-    """Step 3 — fetch post-match stats + run LLM pattern call per sport.
+) -> Path:
+    """Full retro pass — calibrate cuts + post-match fetch + LLM
+    pattern call per sport, joined into one `report.md`.
 
-    Returns `(findings_by_sport, json_path)` where `json_path` is None
-    when `write_json=False` (same `--step all` rationale as
-    `run_step_calibrate`).
+    Inlines `run_step_calibrate` so the operator sees the hit-rate
+    tables alongside the LLM findings without needing a second
+    invocation. Calibrate auto-resolves at its start; this function
+    re-runs resolve before the post-match fetch (idempotent — second
+    pass is a no-op on already-settled markets) so a long-running
+    analyze won't act on stale resolutions if the calibrate render
+    completed minutes earlier.
 
-    Calibration is also re-aggregated internally with post-match-
-    enriched features so the Step 3 LLM call sees divergence columns;
-    the JSON output for Step 2 still uses non-post-match features
-    (they're the same numbers — divergence doesn't change hit-rate
-    cuts).
+    Returns the path to the written `report.md`. The `findings.json`
+    sidecar is gone — the markdown digest is the canonical artefact;
+    callers that want machine-readable findings can re-instantiate
+    them via `analyze_all_sports` directly.
     """
+    rid = _retro_id()
+    calibrate_report = await run_step_calibrate(run_id=run_id)
+
+    # Re-resolve before the post-match path — calibrate's resolve may
+    # have run minutes ago and another match could have settled since.
+    # Idempotent on already-settled rows, so the cost is one "all
+    # already resolved" sweep when no new settlements landed.
+    await run_step_resolve(run_id)
     config = cfg.Config.from_env()
     async with build_tennis_provider(config) as provider:
         post_match = await fetch_post_match_for_settled(provider)
@@ -200,44 +218,8 @@ async def run_step_analyze(
     anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
     findings = await analyze_all_sports(anthropic, feats, sports_filter)
 
-    if not write_json:
-        return findings, None
-    rid = retro_id or _retro_id()
-    out_path = _retro_root() / f"{rid}.findings.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(
-        "[\n"
-        + ",\n".join(f.model_dump_json(indent=2) for f in findings.values())
-        + "\n]"
-    )
-    log.info("retro findings written to %s", out_path)
-    return findings, out_path
-
-
-async def run_step_all(
-    *,
-    sports_filter: set[str] | None = None,
-    run_id: str | None = None,
-) -> Path:
-    """Steps 1 → 2 → 3, then write the combined `report.md`.
-
-    Returns the report.md path so the CLI can print "open this file".
-    Intentionally suppresses the per-step JSON sidecars
-    (`<retro_id>.calibrate.json`, `<retro_id>.findings.json`) — the
-    combined `report.md` is the only artefact `--step all` produces,
-    keeping `logs/retro/` uncluttered for the most common invocation.
-    Operators who want the machine-readable JSON can run the steps
-    individually (`--step calibrate` / `--step analyze`).
-    """
-    rid = _retro_id()
-    await run_step_resolve(run_id)
-    calibrate_report = run_step_calibrate(run_id=run_id)
-    findings, _ = await run_step_analyze(
-        sports_filter=sports_filter,
-        run_id=run_id,
-        retro_id=rid,
-        write_json=False,
-    )
     md_path = _retro_root() / f"{rid}.report.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
     write_md_report(md_path, calibrate_report, findings)
+    log.info("retro report written to %s", md_path)
     return md_path
