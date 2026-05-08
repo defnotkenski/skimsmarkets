@@ -102,15 +102,10 @@ class CalibrateReport:
 
 # Cut definitions live as ordered (label, predicate) pairs so the
 # render order is stable across reports — alphabetical sort would
-# scramble Case 1⭐ below Case 5⭐ etc.
+# scramble Case 1 below Case 5 etc.
 
-# Labels deliberately ASCII-only. The leaderboard renders ⭐ emojis in
-# a dedicated column with fixed-width padding to compensate for font
-# fallback drift; embedding the emoji inline in a label string would
-# break that trick (rich computes wcwidth=2 for ⭐ but most terminal
-# fonts render it at 1 or 1.5 cells, shifting the right border of any
-# cell that contains it). ASCII labels render at predictable widths
-# everywhere.
+# Labels deliberately ASCII-only — keeps cell widths predictable
+# regardless of terminal font.
 _CASE_ORDER: list[str] = [
     "5 (>=0.85)",
     "4 (>=0.65)",
@@ -315,7 +310,7 @@ def _render_cut_table(console: Console, scope: str, cut: CutTable) -> None:
             else "—"
         )
         # Suppress empty-bucket rows — they're noise in the report
-        # (e.g. "5 ⭐: 0/0" carries no signal and squeezes the cells
+        # (e.g. "5: 0/0" carries no signal and squeezes the cells
         # that DO have data).
         if b.total == 0:
             continue

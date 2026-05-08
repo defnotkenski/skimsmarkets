@@ -44,22 +44,16 @@ def _confidence_style(c: str) -> str:
 
 
 def _defensibility_stars(score: float) -> str:
-    """Render a [0,1] defensibility score as a 1-5 star-emoji rating. Bucket
+    """Render a [0,1] defensibility score as a 5-slot bar. Bucket
     boundaries are 0.85 / 0.65 / 0.45 / 0.25 — chosen so a typical 0.74
-    lands at four stars and 0.30 at two, matching the "Yelp rating" mental
-    model. The numeric score is still surfaced verbatim on the JSONL row
-    when precision matters; the emojis are the glanceable form. No color
-    branch — most terminals render emoji glyphs through their own font
-    where rich's color codes don't apply consistently anyway.
+    lands at four-fifths filled and 0.30 at two, matching a "Yelp rating"
+    mental model. The numeric score is still surfaced verbatim on the
+    JSONL row when precision matters; the bar is the glanceable form.
 
-    Cell width is padded to a constant 5-slot (10-cell) shape: each
-    filled position is one ⭐ (wcwidth=2), each empty position is two
-    ASCII spaces (wcwidth=1+1=2). Without the padding, a 1-star row
-    and a 5-star row produce different cell widths and Rich's
-    border alignment goes ragged on some terminals (font-fallback
-    width drift compounds the issue). Padded form keeps both Rich's
-    measurement AND the terminal's rendered width constant across
-    rows.
+    Block characters (FULL BLOCK / LIGHT SHADE) are single-width across
+    terminal fonts, so a 1-bar row and a 5-bar row produce identical
+    cell widths — no padding hack needed. The previous ⭐ emoji form
+    drifted on some terminals because of font fallback width.
     """
     if score >= 0.85:
         filled = 5
@@ -71,7 +65,7 @@ def _defensibility_stars(score: float) -> str:
         filled = 2
     else:
         filled = 1
-    return "⭐" * filled + "  " * (5 - filled)
+    return "█" * filled + "░" * (5 - filled)
 
 
 def _pick_favorite(event: PolymarketEvent) -> PolymarketMarket:

@@ -135,7 +135,7 @@ class EventFeatures(BaseModel):
     case_bucket: int | None = Field(
         default=None,
         description=(
-            "1-5 star-emoji bucket from `_defensibility_stars` boundaries. "
+            "1-5 bar bucket from `_defensibility_stars` boundaries. "
             "None when defensibility_score wasn't logged (judge failure)."
         ),
     )
