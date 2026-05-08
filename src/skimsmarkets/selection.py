@@ -61,6 +61,7 @@ from skimsmarkets.tennis.identity import (
     _slug_tier,
     tennis_match_identity,
 )
+from skimsmarkets.tennis.models import TennisHeadToHead
 from skimsmarkets.tennis.provider import MatchHistoryRow, TennisStatsProvider
 
 log = logging.getLogger(__name__)
@@ -182,6 +183,88 @@ _PRIME_AGE_HALF_WIDTH = 2.5
 # in exactly the cap-vs-no-cap decision band.
 _TIER_MULTIPLIER_SLAM = 1.15
 _TIER_MULTIPLIER_MASTERS = 1.05
+
+# Information-density adjustment cap. Direction-AGNOSTIC bonus / penalty
+# answering "do the lens chains have material to reason with?". Both
+# sides info-rich (deep recent-match cache + meaningful surface-specific
+# sample) → positive bonus. Either side info-poor → negative penalty.
+# Cap matches consistency / surface tiers because the underlying signal
+# is comparable in magnitude — when both lenses can read 8+ recent
+# matches with 4+ on the event surface, the prediction quality lift
+# is real and meaningful but bounded.
+_INFO_DENSITY_CAP = 0.1
+
+# Recent-match count where info-density saturates to "fully readable".
+# Warmup pulls page_size=10 per player (`_SELECTION_MATCH_PAGE_SIZE`),
+# so 8 represents an active player with ~80% cache fill. Below this we
+# scale linearly down to 0. Bottlenecked by the worse-served side: a
+# 10-match cache vs a 2-match cache reads as info-poor matchup.
+_INFO_DENSITY_RECENT_HIGH = 8
+
+# Surface-specific match count where surface-density saturates.
+# Within a 10-row recent-match cache, 4 matches on the event surface
+# (~40%) is a strong sample for the lens chains' surface read; below
+# that the surface-specific story gets thin.
+_INFO_DENSITY_SURFACE_HIGH = 4
+
+# Weighting of recent vs surface depth in the combined info-density
+# score. Recent matches dominate (general lens material is the
+# baseline); surface-specific depth refines.
+_INFO_DENSITY_RECENT_WEIGHT = 0.6
+_INFO_DENSITY_SURFACE_WEIGHT = 0.4
+
+# YTD form alignment cap. Companion to last-10 form alignment — same
+# shape but on a longer (full-season) horizon. Smaller cap than
+# `_FORM_ADJUSTMENT_CAP` because YTD partially overlaps with last-10
+# form (recent matches feed both). Catches "player on a YTD heater"
+# vs "player slumping this season" beyond what last-10 alone resolves.
+_YTD_DIVERGENCE_CAP = 0.05
+
+# Minimum YTD sample size before the alignment fires. A 3-3 YTD record
+# is too thin to carry signal; we want at least a moderately
+# representative season. 10 matches matches the ATP/WTA early-season
+# threshold where rankings settle.
+_MIN_YTD_SAMPLES = 10
+
+# Layoff penalty cap. Applied as a direction-AGNOSTIC penalty when
+# either player has been off the tour for an extended window; the
+# matchup loses informational density on the rusty side regardless of
+# whether layoff helps or hurts the player's actual play. Penalty-only
+# (no positive bonus for fresh play — fresh play is the baseline
+# expectation, not a performance signal).
+_LAYOFF_PENALTY_CAP = 0.05
+
+# Layoff window thresholds. Below `_LAYOFF_FRESH_DAYS` → no penalty;
+# above `_LAYOFF_STALE_DAYS` → max penalty. Linear ramp between.
+# 14 days = standard tour rotation (one event between this and last);
+# 42 days = injury-recovery / off-season window where lens chains'
+# recent-form material is genuinely stale.
+_LAYOFF_FRESH_DAYS = 14
+_LAYOFF_STALE_DAYS = 42
+
+# H2H sample-size bonus tiers. Bonus-only (no penalty for missing
+# H2H — players meeting for the first time isn't a quality signal,
+# just a void of evidence). Each threshold maps total career meetings
+# to a fixed bonus; matchup-conditioned aggregates in
+# `TennisInMatchupStats` (decider record, tiebreak record, bo3/bo5
+# splits, matchup-specific serve/BP) become statistically meaningful
+# at the highest tier.
+_H2H_THIN_THRESHOLD = 1
+_H2H_MEDIUM_THRESHOLD = 3
+_H2H_RICH_THRESHOLD = 6
+_H2H_THIN_BONUS = 0.05
+_H2H_MEDIUM_BONUS = 0.10
+_H2H_RICH_BONUS = 0.15
+
+# Surface-specific H2H boost — added on TOP of the sample-size bonus
+# when the players have ≥`_H2H_SURFACE_THRESHOLD` meetings on the
+# event surface specifically. Surface-conditioned H2H is the single
+# most predictive piece of historical evidence the lens chains can
+# read; the boost rewards matchups that carry it. Two meetings is
+# the floor — a single surface-meeting is sample-size-of-one trivia,
+# not a pattern.
+_H2H_SURFACE_THRESHOLD = 2
+_H2H_SURFACE_BONUS = 0.025
 
 
 def _parse_team_record(record: str) -> tuple[int, int, int] | None:
@@ -548,6 +631,192 @@ def _tier_multiplier(tier: str | None) -> float:
     return 1.0
 
 
+def _info_density_score(
+    a_history: list[MatchHistoryRow] | None,
+    b_history: list[MatchHistoryRow] | None,
+    event_surface: str | None,
+) -> float:
+    """Direction-AGNOSTIC info-density adjustment in `[-cap, +cap]`.
+
+    Two complementary depth signals, each bottlenecked by the worse-
+    served side (`min(a, b)`):
+
+      - **Recent-match depth**: `min(len(a_history), len(b_history))`
+        normalised by `_INFO_DENSITY_RECENT_HIGH`. Lens fetchers want
+        deep history on BOTH players; a 10-row vs 2-row matchup reads
+        as info-poor regardless of how rich the favoured side is.
+
+      - **Surface-specific depth**: count of rows in each player's
+        history matching `event_surface`, again `min`-bottlenecked,
+        normalised by `_INFO_DENSITY_SURFACE_HIGH`. Captures whether
+        the lens chains can read surface-conditioned form. Skipped
+        (neutral 0.5) when `event_surface` is unknown — the upstream
+        cascade couldn't resolve it, so we shouldn't penalise the
+        matchup for our own resolution miss.
+
+    Combined `[0, 1]` density mapped linearly to `[-cap, +cap]` via
+    `(combined - 0.5) * 2`: pivot at average density (0.5) so events
+    that sit in the middle of the distribution score 0 (no
+    contribution), info-rich events get +cap, info-poor events get
+    -cap. Same direction-agnostic posture as the layoff penalty —
+    info-density isn't a who-wins signal, it's a how-readable signal.
+
+    Returns 0.0 when either side's history is missing entirely (cache
+    miss, warmup didn't fire, or vendor returned empty for that
+    player).
+    """
+    if a_history is None or b_history is None:
+        return 0.0
+    n_min = min(len(a_history), len(b_history))
+    recent_density = min(1.0, n_min / _INFO_DENSITY_RECENT_HIGH)
+
+    if event_surface is not None:
+        s_a = sum(1 for r in a_history if r.surface == event_surface)
+        s_b = sum(1 for r in b_history if r.surface == event_surface)
+        s_min = min(s_a, s_b)
+        surface_density = min(1.0, s_min / _INFO_DENSITY_SURFACE_HIGH)
+    else:
+        # Neutral when surface is unknown — don't reward or penalise.
+        surface_density = 0.5
+
+    combined = (
+        _INFO_DENSITY_RECENT_WEIGHT * recent_density
+        + _INFO_DENSITY_SURFACE_WEIGHT * surface_density
+    )
+    # Pivot at 0.5 → (combined - 0.5) * 2 lands in [-1, +1].
+    return _INFO_DENSITY_CAP * (combined - 0.5) * 2.0
+
+
+def _ytd_form_alignment(
+    a_ytd: tuple[int, int] | None,
+    b_ytd: tuple[int, int] | None,
+    a_is_favorite: bool,
+) -> float:
+    """Signed YTD-form alignment in `[-cap, +cap]`.
+
+    Companion to `form_adjustment` (last-10 W/L) but on a longer
+    full-season horizon. Positive when the points-favorite has the
+    higher YTD win-pct (longer-window form confirms the rank-points
+    lead); negative when the underdog does (matchup is tighter than
+    rank suggests on a multi-month basis).
+
+    Returns 0 when either side's YTD record is missing or below
+    `_MIN_YTD_SAMPLES` (early-season noise — a 3-3 record is not
+    a season).
+    """
+    if a_ytd is None or b_ytd is None:
+        return 0.0
+    a_w, a_l = a_ytd
+    b_w, b_l = b_ytd
+    if a_w + a_l < _MIN_YTD_SAMPLES or b_w + b_l < _MIN_YTD_SAMPLES:
+        return 0.0
+    a_wp = a_w / (a_w + a_l)
+    b_wp = b_w / (b_w + b_l)
+    if a_is_favorite:
+        high_wp, low_wp = a_wp, b_wp
+    else:
+        high_wp, low_wp = b_wp, a_wp
+    return _YTD_DIVERGENCE_CAP * (high_wp - low_wp)
+
+
+def _layoff_penalty(
+    a_history: list[MatchHistoryRow] | None,
+    b_history: list[MatchHistoryRow] | None,
+    event_tipoff: datetime,
+) -> float:
+    """Direction-AGNOSTIC layoff penalty in `[-cap, 0]`.
+
+    Reads the most recent match date from each player's warmed history
+    (the first row — vendor returns newest-first). Computes worst-side
+    (max) days-since-last-match and ramps linearly:
+
+      - ≤ `_LAYOFF_FRESH_DAYS` → 0 (both fresh, baseline)
+      - between fresh and stale → linear ramp from 0 to `-cap`
+      - ≥ `_LAYOFF_STALE_DAYS` → `-cap` (max penalty; lens chains have
+        genuinely stale recent-form material)
+
+    Worst-side bottleneck (not average): a single player on long
+    layoff is enough to weaken the lens fetcher's read on the matchup
+    regardless of how active the other side is. Pure info-density
+    framing — no implicit claim about whether layoff helps or hurts
+    the player's actual play (rust-vs-rest is genuinely ambiguous).
+
+    Returns 0 when:
+      - tipoff is unknown (`_FAR_FUTURE`) — we can't compute days-since
+      - either side's history is missing or empty (warmup didn't fire)
+      - either side's most recent row has no parsed date
+    """
+    if event_tipoff == _FAR_FUTURE:
+        return 0.0
+    if not a_history or not b_history:
+        return 0.0
+    a_last = a_history[0].date
+    b_last = b_history[0].date
+    if a_last is None or b_last is None:
+        return 0.0
+    tipoff_date = event_tipoff.date()
+    a_days = (tipoff_date - a_last).days
+    b_days = (tipoff_date - b_last).days
+    worst_days = max(a_days, b_days)
+    if worst_days <= _LAYOFF_FRESH_DAYS:
+        return 0.0
+    if worst_days >= _LAYOFF_STALE_DAYS:
+        return -_LAYOFF_PENALTY_CAP
+    span = _LAYOFF_STALE_DAYS - _LAYOFF_FRESH_DAYS
+    progress = (worst_days - _LAYOFF_FRESH_DAYS) / span
+    return -_LAYOFF_PENALTY_CAP * progress
+
+
+def _h2h_density_score(
+    h2h: TennisHeadToHead | None,
+    event_surface: str | None,
+) -> float:
+    """Bonus-only H2H sample-size + surface-conditioned bonus.
+
+    Direction-AGNOSTIC info-density signal — pure "do the lens chains
+    have direct evidence about how these two play each other?" with no
+    claim about who wins. Bonus-only because zero meetings is a void
+    of evidence, not a quality signal — players meeting for the first
+    time isn't a reason to deprioritise the matchup, just a reason
+    not to upweight it.
+
+    Tiered by total career meetings (`a_wins + b_wins`):
+      - 0          → 0.0   (no evidence, no bonus)
+      - 1 to 2     → `_H2H_THIN_BONUS`
+      - 3 to 5     → `_H2H_MEDIUM_BONUS`
+      - 6+         → `_H2H_RICH_BONUS` (matchup-conditioned aggregates
+        in `TennisInMatchupStats` become statistically meaningful)
+
+    Surface-conditioned boost: when `surface_h2h[event_surface]` has
+    ≥ `_H2H_SURFACE_THRESHOLD` meetings, add `_H2H_SURFACE_BONUS`
+    on top — surface-conditioned H2H is the single most predictive
+    piece of historical evidence the lens chains can read.
+
+    Returns 0.0 when h2h is None (cache miss, no prior meetings, or
+    warmup didn't fire).
+    """
+    if h2h is None:
+        return 0.0
+    total = h2h.a_wins + h2h.b_wins
+    if total >= _H2H_RICH_THRESHOLD:
+        bonus = _H2H_RICH_BONUS
+    elif total >= _H2H_MEDIUM_THRESHOLD:
+        bonus = _H2H_MEDIUM_BONUS
+    elif total >= _H2H_THIN_THRESHOLD:
+        bonus = _H2H_THIN_BONUS
+    else:
+        bonus = 0.0
+
+    if event_surface is not None and h2h.surface_h2h is not None:
+        surface_pair = h2h.surface_h2h.get(event_surface)
+        if surface_pair is not None:
+            surface_total = surface_pair[0] + surface_pair[1]
+            if surface_total >= _H2H_SURFACE_THRESHOLD:
+                bonus += _H2H_SURFACE_BONUS
+
+    return bonus
+
+
 def _tennis_imbalance(
     event: PolymarketEvent, provider: TennisStatsProvider
 ) -> float | None:
@@ -582,12 +851,29 @@ def _tennis_imbalance(
          asymmetry (penalises rank-points that have over- or
          under-accumulated relative to age) and peak-decay asymmetry
          (penalises stale rank-points on declining favorites).
-      6. **Tournament-tier multiplier** (×1.0 / ×1.05 / ×1.15).
+      6. **Info density** (±0.1 cap, direction-AGNOSTIC). Bottlenecked
+         by the worse-served side: how much recent-match cache + how
+         much surface-specific sample. Bonus when both lenses can read
+         deep history; penalty when either side is thin. Pure "do the
+         lens chains have material to reason with?".
+      7. **YTD form alignment** (±0.05 cap). Companion to last-10
+         form on a longer (full-season) horizon. Catches "player on
+         a YTD heater vs slumping" beyond what last-10 resolves.
+      8. **Layoff penalty** (-0.05 cap, direction-AGNOSTIC, penalty-
+         only). Worst-side days-since-last-match — fresh play is
+         baseline, long layoff weakens lens fetcher's recent-form
+         read regardless of which side is rusty.
+      9. **H2H sample-size + surface boost** (+0.175 cap, bonus-only).
+         Tiered by total career meetings; surface-H2H boost when the
+         pair has ≥ 2 meetings on the event surface specifically.
+         Pure info-density signal — first-time meetings get no
+         penalty, just no bonus.
+     10. **Tournament-tier multiplier** (×1.0 / ×1.05 / ×1.15).
          Applied AFTER all additive adjustments. Slams amplify
          imbalance via best-of-5 + depth compounding; Masters get a
          smaller bump.
 
-    All six tiers degrade gracefully and independently: any missing
+    All ten tiers degrade gracefully and independently: any missing
     cache or below-floor sample → that tier's contribution is 0
     (or ×1.0) and the rest of the calculation continues. Final clamp
     to [0, 1] absorbs both directions of stacked adjustment.
@@ -663,6 +949,19 @@ def _tennis_imbalance(
             # de-rank in the selector).
             consistency_adjustment = _CONSISTENCY_ADJUSTMENT_CAP * (high_c - low_c)
 
+    # Surface-record lookups are read both by the surface-specialism
+    # tier (whose adjustment fires only when `event_surface` resolves)
+    # AND by the YTD-form-alignment tier (which reads `ytd_pair` from
+    # the same cache slot regardless of surface resolution). Hoist the
+    # reads out of the surface-specialism block so both consumers share
+    # them — single cache hit per player.
+    a_surface_record = provider.lookup_player_surface_record(
+        identity.tour, identity.player_a
+    )
+    b_surface_record = provider.lookup_player_surface_record(
+        identity.tour, identity.player_b
+    )
+
     # Surface-specialism adjustment. Stacks on form + consistency.
     # Skip silently when the event surface can't be resolved (slug
     # parse miss + favorite history too thin for modal inference) or
@@ -672,19 +971,13 @@ def _tennis_imbalance(
     surface_adjustment = 0.0
     event_surface = _resolve_event_surface(identity, event.slug or "", provider)
     if event_surface is not None:
-        fav_surface_record = provider.lookup_player_surface_record(
-            identity.tour, identity.player_a
-        )
-        und_surface_record = provider.lookup_player_surface_record(
-            identity.tour, identity.player_b
-        )
         if a_is_favorite:
             surface_adjustment = _surface_specialism_adjustment(
-                event_surface, fav_surface_record, und_surface_record
+                event_surface, a_surface_record, b_surface_record
             )
         else:
             surface_adjustment = _surface_specialism_adjustment(
-                event_surface, und_surface_record, fav_surface_record
+                event_surface, b_surface_record, a_surface_record
             )
 
     # Age + career-trajectory adjustment. Free reads from the warmed
@@ -714,6 +1007,41 @@ def _tennis_imbalance(
             a_age, a_best, a_position,
         )
 
+    # Info-density adjustment. Direction-AGNOSTIC bonus / penalty
+    # answering "do the lens chains have material to reason with?".
+    # Reuses the warmed match-history lookups already issued for the
+    # consistency tier — no extra HTTP. Skipped (returns 0) when
+    # either side's history is missing, keeping the same graceful-
+    # degrade posture as the earlier tiers.
+    info_density_adjustment = _info_density_score(
+        a_history, b_history, event_surface
+    )
+
+    # YTD form alignment. Companion to the last-10 form tier on a
+    # longer (full-season) horizon — catches multi-month form trends
+    # that last-10 misses. Reads `ytd_pair` from the surface-record
+    # cache (already fetched above for the surface tier).
+    a_ytd = a_surface_record[0] if a_surface_record is not None else None
+    b_ytd = b_surface_record[0] if b_surface_record is not None else None
+    ytd_adjustment = _ytd_form_alignment(a_ytd, b_ytd, a_is_favorite)
+
+    # Layoff penalty. Direction-AGNOSTIC penalty when either player has
+    # been off the tour for an extended window. Tipoff comes from
+    # `_earliest_tipoff` (same source the slate tiebreaker uses).
+    layoff_adjustment = _layoff_penalty(
+        a_history, b_history, _earliest_tipoff(event)
+    )
+
+    # H2H sample-size + surface boost. Bonus-only — players meeting for
+    # the first time get no penalty. Reads from the matchup-pair cache
+    # populated by `warm_h2h_for_selection`. Provider's stub returns
+    # None (no warmup ran), in which case this contributes 0 — same
+    # posture as every other tier under the no-key configuration.
+    h2h = provider.lookup_h2h(
+        identity.tour, identity.player_a, identity.player_b
+    )
+    h2h_adjustment = _h2h_density_score(h2h, event_surface)
+
     # Tier multiplier — applied AFTER all additive adjustments. Slams
     # amplify imbalance (best-of-5 + depth compounding); Masters get a
     # smaller bump. Default ×1.0 for everything else (250s, 500s,
@@ -729,6 +1057,10 @@ def _tennis_imbalance(
         + consistency_adjustment
         + surface_adjustment
         + age_traj_adjustment
+        + info_density_adjustment
+        + ytd_adjustment
+        + layoff_adjustment
+        + h2h_adjustment
     )
     return max(0.0, min(1.0, score_pre_tier * multiplier))
 
@@ -841,6 +1173,14 @@ async def select_top_events(
             await tennis_provider.warm_surface_summary_for_selection(
                 tennis_identities
             )
+            # H2H warmup feeds `lookup_h2h` (matchup sample-size +
+            # surface-conditioned bonus). Dedup-by-unique-matchup-pair
+            # (NOT per-player) — three /h2h/* HTTPs per unique pair,
+            # ordered by identity convention so subsequent runtime
+            # `_head_to_head` calls in `enrich_tennis_stats` re-use the
+            # cached payload for cap-survivor events. Net cost per run:
+            # ~one MatchStat call cluster per non-cap-survivor matchup.
+            await tennis_provider.warm_h2h_for_selection(tennis_identities)
 
     scored = [
         (ev, imbalance_score(ev, tennis_provider), _earliest_tipoff(ev))

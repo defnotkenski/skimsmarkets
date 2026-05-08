@@ -449,6 +449,19 @@ class MatchStatTennisProvider:
                 dict[str, tuple[int, int]] | None,
             ],
         ] = {}
+        # Per-matchup H2H cache keyed by `(tour, a_id, b_id)` ordered by
+        # identity convention (NOT sorted) → the constructed
+        # `TennisHeadToHead` or None for empty H2H. Populated by
+        # `warm_h2h_for_selection` at slate-time pre-cap, read
+        # synchronously by `lookup_h2h` at selector scoring time, and
+        # re-read by `_head_to_head` at post-cap enrichment so the
+        # warmup HTTP isn't wasted on cap-survivor events. Identity
+        # ordering matters: `TennisHeadToHead.a_wins` is positional to
+        # the URL path's first ID, so a swapped lookup would invert
+        # surface_h2h tuples.
+        self._h2h_cache: dict[
+            tuple[str, int, int], TennisHeadToHead | None
+        ] = {}
 
     async def __aenter__(self) -> Self:
         headers = {
@@ -1458,6 +1471,83 @@ class MatchStatTennisProvider:
         _form_arr, best_rank, age_years, _plays = cached
         return age_years, best_rank
 
+    async def warm_h2h_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        """Pre-fetch /h2h/{info,matches,stats} per matchup and populate
+        `self._h2h_cache`.
+
+        Selection-stage scoring reads the cache synchronously via
+        `lookup_h2h` to compute an H2H sample-size + surface-conditioned
+        bonus. Same dedup pattern as the per-player warmups, but keyed
+        by **matchup pair** rather than by individual player — collect
+        unique `(tour, a_id, b_id)` triples after rank resolution, fan
+        out one `_head_to_head` call per unique triple, skip pairs
+        already cached.
+
+        Pre-condition: rankings index warm. Identities where either
+        player doesn't resolve are silently skipped — the H2H endpoint
+        requires both vendor IDs.
+
+        Cache reuse downstream: the post-cap `fetch()` path's
+        `_head_to_head` consult-cache-first behaviour means cap-survivor
+        events re-use the warmed payload, so the warmup HTTP serves
+        both the selector's H2H tier AND the eventual prompt's H2H
+        block.
+        """
+        pending: list[tuple[str, int, int, str, str]] = []
+        seen: set[tuple[str, int, int]] = set()
+        for ident in identities:
+            a_hit = self._resolve(ident.tour, ident.player_a)
+            b_hit = self._resolve(ident.tour, ident.player_b)
+            if a_hit is None or b_hit is None:
+                continue
+            a_id = a_hit[0]
+            b_id = b_hit[0]
+            key = (ident.tour, a_id, b_id)
+            if key in seen or key in self._h2h_cache:
+                continue
+            seen.add(key)
+            pending.append(
+                (ident.tour, a_id, b_id, ident.player_a, ident.player_b)
+            )
+        if not pending:
+            return
+        log.info(
+            "matchstat: warming H2H cache for %d matchups (selection)",
+            len(pending),
+        )
+        await asyncio.gather(
+            *(
+                self._head_to_head(tour, a_id, b_id, name_a, name_b)
+                for tour, a_id, b_id, name_a, name_b in pending
+            )
+        )
+
+    def lookup_h2h(
+        self, tour: str, name_a: str, name_b: str
+    ) -> TennisHeadToHead | None:
+        """Sync H2H lookup from the warmed matchup cache.
+
+        Returns None when:
+          - either player isn't in the rankings index for this tour
+          - `warm_h2h_for_selection` hasn't been called for this matchup
+            (cache key absent)
+          - the warmup ran but the vendor returned no usable H2H rows
+            (cache key present, value is None)
+        Selection callers treat None as "no H2H signal" — no penalty,
+        no bonus.
+
+        Identity-ordered: caller passes `name_a` / `name_b` in the same
+        order as `TennisMatchIdentity` (the order used at warmup time).
+        Reordering bypasses the cache key.
+        """
+        a_hit = self._resolve(tour, name_a)
+        b_hit = self._resolve(tour, name_b)
+        if a_hit is None or b_hit is None:
+            return None
+        return self._h2h_cache.get((tour, a_hit[0], b_hit[0]))
+
     async def _player_stats(
         self,
         tour: str,
@@ -1548,7 +1638,18 @@ class MatchStatTennisProvider:
 
         Empty H2H (no prior meetings) returns None and the renderer
         suppresses the section.
+
+        Cache shape: keyed by `(tour, a_id, b_id)` in identity-positional
+        order (NOT sorted). Both selection-stage warmup
+        (`warm_h2h_for_selection`) and post-cap `fetch()` route through
+        this method, so the cache absorbs duplicate work — warmup
+        populates for every matchup in the slate, runtime fetch reuses
+        the cached payload for cap-survivor events without re-issuing
+        the three /h2h/* HTTPs.
         """
+        cache_key = (tour, a_id, b_id)
+        if cache_key in self._h2h_cache:
+            return self._h2h_cache[cache_key]
         info_body, matches_body, stats_body = await asyncio.gather(
             self._get(f"/tennis/v2/{tour}/h2h/info/{a_id}/{b_id}"),
             self._get(
@@ -1632,9 +1733,10 @@ class MatchStatTennisProvider:
             and not recent_meetings
             and a_in_matchup is None and b_in_matchup is None
         ):
+            self._h2h_cache[cache_key] = None
             return None
 
-        return TennisHeadToHead(
+        result = TennisHeadToHead(
             a_wins=a_wins_total,
             b_wins=b_wins_total,
             surface_h2h=surface_h2h or None,
@@ -1642,6 +1744,8 @@ class MatchStatTennisProvider:
             a_in_matchup=a_in_matchup,
             b_in_matchup=b_in_matchup,
         )
+        self._h2h_cache[cache_key] = result
+        return result
 
     @staticmethod
     def _build_matchup_stats(

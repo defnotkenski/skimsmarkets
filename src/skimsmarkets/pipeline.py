@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -126,6 +128,22 @@ class RunResult:
     defensibility_assessments: dict[str, DefensibilityAssessment] = field(
         default_factory=dict
     )
+    # Per-stage wall-clock timings (seconds), populated by `run_pipeline`
+    # right before persist. Persisted to JSONL as a `record_type="meta"`
+    # row so post-hoc bottleneck attribution doesn't depend on captured
+    # stderr. Empty on direct-construction paths (tests) that don't go
+    # through `run_pipeline`.
+    stage_timings: dict[str, float] = field(default_factory=dict)
+    total_seconds: float = 0.0
+    # Per-event lens-chain timings: event_id → stage_name → seconds.
+    # Stage names are `fetcher:<lens>`, `reasoner:<lens>`, and `director`.
+    # Populated incrementally inside `process_event` so a partial dict is
+    # left behind when an event drops mid-chain (the dropped event's row
+    # has whichever stages completed before the error). Used to attribute
+    # the `process_events` wall time across lenses; the high-level
+    # `stage_timings["process_events"]` is still the gather wall clock,
+    # which is dominated by the slowest event.
+    lens_timings: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -889,6 +907,7 @@ async def _run_lenses(
     fetcher_sem: asyncio.Semaphore,
     reasoner_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
+    per_event_timings: dict[str, float],
 ) -> tuple[dict[str, LensNotebook], dict[str, BaseModel]] | None:
     """Run every lens declared by `lens_set` for one event. Each lens is a
     provider fetcher (Stage A) → Claude reasoner (Stage B) chain; lenses
@@ -910,12 +929,16 @@ async def _run_lenses(
         lens = spec.name
         try:
             async with fetcher_sem:
-                notebook = await provider.fetch(event, lens, lens_set=lens_set)
+                with _time_stage(per_event_timings, f"fetcher:{lens}"):
+                    notebook = await provider.fetch(
+                        event, lens, lens_set=lens_set
+                    )
         except Exception as e:  # noqa: BLE001
             return _LensOutcome(lens=lens, error_stage="fetcher", error=e)
         try:
             async with reasoner_sem:
-                report = await run_reasoner(anthropic, event, notebook, spec)
+                with _time_stage(per_event_timings, f"reasoner:{lens}"):
+                    report = await run_reasoner(anthropic, event, notebook, spec)
         except Exception as e:  # noqa: BLE001
             return _LensOutcome(
                 lens=lens, notebook=notebook, error_stage="reasoner", error=e
@@ -959,8 +982,8 @@ def _persist_run(result: RunResult) -> None:
     logged and swallowed — persistence must never abort the run, matching the
     enrichment-stage posture.
 
-    Two row shapes share the file, distinguished by a top-level `record_type`
-    field:
+    Three row shapes share the file, distinguished by a top-level
+    `record_type` field:
       - `record_type="prediction"` — one row per ranked event with the
         director's synthesis, judge's defensibility score, full lens
         notebooks + reasoner reports.
@@ -968,9 +991,13 @@ def _persist_run(result: RunResult) -> None:
         `stage` (e.g. `fetcher:tennis_form_and_surface`,
         `reasoner:tennis_matchup_and_clutch`, `director`, `tennis_stats`,
         `judge`), and the captured error string.
-    Both share the run-level metadata (`run_id`, `logged_at_utc`,
-    `fetcher_provider`, `fetcher_model`) so a grading script can `jq` over
-    the slate without joining against a sidecar.
+      - `record_type="meta"` — one row per run with the per-stage
+        wall-clock timings, slate counts, and total seconds. Lets
+        bottleneck attribution be a `jq` query rather than depending on
+        captured stderr.
+    All three share the run-level metadata (`run_id`, `logged_at_utc`,
+    `fetcher_provider`, `fetcher_model`) so a grading script can `jq`
+    over the slate without joining against a sidecar.
 
     Why JSONL not parquet: lines are easy to tail, easy to grep, easy to feed
     into a future grading script that joins against gamma settlement after
@@ -1108,6 +1135,33 @@ def _persist_run(result: RunResult) -> None:
                     "error": err.error,
                 }
                 f.write(json.dumps(error_payload, separators=(",", ":")) + "\n")
+            # Run-level meta — single row per file. `stage_timings` is the
+            # bottleneck-attribution data structure; `total_seconds` is
+            # the wall-clock from pipeline entry to just-before-this-write
+            # (the persist row itself isn't included in `stage_timings`
+            # because we're inside the persist call). Empty `stage_timings`
+            # on direct-construction paths (tests / non-orchestrator
+            # callers) is harmless — the row still records counts.
+            meta_payload = {
+                "record_type": "meta",
+                "run_id": result.run_id,
+                "logged_at_utc": logged_at,
+                "fetcher_provider": result.fetcher_provider,
+                "fetcher_model": result.fetcher_model,
+                "fetched_events": result.fetched_events,
+                "considered_events": result.considered_events,
+                "n_predictions": len(result.predictions),
+                "n_errors": len(result.errors),
+                "total_seconds": result.total_seconds,
+                "stage_timings": result.stage_timings,
+                # Per-event lens-chain breakdown — `event_id` →
+                # `fetcher:<lens>` / `reasoner:<lens>` / `director` →
+                # seconds. Use `jq` to attribute `process_events` wall
+                # time across lenses, e.g.:
+                #   jq 'select(.record_type=="meta") | .lens_timings'
+                "lens_timings": result.lens_timings,
+            }
+            f.write(json.dumps(meta_payload, separators=(",", ":")) + "\n")
         log.info(
             "persisted %d predictions and %d errors to %s",
             len(result.predictions),
@@ -1127,6 +1181,7 @@ async def process_event(
     reasoner_sem: asyncio.Semaphore,
     director_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
+    lens_timings_out: dict[str, dict[str, float]],
 ) -> tuple[
     MarketPrediction, dict[str, LensNotebook], dict[str, BaseModel]
 ] | None:
@@ -1135,13 +1190,26 @@ async def process_event(
     Returns the prediction alongside the per-lens notebooks and reasoner
     reports so the caller can persist them to the run JSONL. Returns None
     when the event was dropped (any lens stage failure or director failure).
+
+    `lens_timings_out` is a per-run accumulator: keyed by `event_id`, each
+    value is a dict of `fetcher:<lens>` / `reasoner:<lens>` / `director`
+    → seconds. Registered eagerly here so a dropped event still leaves
+    behind whatever stages completed before the error — useful for
+    attributing "which lens failed slowly" vs "which lens failed fast".
+    Concurrent writes from sibling `process_event` tasks are safe because
+    asyncio is single-threaded and each task writes only under its own
+    `event.id` key.
     """
     log.info(
         "processing event %s sport=%s lens_set=%s (%s)",
         event.id, event.sport_type, lens_set.sport, event.title,
     )
+    per_event: dict[str, float] = {}
+    lens_timings_out[event.id] = per_event
     pairs = await _run_lenses(
-        provider, anthropic, event, lens_set, fetcher_sem, reasoner_sem, errors
+        provider, anthropic, event, lens_set,
+        fetcher_sem, reasoner_sem, errors,
+        per_event,
     )
     if pairs is None:
         return None
@@ -1149,9 +1217,10 @@ async def process_event(
 
     async with director_sem:
         try:
-            prediction = await synthesize_prediction(
-                anthropic, event, reports, lens_set
-            )
+            with _time_stage(per_event, "director"):
+                prediction = await synthesize_prediction(
+                    anthropic, event, reports, lens_set
+                )
         except Exception as e:  # noqa: BLE001
             errors.append(
                 ErrorRecord(
@@ -1163,6 +1232,79 @@ async def process_event(
             )
             return None
     return prediction, notebooks, reports
+
+
+@contextmanager
+def _time_stage(timings: dict[str, float], name: str):
+    """Record wall-clock time for a pipeline stage into `timings`.
+
+    Sync context manager — works inside `async` code because awaiting
+    inside a `with` block is fine; `__enter__`/`__exit__` themselves
+    don't need to be async. Same instance can wrap synchronous calls
+    (`enrich_tennis_simulation`) and async calls (`fetch_slate`,
+    `enrich_*`, the per-event `asyncio.gather`).
+
+    `timings` accumulates with `+=` so the same name can be wrapped
+    twice (e.g. enrichment stages that branch on a config flag) without
+    clobbering — though no current caller relies on that. Diagnostic
+    only — never mutates pipeline behaviour, never raises.
+    """
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[name] = timings.get(name, 0.0) + (time.perf_counter() - t0)
+
+
+def _format_stage_timings(
+    timings: dict[str, float], total_seconds: float
+) -> str:
+    """Format the per-stage breakdown as a single info-level line.
+
+    Sorted descending by elapsed seconds so the bottleneck is at the
+    front; rows with `<1ms` cost are dropped (lens_dispatch on small
+    slates) to keep the line readable. Each entry is `name=Xs (P%)`
+    where P is the share of total wall time, so a quick eyeball tells
+    you both the absolute cost AND whether it's a meaningful fraction
+    of the run.
+    """
+    items = [
+        (name, dt) for name, dt in timings.items() if dt >= 0.001
+    ]
+    items.sort(key=lambda x: -x[1])
+    parts = []
+    for name, dt in items:
+        pct = (100.0 * dt / total_seconds) if total_seconds > 0 else 0.0
+        parts.append(f"{name}={dt:.2f}s ({pct:.0f}%)")
+    return f"total={total_seconds:.2f}s | " + " ".join(parts)
+
+
+def _aggregate_lens_timings(
+    lens_timings: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """Sum per-event lens-stage timings into across-the-slate totals.
+
+    Returns a flat `stage → total_seconds` dict (e.g.
+    `fetcher:tennis_form_and_surface=420.5`) where each value is the
+    SUM across every event's lens chain. Note: this is CPU-seconds (or
+    rather wait-seconds), NOT wall-clock — the per-event chains run in
+    parallel via `asyncio.gather`, so the sum is what you'd see if the
+    work were serialised. Use this to ask "which lens stage burns the
+    most cumulative work across the slate?"; pair with the per-event
+    detail in `lens_timings` to ask "is one EVENT dragging the gather?"
+    """
+    totals: dict[str, float] = {}
+    for per_event in lens_timings.values():
+        for stage_name, dt in per_event.items():
+            totals[stage_name] = totals.get(stage_name, 0.0) + dt
+    return totals
+
+
+def _format_lens_aggregate(totals: dict[str, float]) -> str:
+    """Single line: `lens-stage totals (across N events)`, sorted desc."""
+    items = [(n, dt) for n, dt in totals.items() if dt >= 0.001]
+    items.sort(key=lambda x: -x[1])
+    return " ".join(f"{n}={dt:.1f}s" for n, dt in items)
 
 
 async def run_pipeline(
@@ -1199,6 +1341,50 @@ async def run_pipeline(
     run_id = uuid.uuid4().hex[:8]
     result = RunResult(run_id=run_id)
 
+    # Per-stage wall-clock breakdown — diagnostic only, dumped to log
+    # at the end of the run with the bottleneck at the front. Cost is
+    # ~12 `time.perf_counter()` calls per run, effectively free.
+    stage_timings: dict[str, float] = {}
+    pipeline_t0 = time.perf_counter()
+
+    def _snapshot_timings() -> None:
+        """Mirror the in-flight `stage_timings` dict + total elapsed onto
+        `result` so `_persist_run` can write them into the meta row.
+
+        Called immediately before each `_persist_run` site so the meta
+        row carries the most up-to-date breakdown short of the persist
+        call itself. The persist time is not retroactively folded back
+        in (it lands in `stage_timings` after `_persist_run` returns,
+        which the on-disk meta row already won't have observed).
+        """
+        result.stage_timings = dict(stage_timings)
+        result.total_seconds = time.perf_counter() - pipeline_t0
+
+    def _emit_timings() -> None:
+        """Dump the per-stage breakdown. Inner closure so the early-exit
+        paths (empty slate post-select, all-dropped post-lens_dispatch)
+        can call it before returning without duplicating the formatting.
+
+        Two lines: the high-level pipeline stages (fetch_slate, select,
+        enrich_*, process_events, judge, persist), then a second line
+        aggregating per-lens-stage CPU-seconds summed across events.
+        Skip the second line when no per-event chains ran (no events
+        survived to `process_events`, or all dropped at lens_dispatch).
+        """
+        log.info(
+            "pipeline timings: %s",
+            _format_stage_timings(
+                stage_timings, time.perf_counter() - pipeline_t0
+            ),
+        )
+        if result.lens_timings:
+            totals = _aggregate_lens_timings(result.lens_timings)
+            log.info(
+                "lens-stage totals (across %d events, summed): %s",
+                len(result.lens_timings),
+                _format_lens_aggregate(totals),
+            )
+
     fetcher_sem = asyncio.Semaphore(cfg.FETCHER_SEM)
     reasoner_sem = asyncio.Semaphore(cfg.REASONER_SEM)
     director_sem = asyncio.Semaphore(cfg.DIRECTOR_SEM)
@@ -1227,7 +1413,10 @@ async def run_pipeline(
             sports=sports or [],
             horizon_hours=horizon_hours,
         )
-        events = await fetch_slate(slate_opts, http=uw.http, gamma_sem=gamma_sem)
+        with _time_stage(stage_timings, "fetch_slate"):
+            events = await fetch_slate(
+                slate_opts, http=uw.http, gamma_sem=gamma_sem
+            )
         result.fetched_events = len(events)
 
         # Pre-LLM selection — score by fundamental imbalance (player-rank
@@ -1239,16 +1428,18 @@ async def run_pipeline(
         # Tennis-event scoring requires the matchstat rankings index to
         # be warm; `select_top_events` warms it lazily on first use, so
         # non-tennis-only slates pay no warmup cost.
-        events = await select_top_events(
-            events,
-            max_events=cfg.MAX_SLATE_EVENTS,
-            tennis_provider=tennis_provider,
-        )
+        with _time_stage(stage_timings, "select"):
+            events = await select_top_events(
+                events,
+                max_events=cfg.MAX_SLATE_EVENTS,
+                tennis_provider=tennis_provider,
+            )
 
         result.considered_events = len(events)
         log.info("considering %d events", len(events))
 
         if not events:
+            _emit_timings()
             return result
 
         # Lens-set dispatch — strict-declaration: events whose `sport_type`
@@ -1288,25 +1479,35 @@ async def run_pipeline(
             # Whole slate dropped at lens_dispatch. Persist whatever
             # error rows accumulated before bailing.
             if result.errors:
-                _persist_run(result)
+                _snapshot_timings()
+                with _time_stage(stage_timings, "persist"):
+                    _persist_run(result)
+            _emit_timings()
             return result
 
         # Enrichment stages all share the same `gamma_resolver` so token-ID
         # lookups are paid for at most once per slug across UW + CLOB book +
         # CLOB price-history. UW runs first because it can drop events with
         # no actionable signal; book/history then enrich whatever remains.
-        await resolve_unusual_whales(uw, events, uw_sem, resolver=gamma_resolver)
+        with _time_stage(stage_timings, "enrich_uw"):
+            await resolve_unusual_whales(
+                uw, events, uw_sem, resolver=gamma_resolver
+            )
         # CLOB book — top-of-book size, depth, full-book $ totals. Adds
         # one HTTP per unique market slug (deduplicated). Replaces the
         # legacy US `markets.book(...)` BBO refresh; the CLOB endpoint
         # exposes the full global book so book-$ totals here are 5–20×
         # what the legacy US slice used to show.
-        await enrich_clob_book(events, gamma_resolver, public_http, clob_sem)
+        with _time_stage(stage_timings, "enrich_clob_book"):
+            await enrich_clob_book(events, gamma_resolver, public_http, clob_sem)
         # Optional CLOB price-history enrichment — opt-in via the
         # `CLOB_HISTORY_ENABLED` constant in `config.py`. Adds 1 HTTP per
         # unique slug. When off, this is a no-op (zero CLOB calls).
         if cfg.CLOB_HISTORY_ENABLED:
-            await enrich_price_history(events, gamma_resolver, public_http, clob_sem)
+            with _time_stage(stage_timings, "enrich_clob_history"):
+                await enrich_price_history(
+                    events, gamma_resolver, public_http, clob_sem
+                )
         else:
             log.info("clob price history disabled (cfg.CLOB_HISTORY_ENABLED=False)")
         # Tennis stats run LAST among enrichers — gated per-event by sport,
@@ -1314,19 +1515,24 @@ async def run_pipeline(
         # all the upstream gamma/CLOB enrichment costs we want anyway.
         # The provider is always non-None (factory returns the stub when no
         # key is configured), so this is safe without an `if enabled` branch.
-        await enrich_tennis_stats(tennis_provider, events, tennis_sem, result.errors)
+        with _time_stage(stage_timings, "enrich_tennis_stats"):
+            await enrich_tennis_stats(
+                tennis_provider, events, tennis_sem, result.errors
+            )
         # Career-baseline Monte Carlo sim — pure CPU on the inputs
         # `enrich_tennis_stats` just attached. Director-only feed, so
         # this MUST run before the lens chain so the director's
         # per-event context block can render the simulation block
         # alongside the UW block. Lens fetchers don't see it.
-        enrich_tennis_simulation(events, result.errors)
+        with _time_stage(stage_timings, "enrich_tennis_sim"):
+            enrich_tennis_simulation(events, result.errors)
         # GBT prior — third deterministic prior alongside market + sim.
         # Pure-CPU; reads the historical parquet built by
         # `skims gbt backfill` and the catboost artefact built by
         # `skims gbt train`. Silent degrade when either is missing
         # (fresh checkout, no spike training yet).
-        enrich_tennis_gbt(events, result.errors)
+        with _time_stage(stage_timings, "enrich_tennis_gbt"):
+            enrich_tennis_gbt(events, result.errors)
         # Snapshot the per-event tennis context onto the RunResult so
         # `_persist_run` can write it to the JSONL row even though the
         # event itself isn't carried into persistence (only the resulting
@@ -1348,21 +1554,23 @@ async def run_pipeline(
         )
         anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
         try:
-            outcomes = await asyncio.gather(
-                *(
-                    process_event(
-                        provider,
-                        anthropic,
-                        e,
-                        lens_sets_by_event[e.id],
-                        fetcher_sem,
-                        reasoner_sem,
-                        director_sem,
-                        result.errors,
+            with _time_stage(stage_timings, "process_events"):
+                outcomes = await asyncio.gather(
+                    *(
+                        process_event(
+                            provider,
+                            anthropic,
+                            e,
+                            lens_sets_by_event[e.id],
+                            fetcher_sem,
+                            reasoner_sem,
+                            director_sem,
+                            result.errors,
+                            result.lens_timings,
+                        )
+                        for e in events
                     )
-                    for e in events
                 )
-            )
         finally:
             await provider.aclose()
 
@@ -1386,7 +1594,8 @@ async def run_pipeline(
         # but skipping the call avoids spending a token on a known no-op).
         if result.predictions:
             try:
-                judgment = await judge_slate(anthropic, result.predictions)
+                with _time_stage(stage_timings, "judge"):
+                    judgment = await judge_slate(anthropic, result.predictions)
                 for a in judgment.assessments:
                     result.defensibility_assessments[a.event_id] = a
             except Exception as e:  # noqa: BLE001
@@ -1408,5 +1617,9 @@ async def run_pipeline(
     # still produces useful telemetry: the error rows tell us WHY the slate
     # collapsed, which the terminal Errors table loses to scrollback.
     if result.predictions or result.errors:
-        _persist_run(result)
+        _snapshot_timings()
+        with _time_stage(stage_timings, "persist"):
+            _persist_run(result)
+
+    _emit_timings()
     return result

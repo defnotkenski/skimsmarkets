@@ -30,7 +30,11 @@ from skimsmarkets import config as cfg
 from datetime import date
 
 from skimsmarkets.tennis.identity import TennisMatchIdentity
-from skimsmarkets.tennis.models import PerMatchStats, TennisStatsContext
+from skimsmarkets.tennis.models import (
+    PerMatchStats,
+    TennisHeadToHead,
+    TennisStatsContext,
+)
 
 log = logging.getLogger(__name__)
 
@@ -304,6 +308,45 @@ class TennisStatsProvider(Protocol):
         """
         ...
 
+    async def warm_h2h_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        """Pre-fetch head-to-head context per matchup for every identity
+        in the slate. Selection scoring reads the cache via `lookup_h2h`
+        to compute an H2H sample-size + surface-conditioned bonus.
+
+        Same idempotent dedup-and-cache pattern as the four other
+        warmups, but keyed by **matchup pair** rather than by individual
+        player — one HTTP per unique (tour, player_a_id, player_b_id)
+        triple, ordered by identity convention so subsequent runtime
+        fetches in `enrich_tennis_stats` post-cap re-use the cached
+        payload for free on cap-survivor events.
+
+        Pre-condition: rankings index warm. Identities where either
+        player doesn't resolve are silently skipped (the H2H endpoint
+        requires both vendor IDs).
+        """
+        ...
+
+    def lookup_h2h(
+        self, tour: str, name_a: str, name_b: str
+    ) -> TennisHeadToHead | None:
+        """Synchronous H2H lookup against the warmed cache.
+
+        Identity-ordered: callers MUST pass `name_a` and `name_b` in
+        the same order as the original `TennisMatchIdentity` (i.e. the
+        order used at warmup time). Reordering bypasses the cache key.
+
+        Returns None when:
+          - either player isn't in the rankings index
+          - `warm_h2h_for_selection` hasn't been called for this matchup
+          - the warmup ran but the vendor returned no usable H2H rows
+            (no prior meetings AND no matchup-conditioned stats)
+        Selection callers treat None as "no H2H signal" — no penalty,
+        no bonus.
+        """
+        ...
+
     async def fetch_post_match_stats(
         self,
         tour: str,
@@ -415,6 +458,19 @@ class StubTennisStatsProvider:
     def lookup_player_profile_extras(
         self, tour: str, name: str
     ) -> tuple[int | None, int | None] | None:
+        return None
+
+    async def warm_h2h_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        # No backing cache — selection scoring will see None for every
+        # `lookup_h2h` and skip the H2H tier.
+        for _ in identities:
+            pass
+
+    def lookup_h2h(
+        self, tour: str, name_a: str, name_b: str
+    ) -> TennisHeadToHead | None:
         return None
 
     async def fetch_post_match_stats(

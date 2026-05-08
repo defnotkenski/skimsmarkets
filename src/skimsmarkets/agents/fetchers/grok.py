@@ -1,12 +1,11 @@
-"""Grok fetcher provider — xAI SDK with `agent_count=4` multi-agent ensemble.
+"""Grok fetcher provider — xAI SDK, single-agent.
 
 Each lens runs as one xAI chat with `web_search` + `x_search` +
-`code_execution` tools available; `agent_count=4` fans the search out
-across 4 independent trajectories that the SDK merges into one structured
-response. The 4× search-path diversity is what we get from xAI's native
-ensemble — Gemini has no equivalent primitive, so the parallel
-`GeminiProvider` runs single-pass and the A/B is "Grok-with-its-native-
-ensemble vs Gemini-single-pass" by design.
+`code_execution` tools available. Single-pass per lens, same posture
+as the parallel `GeminiProvider` — the A/B is now "Grok vs Gemini"
+straight up. (Earlier model versions exposed an `agent_count=4`
+multi-agent ensemble primitive; current models don't, so the parameter
+is dropped.)
 
 Per-sport-lens-set refactor: prompts are pre-built per `(sport, lens)` at
 construction by iterating `SPORT_LENS_SETS`. `_TOOLS_BY_LENS` is the
@@ -19,7 +18,6 @@ per new lens) without touching existing entries.
 from __future__ import annotations
 
 import logging
-from typing import Literal
 
 from xai_sdk import AsyncClient as XAIAsyncClient
 from xai_sdk.chat import system, user
@@ -37,11 +35,7 @@ from skimsmarkets.polymarket.models import PolymarketEvent
 
 log = logging.getLogger(__name__)
 
-GROK_MODEL = "grok-4.20-multi-agent-0309"
-# xAI's `agent_count` is typed `Literal[4, 16]` — the SDK only accepts those
-# two ensemble sizes. Annotate explicitly so static checkers narrow correctly
-# at the `chat.create(...)` call site.
-GROK_AGENT_COUNT: Literal[4] = 4
+GROK_MODEL = "grok-4.3"
 
 
 # Generic notebook tail — output rules + tool list naming the xAI tools by
@@ -187,7 +181,6 @@ class GrokProvider:
     ) -> LensNotebook:
         chat = self._xai.chat.create(
             model=GROK_MODEL,
-            agent_count=GROK_AGENT_COUNT,
             messages=[system(self._lens_prompts[(lens_set.sport, lens)])],
             tools=[web_search(), x_search(), code_execution()],
         )

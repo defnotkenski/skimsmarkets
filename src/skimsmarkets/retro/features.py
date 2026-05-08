@@ -26,18 +26,18 @@ from skimsmarkets.retro.models import (
 
 
 def _case_bucket(score: float | None) -> int | None:
-    """Map a [0,1] defensibility score to its 1-5 fire-emoji bucket.
+    """Map a [0,1] defensibility score to its 1-5 star-emoji bucket.
 
     Source-of-truth boundaries live in
     `reporting._defensibility_stars` (0.85 / 0.65 / 0.45 / 0.25). We
-    derive the bucket here by counting fire glyphs in the rendered
+    derive the bucket here by counting star glyphs in the rendered
     string rather than re-asserting the boundaries — single source of
     truth, will track future changes.
     """
     if score is None:
         return None
     rendered = _defensibility_stars(score)
-    return rendered.count("🔥") or None
+    return rendered.count("⭐") or None
 
 
 def _market_favorite_pick(
