@@ -181,6 +181,10 @@ class SlateOptions:
     slugs: list[str] = field(default_factory=list)
     sports: list[str] = field(default_factory=list)
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS
+    # Favorite-blowout threshold on the YES mid. Defaults to the config
+    # constant; CLI surfaces `--max-implied-prob` for ad-hoc overrides
+    # without editing config.py.
+    max_implied_probability: float = cfg.MAX_IMPLIED_PROBABILITY
 
 
 async def fetch_gamma_slate(
@@ -189,6 +193,7 @@ async def fetch_gamma_slate(
     horizon_hours: int,
     *,
     sports: list[str] | None = None,
+    max_implied_probability: float = cfg.MAX_IMPLIED_PROBABILITY,
 ) -> list[PolymarketEvent]:
     """Fetch the Polymarket sports slate from gamma-api.
 
@@ -321,7 +326,7 @@ async def fetch_gamma_slate(
             (m.yes_bid_dollars + m.yes_ask_dollars) / 2.0  # type: ignore[operator]
             for m in live_markets
         )
-        if favorite_mid >= cfg.MAX_IMPLIED_PROBABILITY:
+        if favorite_mid >= max_implied_probability:
             dropped_blowout += 1
             continue
         if len(live_markets) != len(ev.markets):
@@ -332,7 +337,7 @@ async def fetch_gamma_slate(
         "kept %d gamma events after league + horizon + tradability + "
         "blowout (>=%.2f) filters; dropped %d as blowouts",
         len(kept),
-        cfg.MAX_IMPLIED_PROBABILITY,
+        max_implied_probability,
         dropped_blowout,
     )
 
@@ -439,7 +444,11 @@ async def fetch_slate(
         events: list[PolymarketEvent] = []
     else:
         events = await fetch_gamma_slate(
-            http, opts.leagues, opts.horizon_hours, sports=opts.sports
+            http,
+            opts.leagues,
+            opts.horizon_hours,
+            sports=opts.sports,
+            max_implied_probability=opts.max_implied_probability,
         )
 
     if opts.slugs:
@@ -1311,6 +1320,7 @@ async def run_pipeline(
     *,
     leagues: list[str] | None = None,
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
+    max_implied_probability: float = cfg.MAX_IMPLIED_PROBABILITY,
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
     tennis_stats_disabled: bool = False,
@@ -1412,6 +1422,7 @@ async def run_pipeline(
             slugs=slugs or [],
             sports=sports or [],
             horizon_hours=horizon_hours,
+            max_implied_probability=max_implied_probability,
         )
         with _time_stage(stage_timings, "fetch_slate"):
             events = await fetch_slate(

@@ -71,14 +71,24 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
     """Translate the shared slate-flags namespace into a `SlateOptions`.
 
     `argparse` gives us bare lists for repeatable flags (always a list,
-    possibly empty), so we don't need to coerce `None`. Horizon comes from
-    `cfg` and is not currently exposed on the CLI.
+    possibly empty), so we don't need to coerce `None`. `--horizon` and
+    `--max-implied-prob` default to `None` at the argparse layer; the
+    fall-through below resolves to the config constants when the user
+    didn't pass an override, so passing the flag wins and omitting it
+    quietly inherits config.
     """
     return SlateOptions(
         leagues=args.league,
         slugs=args.slug,
         sports=args.sport,
-        horizon_hours=cfg.DEFAULT_HORIZON_HOURS,
+        horizon_hours=(
+            args.horizon if args.horizon is not None else cfg.DEFAULT_HORIZON_HOURS
+        ),
+        max_implied_probability=(
+            args.max_implied_prob
+            if args.max_implied_prob is not None
+            else cfg.MAX_IMPLIED_PROBABILITY
+        ),
     )
 
 
@@ -90,6 +100,7 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
     result = await run_pipeline(
         leagues=opts.leagues or None,
         horizon_hours=opts.horizon_hours,
+        max_implied_probability=opts.max_implied_probability,
         slugs=opts.slugs or None,
         sports=opts.sports or None,
         tennis_stats_disabled=args.no_tennis_stats,
@@ -301,6 +312,30 @@ def _build_slate_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--horizon",
+        type=int,
+        default=None,
+        metavar="HOURS",
+        help=(
+            f"Override the horizon window. Markets whose earliest "
+            f"game_start_time sits further out than this are dropped "
+            f"from the slate before LLM spend. Defaults to "
+            f"{cfg.DEFAULT_HORIZON_HOURS}h from config.py."
+        ),
+    )
+    p.add_argument(
+        "--max-implied-prob",
+        type=float,
+        default=None,
+        metavar="PROB",
+        help=(
+            f"Override the favorite-blowout threshold. Events whose "
+            f"favorite is priced at or above this on the YES mid are "
+            f"dropped before the LLM path. Range [0, 1]. Defaults to "
+            f"{cfg.MAX_IMPLIED_PROBABILITY:.2f} from config.py."
+        ),
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
     return p
@@ -311,8 +346,10 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="skims",
         description=(
             "Fetch live Polymarket sports markets and run the multi-agent "
-            f"confidence-ranker pipeline. Horizon fixed at "
-            f"{cfg.DEFAULT_HORIZON_HOURS}h (set DEFAULT_HORIZON_HOURS in config.py to change)."
+            "confidence-ranker pipeline. Horizon and favorite-blowout "
+            f"threshold default to {cfg.DEFAULT_HORIZON_HOURS}h / "
+            f"{cfg.MAX_IMPLIED_PROBABILITY:.2f} from config.py; override "
+            "per-invocation with --horizon / --max-implied-prob."
         ),
     )
     slate = _build_slate_parser()
