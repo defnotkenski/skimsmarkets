@@ -12,7 +12,7 @@ from anthropic.types import (
 )
 from pydantic import BaseModel, ValidationError
 
-from skimsmarkets.agents.schemas import EventPrediction, MarketPrediction
+from skimsmarkets.agents.schemas import EventPrediction, MarketPrediction, TokenUsage
 from skimsmarkets.agents.sport_hints import render_director_sport_hint
 from skimsmarkets.agents.sports import DIRECTOR_SHARED_PREAMBLE
 from skimsmarkets.agents.sports.base import LensSet
@@ -232,6 +232,7 @@ def _project_to_market_prediction(
         specialist_weights=event_pred.specialist_weights,
         disagreements_flagged=event_pred.disagreements_flagged,
         uw_flow_note=event_pred.uw_flow_note,
+        retracted_shifts=event_pred.retracted_shifts,
     )
 
 
@@ -240,6 +241,8 @@ async def synthesize_prediction(
     event: PolymarketEvent,
     reports: dict[str, BaseModel],
     lens_set: LensSet,
+    *,
+    token_sink: list[TokenUsage] | None = None,
 ) -> MarketPrediction:
     """Synthesize a sport's specialist reports into an event-level
     `EventPrediction`, then project onto the predicted winner's market.
@@ -304,6 +307,14 @@ async def synthesize_prediction(
             raise
 
     assert parsed is not None and event_pred is not None  # break-path invariant
+    if token_sink is not None:
+        token_sink.append(TokenUsage(
+            stage="director",
+            provider="anthropic",
+            model=CLAUDE_MODEL,
+            input_tokens=parsed.usage.input_tokens,
+            output_tokens=parsed.usage.output_tokens,
+        ))
     log.debug(
         "director event=%s sport=%s tokens in/out=%s/%s",
         event.id,

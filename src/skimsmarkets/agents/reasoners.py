@@ -39,7 +39,7 @@ from skimsmarkets.agents.director import (
     _PARSE_RETRY_ATTEMPTS,
 )
 from skimsmarkets.agents.fetchers import render_context
-from skimsmarkets.agents.schemas import LensNotebook
+from skimsmarkets.agents.schemas import LensNotebook, TokenUsage
 from skimsmarkets.agents.sports.base import LensSpec
 from skimsmarkets.polymarket.models import PolymarketEvent
 
@@ -51,6 +51,8 @@ async def run_reasoner(
     event: PolymarketEvent,
     notebook: LensNotebook,
     spec: LensSpec,
+    *,
+    token_sink: list[TokenUsage] | None = None,
 ) -> BaseModel:
     """Run one Claude reasoner for one event/lens.
 
@@ -124,6 +126,14 @@ async def run_reasoner(
             raise
 
     assert parsed is not None and report is not None  # break-path invariant
+    if token_sink is not None:
+        token_sink.append(TokenUsage(
+            stage=f"reasoner:{spec.name}",
+            provider="anthropic",
+            model=CLAUDE_MODEL,
+            input_tokens=parsed.usage.input_tokens,
+            output_tokens=parsed.usage.output_tokens,
+        ))
     log.debug(
         "reasoner=%s event=%s tokens in/out=%s/%s",
         spec.name,

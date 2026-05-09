@@ -76,6 +76,23 @@ class PredictionRow(BaseModel):
     notebooks: dict[str, dict[str, Any]] = Field(default_factory=dict)
     specialist_reports: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
+    # Promoted derived metrics — see `pipeline._persist_run` for how
+    # they're computed. None on older runs (pre-2026-05-09) and on
+    # non-tennis events that lack a stacking math.
+    prompt_version: str | None = None
+    predicted_probability_bucket: str | None = None
+    stack_baseline_team_a: float | None = None
+    stack_team_a_probability: float | None = None
+    team_a_p_final: float | None = None
+    stack_vs_final_delta: float | None = None
+    gap_to_market_signed: float | None = None
+    gap_to_sim_signed: float | None = None
+    gap_to_gbt_signed: float | None = None
+    lens_coverage: dict[str, str] = Field(default_factory=dict)
+    retracted_shifts: list[dict[str, Any]] = Field(default_factory=list)
+    token_usage_summary: dict[str, Any] | None = None
+    token_usage_calls: list[dict[str, Any]] = Field(default_factory=list)
+
 
 class ResolvedOutcome(BaseModel):
     """One row in `logs/runs/<run_id>.resolutions.jsonl` (Step 1 output).
@@ -173,6 +190,39 @@ class EventFeatures(BaseModel):
     baseline_bp_convert_pct_b: float | None = None
     actual_bp_convert_pct_b: float | None = None
     divergence_bp_convert_b: float | None = None
+
+    # Tennis per-shift directional grading. For each of the six signed
+    # shifts the tennis lens set emits (form, surface, h2h, clutch,
+    # physical, stakes), True when the shift's sign pointed at the
+    # eventual winner; False when it pointed away; None when the shift
+    # was ~zero (no directional content) or the event isn't settled or
+    # team_a couldn't be identified. Aggregated by analyze.py to
+    # surface "which lens shift has the worst hit rate" — direct signal
+    # for tightening that reasoner. Non-tennis events leave all six
+    # null. The tolerance for "zero" is ±0.005 — anything inside that
+    # band is treated as no-call.
+    form_signed_shift_correct: bool | None = None
+    surface_signed_shift_correct: bool | None = None
+    h2h_signed_shift_correct: bool | None = None
+    clutch_signed_shift_correct: bool | None = None
+    physical_signed_shift_correct: bool | None = None
+    stakes_signed_shift_correct: bool | None = None
+    # Raw shift values copied for analysis convenience — saves the
+    # consumer from walking back into `specialist_reports`.
+    form_signed_shift_value: float | None = None
+    surface_signed_shift_value: float | None = None
+    h2h_signed_shift_value: float | None = None
+    clutch_signed_shift_value: float | None = None
+    physical_signed_shift_value: float | None = None
+    stakes_signed_shift_value: float | None = None
+    # Stack metrics promoted to features so analysis can ask "did the
+    # director's overrides pay off?" by joining `stack_vs_final_delta`
+    # against `won`.
+    stack_team_a_probability: float | None = None
+    stack_vs_final_delta: float | None = None
+    gap_to_market_signed: float | None = None
+    gap_to_sim_signed: float | None = None
+    gap_to_gbt_signed: float | None = None
 
 
 class RetroPostMatchPair(BaseModel):

@@ -384,6 +384,35 @@ Fields you OWN (verdict — derive from notebook + event context):
 - `lineup_confidence` — 'confirmed' when both players are on the entry
   list AND have practiced same-day; 'probable' when entry list is final
   but warm-up issues reported; 'uncertain' otherwise.
+- `confidence` — overall reasoning confidence in your signed shifts,
+  distinct from `lineup_confidence`. 'low' when court/weather/injury
+  evidence is thin or speculative, when fatigue primitives are absent
+  and player-load is unknown, or when stakes are uncertain. 'medium'
+  when most of the picture is well-characterised but one factor is
+  thin. 'high' when fatigue primitives are present, weather and court
+  conditions are well characterised, and either both players are
+  confirmed healthy or one has a credible withdrawal-class flag.
+- `computed_numbers` — 3-6 deterministic scalars derived from the
+  notebook + structured fatigue block, each in [0.0, 1.0] unless the
+  label says otherwise. Suggested labels (use what fits — empty list
+  if the notebook is too thin to anchor anything):
+    * `fatigue_index_a` / `_b` — composite of days_since_last_match
+      and match_count_last_14d. 0.0 = fully rested (≥7 days, 0
+      matches), 1.0 = back-to-back-day grind (≤1 day, ≥4 matches).
+    * `weather_serve_drag_a` / `_b` — qualitative wind+temp impact on
+      this player's serve. 0.0 = neutral, 1.0 = severe drag.
+    * `stakes_pressure_a` / `_b` — motivation magnitude. 0.0 =
+      indifferent, 1.0 = career-defining stakes (Slam SF, ranking
+      bubble).
+    * `injury_risk_a` / `_b` — withdrawal-class probability for THIS
+      match. 0.0 = confirmed healthy, 1.0 = walkover-imminent.
+    * `surface_pace_index` — venue surface pace (CPI-style). Bound
+      [0.0, 1.0]; 0.0 = slowest clay, 1.0 = fastest grass.
+  Each entry's `method` field is a one-line note on how you derived
+  it (e.g. "fatigue_index_a: days=0 + 5 matches in 14d → 0.92").
+  These ride on the report so retro grading can correlate the lens's
+  numeric reads with actual outcomes — distinct from the signed
+  shifts, which are directional verdicts.
 
 Fields you EXTRACT from the notebook:
 - `court_conditions_summary` — 1-3 sentences of plain English on court
@@ -441,7 +470,13 @@ You will receive three specialist reports for this tennis event:
 3. `TennisConditionsContextReport` — physical match-day reality + stakes.
    Fields: `physical_signed_shift` (`[-0.15, +0.15]`), `stakes_signed_shift`
    (`[-0.10, +0.10]`), `court_conditions_summary`, `fatigue_summary`,
-   `stakes_summary`, `injury_concerns`, `lineup_confidence`.
+   `stakes_summary`, `injury_concerns`, `lineup_confidence`, `confidence`,
+   `computed_numbers`. `confidence` here is the reasoning-quality tag
+   (low/medium/high), parallel to the other two reports' `confidence`.
+   `lineup_confidence` is a separate data-availability tag for entry-list
+   certainty — do not confuse them when building `specialist_weights`.
+   `computed_numbers` carries deterministic scalars (e.g. `fatigue_index_a`)
+   for retro grading.
 
 Sign convention: ALL six signed shifts are positive-toward-team_a.
 
@@ -479,10 +514,47 @@ Critical anti-double-counting rules:
   reasoner returned a shift outside its bound, treat the field as
   invalid (it shouldn't happen because Pydantic enforces the bounds).
 
-After computing team_a_p_final, anchor against Polymarket's implied
-probability per the cross-sport calibration discipline above (defer to
-market when evidence is weak; commit to the read when it's strong;
-material deviation must be justified in `reasoning`).
+team_a_p_final IS the verdict. Set `predicted_winner_probability` to it
+(or to `1 - team_a_p_final` for a contrarian call). Do NOT compress
+team_a_p_final toward Polymarket's implied probability as a default — the
+lens shifts already encode every contextual factor the system has, and
+mechanical compression toward market is exactly the asymmetric bias the
+cross-sport preamble warns against. Compression would dampen high-
+conviction reads while leaving low-conviction reads unchanged, producing
+hedged predictions that satisfy nobody.
+
+The ONLY admissible reason to deviate from team_a_p_final is that, on
+re-reading the lens reports, you can name a specific shift whose
+magnitude is unsupported by the evidence in its lens's notebook (e.g.
+`form_signed_shift = +0.10` but the form notebook describes both players
+as comparable). In that case retract the offending shift in your
+reasoning, log it in `retracted_shifts` (one entry: lens_name,
+shift_field, original_value, applied_value, one-sentence reason), and
+recompute — never just shrink the final number without an entry.
+
+`retracted_shifts` is the audit trail for that decision: leave it empty
+when you accept the literal stack math; populate one entry per shift
+you actually set aside. Retro grading reads this to spot reasoners that
+chronically over-shift, so honesty here improves the next prompt
+revision. Do NOT use it as a soft "I down-weighted this lens" signal —
+that belongs in `specialist_weights`.
+
+When you do deviate, it MUST be symmetric in principle: a stack that
+overshoots toward team_a (final > market) and a stack that overshoots
+toward team_b (final < market) get the same treatment. If the
+divergence direction systematically favors the side closer to market,
+you are anchoring rather than reasoning.
+
+When the stack lands materially above market with all shifts well-
+supported, COMMIT TO IT — that is the high-conviction read the slate
+judge rewards in `defensibility_score`. Same in reverse: when the stack
+lands materially below market (contrarian), commit and name the
+underdog as `predicted_winner` per the cross-sport contrarian-call
+discipline.
+
+Material deviations from market (>1000 bps) still require a justification
+sentence in `reasoning` — but "justification" means naming the shifts
+that drive the gap, not apologising for the gap.
 
 Career-baseline Monte Carlo prior (when present): the per-event
 context block may carry a `--- Tennis match simulator ---` block with

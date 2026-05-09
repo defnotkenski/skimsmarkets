@@ -43,16 +43,18 @@ _RESOLVE_CONCURRENCY = cfg.GAMMA_FETCH_SEM
 
 
 def _norm_name(name: str) -> str:
-    """Lowercase + diacritic-stripped + single-spaced.
+    """Lowercase + diacritic-stripped + hyphen-collapsed + single-spaced.
 
     Mirrors `tennis/matchstat._normalize_name` so the same comparison
     semantics apply across the retro layer. Used to match the
     director's `predicted_winner` (verbatim from gamma's `team_a_name`
-    plumbing) against the resolved gamma outcome name.
+    plumbing) against the resolved gamma outcome name. Hyphens collapse
+    to spaces so a Polymarket-hyphenated name (e.g. 'En-Shuo Liang')
+    matches the vendor-spaced form ('En Shuo Liang').
     """
     nfkd = unicodedata.normalize("NFKD", name)
     stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
-    return " ".join(stripped.lower().split())
+    return " ".join(stripped.replace("-", " ").lower().split())
 
 
 def _parse_outcome_pair(raw: Any) -> list[Any] | None:

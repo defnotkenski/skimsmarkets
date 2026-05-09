@@ -45,7 +45,7 @@ from skimsmarkets.agents.fetchers.base import (
     build_lens_prompts_for_set,
     render_user_message_for_lens,
 )
-from skimsmarkets.agents.schemas import LensNotebook
+from skimsmarkets.agents.schemas import LensNotebook, TokenUsage
 from skimsmarkets.agents.sports import SPORT_LENS_SETS
 from skimsmarkets.agents.sports.base import LensSet
 from skimsmarkets.polymarket.models import PolymarketEvent
@@ -231,6 +231,7 @@ class GeminiProvider:
         lens: str,
         *,
         lens_set: LensSet,
+        token_sink: list[TokenUsage] | None = None,
     ) -> LensNotebook:
         spec = lens_set.lens_specs_by_name[lens]
         user_msg = render_user_message_for_lens(event, spec)
@@ -325,6 +326,16 @@ class GeminiProvider:
         # names differ from xAI; pull defensively so a future SDK rename
         # doesn't break logging.
         usage = getattr(response, "usage_metadata", None)
+        in_tok = getattr(usage, "prompt_token_count", None)
+        out_tok = getattr(usage, "candidates_token_count", None)
+        if token_sink is not None:
+            token_sink.append(TokenUsage(
+                stage=f"fetcher:{lens}",
+                provider="gemini",
+                model=GEMINI_MODEL,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+            ))
         log.debug(
             "fetcher=gemini sport=%s lens=%s event=%s coverage=%s citations=%d "
             "computed=%d tokens in/out=%s/%s",
@@ -334,8 +345,8 @@ class GeminiProvider:
             parsed.coverage,
             len(parsed.citations),
             len(parsed.computed_numbers),
-            getattr(usage, "prompt_token_count", None),
-            getattr(usage, "candidates_token_count", None),
+            in_tok,
+            out_tok,
         )
         return parsed
 

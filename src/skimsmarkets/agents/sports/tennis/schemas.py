@@ -19,7 +19,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from skimsmarkets.agents.schemas import Confidence, PlayerStatus
+from skimsmarkets.agents.schemas import ComputedNumber, Confidence, PlayerStatus
 
 TennisFormGrade = Literal["poor", "below_avg", "average", "strong", "elite"]
 
@@ -202,5 +202,32 @@ class TennisConditionsContextReport(BaseModel):
             "'confirmed' once both players are on entry list AND have practiced "
             "same-day; 'probable' when entry list is final but warm-up issues "
             "reported; 'uncertain' otherwise."
+        ),
+    )
+    confidence: Confidence = Field(
+        description=(
+            "Reasoning confidence in the signed shifts (distinct from "
+            "`lineup_confidence`, which gauges entry-list certainty). 'low' "
+            "when court/weather/injury evidence is thin or speculative, when "
+            "no fatigue primitives are present and the player-load picture is "
+            "unknown, or when stakes are uncertain. 'high' when fatigue "
+            "primitives are present, weather and court conditions are well "
+            "characterised, and either both players are confirmed healthy "
+            "or one has a credible withdrawal-class flag. The director "
+            "down-weights low-confidence shifts in `specialist_weights`."
+        ),
+    )
+    computed_numbers: list[ComputedNumber] = Field(
+        default_factory=list,
+        description=(
+            "Deterministic numeric scalars you derived for THIS event so "
+            "retro grading can score the conditions lens against outcomes "
+            "(the other two lenses inherit numbers from their fetchers' "
+            "code_execution; conditions historically had none). Aim for "
+            "3-6 entries when the picture supports them — see the reasoner "
+            "sport hint for the suggested label conventions "
+            "(`fatigue_index_a`, `weather_serve_drag_a`, "
+            "`stakes_pressure_a`, etc., each in [0.0, 1.0] unless noted). "
+            "Empty when the notebook is too thin to anchor any of them."
         ),
     )

@@ -28,7 +28,7 @@ from skimsmarkets.agents.fetchers.base import (
     build_lens_prompts_for_set,
     render_user_message_for_lens,
 )
-from skimsmarkets.agents.schemas import LensNotebook
+from skimsmarkets.agents.schemas import LensNotebook, TokenUsage
 from skimsmarkets.agents.sports import SPORT_LENS_SETS
 from skimsmarkets.agents.sports.base import LensSet
 from skimsmarkets.polymarket.models import PolymarketEvent
@@ -178,6 +178,7 @@ class GrokProvider:
         lens: str,
         *,
         lens_set: LensSet,
+        token_sink: list[TokenUsage] | None = None,
     ) -> LensNotebook:
         chat = self._xai.chat.create(
             model=GROK_MODEL,
@@ -189,6 +190,16 @@ class GrokProvider:
         chat.append(user(user_msg))
         response, parsed = await chat.parse(LensNotebook)
         assert_lens_match(parsed, lens, event.id)
+        in_tok = getattr(response.usage, "prompt_tokens", None)
+        out_tok = getattr(response.usage, "completion_tokens", None)
+        if token_sink is not None:
+            token_sink.append(TokenUsage(
+                stage=f"fetcher:{lens}",
+                provider="grok",
+                model=GROK_MODEL,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+            ))
         log.debug(
             "fetcher=grok sport=%s lens=%s event=%s coverage=%s citations=%d "
             "computed=%d tokens in/out=%s/%s",
@@ -198,8 +209,8 @@ class GrokProvider:
             parsed.coverage,
             len(parsed.citations),
             len(parsed.computed_numbers),
-            getattr(response.usage, "prompt_tokens", None),
-            getattr(response.usage, "completion_tokens", None),
+            in_tok,
+            out_tok,
         )
         return parsed
 

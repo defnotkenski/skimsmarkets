@@ -24,6 +24,16 @@ sport.
 
 from __future__ import annotations
 
+# Bumped manually whenever any prompt or lens schema changes in a way that
+# would alter director behaviour (preamble text, sport tail text, lens
+# report schemas, signed-shift bounds, calibration anchors). Stamped on
+# every prediction row + meta record so retro analysis can A/B before vs
+# after a change without joining against git history. Format is a short
+# semver-ish string; bump the minor on prompt tweaks, the major on
+# breaking schema changes.
+PROMPT_VERSION = "2026.05.09-1"
+
+
 DIRECTOR_SHARED_PREAMBLE = """
 You are the director of a sports prediction-market research team. For a single sporting event
 you receive specialist reports from a sport-specific lens set and emit an EventPrediction:
@@ -75,8 +85,15 @@ Cross-sport synthesis rules:
   your `predicted_winner_probability` accordingly and call this out explicitly in
   `reasoning`.
 - When specialists disagree, resolve it explicitly in your reasoning — never paper over it.
-  Populate disagreements_flagged for any material directional disagreement (one specialist
-  favors team_a, another favors team_b), not just magnitude differences.
+  Populate disagreements_flagged in any of these cases (one short string per item):
+    1. Directional conflict between specialists — one shift favors team_a, another favors
+       team_b. Magnitude differences alone do NOT qualify; sign conflicts do.
+    2. You retracted a shift and your final probability differs from the literal stack
+       math by more than 5pp. Name which shift you retracted and why.
+    3. Your final probability deviates from a deterministic prior (market, sim, or GBT)
+       by more than 10pp. Name which prior and which lens-shifts justify the gap.
+  Empty only when specialists agree directionally AND your final tracks the stack AND it
+  tracks every available deterministic prior.
 - `predicted_winner` MUST exactly match one of the yes_sub_titles listed in the event context
   (e.g. 'Cavaliers' or 'Lakers'). Do not abbreviate or rename — downstream looks up the
   winner's Polymarket market by exact match on this string.

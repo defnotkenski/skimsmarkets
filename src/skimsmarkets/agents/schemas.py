@@ -51,6 +51,44 @@ class Citation(BaseModel):
     )
 
 
+class TokenUsage(BaseModel):
+    """Token-count record for one LLM call.
+
+    Appended to a per-event sink by each LLM-call site (fetcher, reasoner,
+    director, judge) so the pipeline can persist per-event token totals
+    alongside timings. `stage` mirrors the same naming convention used by
+    `RunResult.lens_timings` (`fetcher:<lens>`, `reasoner:<lens>`,
+    `director`, `judge`) so retro queries can join tokens to timings on
+    the stage label.
+
+    Token fields are `int | None` because Gemini's older SDK occasionally
+    omits the metadata; treat None as "unknown, do not aggregate."
+    `provider` and `model` ride along so retro grading can A/B token cost
+    per provider without joining against the run-level meta record.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    stage: str = Field(
+        description=(
+            "Stage label matching `RunResult.lens_timings` keys: "
+            "`fetcher:<lens>` / `reasoner:<lens>` / `director` / `judge`."
+        ),
+    )
+    provider: str = Field(
+        description="Provider name (e.g. 'grok', 'gemini', 'anthropic')."
+    )
+    model: str = Field(description="Model id (e.g. 'grok-4.3', 'claude-opus-4-7').")
+    input_tokens: int | None = Field(
+        default=None,
+        description="Prompt-side tokens. None when the SDK omitted the metadata.",
+    )
+    output_tokens: int | None = Field(
+        default=None,
+        description="Completion-side tokens. None when the SDK omitted the metadata.",
+    )
+
+
 class ComputedNumber(BaseModel):
     """A number derived via the fetcher's `code_execution` tool.
 
@@ -134,6 +172,49 @@ class PlayerStatus(BaseModel):
     impact_note: str = Field(description="How this affects the matchup.")
 
 
+class RetractedShift(BaseModel):
+    """One signed shift the director set aside during synthesis.
+
+    Populated on `EventPrediction.retracted_shifts` when the director's
+    final probability deviates from the literal stack math because a
+    specific shift's magnitude wasn't supported by its lens's notebook.
+    Retro grading aggregates these to find the most-retracted shifts —
+    a direct signal that the offending reasoner is over-confident on
+    that field.
+    """
+
+    lens_name: str = Field(
+        description=(
+            "The lens whose shift was retracted (e.g. "
+            "'tennis_matchup_and_clutch'). Must match a key in "
+            "`specialist_weights`."
+        ),
+    )
+    shift_field: str = Field(
+        description=(
+            "Name of the signed-shift field that was retracted (e.g. "
+            "'clutch_signed_shift', 'h2h_signed_shift'). Use the exact "
+            "field name from the lens's report schema."
+        ),
+    )
+    original_value: float = Field(
+        description="The value the reasoner emitted (within the field's bound).",
+    )
+    applied_value: float = Field(
+        description=(
+            "The value you actually used when computing your final probability "
+            "(typically 0.0 for a full retraction; non-zero for partial)."
+        ),
+    )
+    reason: str = Field(
+        description=(
+            "ONE short sentence on why the lens's notebook didn't support "
+            "the original value (e.g. 'matchup notebook flagged N=1 H2H "
+            "and low confidence; original +0.06 too aggressive')."
+        ),
+    )
+
+
 class EventPrediction(BaseModel):
     """Event-level synthesis emitted by the director (LLM output).
 
@@ -190,7 +271,18 @@ class EventPrediction(BaseModel):
     )
     disagreements_flagged: list[str] = Field(
         default_factory=list,
-        description="Empty when specialists aligned.",
+        description=(
+            "One short string per material disagreement that shaped the "
+            "synthesis. Cover, when applicable: (1) directional conflict "
+            "between specialists (one shift favors team_a, another team_b); "
+            "(2) deviation between your final probability and the literal "
+            "stack math when you retracted a shift (>5pp); (3) deviation "
+            "between your final probability and a deterministic prior "
+            "(market, sim, or GBT) by >10pp. Each entry should name what "
+            "diverged and how you resolved it. Empty only when specialists "
+            "agree directionally AND your final tracks the stack AND it "
+            "tracks the deterministic priors."
+        ),
     )
     uw_flow_note: str | None = Field(
         default=None,
@@ -202,6 +294,20 @@ class EventPrediction(BaseModel):
             "vs sellers hitting bid), notable insider positions, MCI value/delta "
             "if meaningful, and whether flow agreed with or diverged from the "
             "sportsbook consensus. Null when UW had no coverage for this event."
+        ),
+    )
+    retracted_shifts: list[RetractedShift] = Field(
+        default_factory=list,
+        description=(
+            "Per-event audit log of any signed shifts you set aside while "
+            "synthesizing — i.e. shifts whose magnitude you concluded were "
+            "unsupported by the lens's notebook evidence after re-reading. "
+            "ONLY populate when you genuinely retracted a shift; do NOT use "
+            "this as a generic 'I down-weighted this lens' field (that "
+            "belongs in `specialist_weights`). One entry per retracted shift. "
+            "Empty when you accepted the literal stack math. Drives retro "
+            "grading of which shifts the director most often retracts — a "
+            "signal for tightening the offending reasoner's calibration."
         ),
     )
 
@@ -255,9 +361,22 @@ class MarketPrediction(BaseModel):
     )
     disagreements_flagged: list[str] = Field(
         default_factory=list,
-        description="Empty when specialists aligned.",
+        description=(
+            "Material disagreements the director resolved during synthesis. "
+            "Projected verbatim from the EventPrediction; see that field's "
+            "description for the full scope (lens directional conflicts, "
+            "stack-vs-final retractions, prior-vs-final deviations)."
+        ),
     )
     uw_flow_note: str | None = None
+    retracted_shifts: list[RetractedShift] = Field(
+        default_factory=list,
+        description=(
+            "Projected verbatim from EventPrediction.retracted_shifts — "
+            "audit log of signed shifts the director set aside during "
+            "synthesis. See that field's description for usage."
+        ),
+    )
 
 
 class DefensibilityAssessment(BaseModel):

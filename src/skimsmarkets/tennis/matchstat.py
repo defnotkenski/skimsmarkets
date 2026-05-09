@@ -197,16 +197,20 @@ _BURST_TOKENS = 5
 
 
 def _normalize_name(name: str) -> str:
-    """Lowercase, diacritic-stripped, single-spaced.
+    """Lowercase, diacritic-stripped, hyphen-collapsed, single-spaced.
 
     Used for keying the rankings index. The vendor and Polymarket both
     ship names in roughly the same Latin form, but the vendor preserves
     diacritics (Cóbolli, Müller) while Polymarket question strings
-    sometimes drop them. We normalize both sides so lookups don't miss.
+    sometimes drop them. Polymarket also occasionally hyphenates
+    compound given names (e.g. 'En-Shuo Liang') where the vendor's
+    rankings list ships them with a space ('En Shuo Liang'); collapsing
+    hyphens to spaces makes both lookups land on the same key. The
+    final split/join collapses any resulting double-spaces.
     """
     nfkd = unicodedata.normalize("NFKD", name)
     stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
-    return " ".join(stripped.lower().split())
+    return " ".join(stripped.replace("-", " ").lower().split())
 
 
 def _coerce_int(v: Any) -> int | None:

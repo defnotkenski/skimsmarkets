@@ -23,7 +23,9 @@ from skimsmarkets.agents.schemas import (
     DefensibilityAssessment,
     LensNotebook,
     MarketPrediction,
+    TokenUsage,
 )
+from skimsmarkets.agents.sports._director_shared import PROMPT_VERSION
 from skimsmarkets.agents.sports import resolve_lens_set
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
 from skimsmarkets.clob import (
@@ -144,6 +146,15 @@ class RunResult:
     # `stage_timings["process_events"]` is still the gather wall clock,
     # which is dominated by the slowest event.
     lens_timings: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Per-event token usage: event_id → list of TokenUsage records, one per
+    # LLM call (fetcher per lens, reasoner per lens, director). Populated
+    # alongside `lens_timings`. Persisted on the prediction row so retro
+    # grading can correlate token cost vs predictive value per lens
+    # (especially relevant given the form/matchup fetchers are confirmed
+    # to do little web search beyond LLM-rewriting the structured block).
+    token_usage: dict[str, list[TokenUsage]] = field(default_factory=dict)
+    # Slate-level token usage: judge call. Persisted on the meta row.
+    slate_token_usage: list[TokenUsage] = field(default_factory=list)
 
 
 @dataclass
@@ -917,6 +928,7 @@ async def _run_lenses(
     reasoner_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
     per_event_timings: dict[str, float],
+    per_event_tokens: list[TokenUsage],
 ) -> tuple[dict[str, LensNotebook], dict[str, BaseModel]] | None:
     """Run every lens declared by `lens_set` for one event. Each lens is a
     provider fetcher (Stage A) → Claude reasoner (Stage B) chain; lenses
@@ -940,14 +952,18 @@ async def _run_lenses(
             async with fetcher_sem:
                 with _time_stage(per_event_timings, f"fetcher:{lens}"):
                     notebook = await provider.fetch(
-                        event, lens, lens_set=lens_set
+                        event, lens, lens_set=lens_set,
+                        token_sink=per_event_tokens,
                     )
         except Exception as e:  # noqa: BLE001
             return _LensOutcome(lens=lens, error_stage="fetcher", error=e)
         try:
             async with reasoner_sem:
                 with _time_stage(per_event_timings, f"reasoner:{lens}"):
-                    report = await run_reasoner(anthropic, event, notebook, spec)
+                    report = await run_reasoner(
+                        anthropic, event, notebook, spec,
+                        token_sink=per_event_tokens,
+                    )
         except Exception as e:  # noqa: BLE001
             return _LensOutcome(
                 lens=lens, notebook=notebook, error_stage="reasoner", error=e
@@ -982,6 +998,135 @@ async def _run_lenses(
 # so behaviour doesn't drift with cwd. `parents[2]` walks
 # src/skimsmarkets/pipeline.py → src/skimsmarkets → src → repo-root.
 _LOG_ROOT = Path(__file__).resolve().parents[2] / "logs" / "runs"
+
+
+# ---------------------------------------------------------------------------
+# Per-prediction derived metrics — pure functions over already-persisted
+# fields. Promoted to top-level columns so retro queries don't have to
+# walk into nested specialist_reports / notebooks / sim / GBT to ask
+# "did the override pay off" / "did the lens stack track outcomes".
+# ---------------------------------------------------------------------------
+
+# Tennis lens-set stack composition. Used by `_compute_tennis_stack` to
+# reconstruct the literal `baseline + sum(shifts)` the director was asked
+# to apply, so retro can compute `stack_vs_final_delta`. List of
+# (lens_name, field_name) pairs in the same order the synthesis tail
+# spells out — keeping it data-driven means a future shift addition just
+# adds a tuple here.
+_TENNIS_STACK_SHIFTS: tuple[tuple[str, str], ...] = (
+    ("tennis_form_and_surface", "form_signed_shift"),
+    ("tennis_form_and_surface", "surface_signed_shift"),
+    ("tennis_matchup_and_clutch", "h2h_signed_shift"),
+    ("tennis_matchup_and_clutch", "clutch_signed_shift"),
+    ("tennis_conditions_and_context", "physical_signed_shift"),
+    ("tennis_conditions_and_context", "stakes_signed_shift"),
+)
+
+
+def _compute_tennis_stack(
+    reports: dict[str, BaseModel],
+) -> tuple[float, float] | None:
+    """Reconstruct the literal stack math for a tennis event.
+
+    Returns (baseline, stack_team_a) where stack_team_a is the unclipped
+    sum of baseline + all six signed shifts; the caller clips to [0,1].
+    Returns None when the form lens didn't emit a baseline (only happens
+    on a partial-failure event the director shouldn't have synthesised
+    anyway — defensive).
+    """
+    form = reports.get("tennis_form_and_surface")
+    if form is None:
+        return None
+    baseline = getattr(form, "team_a_win_probability", None)
+    if baseline is None:
+        return None
+    total = float(baseline)
+    for lens_name, field_name in _TENNIS_STACK_SHIFTS:
+        report = reports.get(lens_name)
+        if report is None:
+            continue
+        v = getattr(report, field_name, None)
+        if v is not None:
+            total += float(v)
+    return float(baseline), total
+
+
+def _team_a_probability(
+    p: MarketPrediction, reports: dict[str, BaseModel]
+) -> float | None:
+    """Re-orient `predicted_yes_probability` to team_a's frame.
+
+    `predicted_yes_probability` is the probability of whoever the
+    director picked. To compare against the stack (which is team_a-
+    anchored) and the deterministic priors (also team_a-anchored), we
+    flip when the picked winner is team_b. None when no report carries
+    team_a_name (shouldn't happen under tennis but defensive).
+    """
+    team_a_name: str | None = None
+    for r in reports.values():
+        name = getattr(r, "team_a_name", None)
+        if name:
+            team_a_name = name
+            break
+    if not team_a_name:
+        return None
+    if p.predicted_winner.strip().lower() == team_a_name.strip().lower():
+        return p.predicted_yes_probability
+    return 1.0 - p.predicted_yes_probability
+
+
+def _calibration_bucket(prob: float) -> str:
+    """Bin `predicted_yes_probability` into 5pp buckets for calibration plots.
+
+    Predictions naturally cluster in 0.50-1.00 (since predicted_winner is
+    always picked above 50% by the contrarian-call discipline), but the
+    bucket label is full-range so an underdog flip gets binned correctly.
+    Uses inclusive-low / exclusive-high boundaries except the top bucket
+    which is inclusive-high to keep p=1.0 in a real bucket.
+    """
+    if prob >= 0.95:
+        return "0.95-1.00"
+    lo = int(prob * 20) * 5
+    return f"0.{lo:02d}-0.{lo + 5:02d}"
+
+
+def _coverage_by_lens(
+    notebooks: dict[str, LensNotebook],
+) -> dict[str, str]:
+    """Promote per-lens `notebook.coverage` to a flat top-level dict.
+
+    Lets retro queries filter low-coverage events with a single column
+    lookup (`jq '.lens_coverage["tennis_form_and_surface"]=="thin"'`)
+    instead of walking into the notebook payload.
+    """
+    return {lens: nb.coverage for lens, nb in notebooks.items()}
+
+
+def _aggregate_tokens(
+    usage: list[TokenUsage],
+) -> dict[str, int | None]:
+    """Sum token usage across an event's LLM calls.
+
+    Returns a dict with `input_total`, `output_total`, and
+    `n_calls`. Treats None tokens as 0 in the sum but reports them
+    separately as `n_unknown_calls` so retro can flag SDK regressions
+    that drop usage metadata.
+    """
+    in_total = 0
+    out_total = 0
+    n_unknown = 0
+    for u in usage:
+        if u.input_tokens is None and u.output_tokens is None:
+            n_unknown += 1
+            continue
+        in_total += u.input_tokens or 0
+        out_total += u.output_tokens or 0
+    return {
+        "input_total": in_total,
+        "output_total": out_total,
+        "n_calls": len(usage),
+        "n_unknown_calls": n_unknown,
+    }
 
 
 def _persist_run(result: RunResult) -> None:
@@ -1059,6 +1204,81 @@ def _persist_run(result: RunResult) -> None:
                 # is fine for jq filtering even though the LensSet itself
                 # has an ordered tuple.
                 lens_names_for_row = sorted(reports_for_event.keys())
+
+                # Stack reconstruction (tennis-only for now; other sports
+                # land here with stack=None until they declare their own
+                # stacking math). When stack is present we also compute
+                # the team_a-anchored final probability so all the prior
+                # gaps are apples-to-apples.
+                reports_typed = result.reports.get(p.event_id, {})
+                stack_pair = (
+                    _compute_tennis_stack(reports_typed)
+                    if p.lens_set_name == "tennis" else None
+                )
+                team_a_p_final = _team_a_probability(p, reports_typed)
+                stack_baseline = stack_pair[0] if stack_pair else None
+                stack_team_a = stack_pair[1] if stack_pair else None
+                # Clip to the same [0,1] the director was asked to clip
+                # to, so `stack_vs_final_delta` measures override
+                # magnitude rather than clip-magnitude.
+                stack_team_a_clipped = (
+                    max(0.0, min(1.0, stack_team_a))
+                    if stack_team_a is not None else None
+                )
+                stack_vs_final_delta = (
+                    team_a_p_final - stack_team_a_clipped
+                    if (team_a_p_final is not None
+                        and stack_team_a_clipped is not None)
+                    else None
+                )
+                # team_a-anchored gaps to deterministic priors. All three
+                # are signed (positive = director above prior) so retro
+                # queries can ask "are we systematically above the
+                # market?" with a one-line aggregate. The market gap
+                # needs flipping when the predicted winner is team_b
+                # (polymarket_implied_probability is in the picked-
+                # winner frame; sim/GBT are already team_a-anchored).
+                if (team_a_p_final is not None
+                        and p.polymarket_implied_probability is not None):
+                    ta_name = next(
+                        (getattr(r, "team_a_name", None)
+                         for r in reports_typed.values()
+                         if getattr(r, "team_a_name", None)),
+                        None,
+                    )
+                    if ta_name and ta_name.strip().lower() == p.predicted_winner.strip().lower():
+                        market_team_a = p.polymarket_implied_probability
+                    elif ta_name:
+                        market_team_a = 1.0 - p.polymarket_implied_probability
+                    else:
+                        market_team_a = None
+                    gap_to_market = (
+                        team_a_p_final - market_team_a
+                        if market_team_a is not None else None
+                    )
+                else:
+                    gap_to_market = None
+                sim_p = (
+                    tsim.p_team_a_wins if tsim is not None else None
+                )
+                gap_to_sim = (
+                    team_a_p_final - sim_p
+                    if (team_a_p_final is not None and sim_p is not None)
+                    else None
+                )
+                gbt_p = (
+                    tgbt.p_team_a_wins if tgbt is not None else None
+                )
+                gap_to_gbt = (
+                    team_a_p_final - gbt_p
+                    if (team_a_p_final is not None and gbt_p is not None)
+                    else None
+                )
+
+                # Per-event token usage rollup
+                event_token_usage = result.token_usage.get(p.event_id, [])
+                token_summary = _aggregate_tokens(event_token_usage)
+
                 payload = {
                     # Discriminator — see function docstring for shapes.
                     # Listed first so `jq '.record_type'` is one cheap
@@ -1066,6 +1286,11 @@ def _persist_run(result: RunResult) -> None:
                     "record_type": "prediction",
                     "run_id": result.run_id,
                     "logged_at_utc": logged_at,
+                    # Bumped manually whenever any prompt or schema changes
+                    # in a way that would alter director behaviour. Lets A/B
+                    # analysis split before vs after a change without
+                    # joining against git history.
+                    "prompt_version": PROMPT_VERSION,
                     # Run-level fetcher metadata — top-level (not nested in
                     # `notebooks`) so retrospective A/B grading can group
                     # rows by provider via `jq '.fetcher_provider'`.
@@ -1086,8 +1311,47 @@ def _persist_run(result: RunResult) -> None:
                     "predicted_winner": p.predicted_winner,
                     "predicted_yes_probability": p.predicted_yes_probability,
                     "polymarket_implied_probability": p.polymarket_implied_probability,
+                    # Pre-binned 5pp bucket of `predicted_yes_probability`
+                    # so calibration-plot scripts can group rows with one
+                    # column lookup instead of re-binning every time.
+                    "predicted_probability_bucket": _calibration_bucket(
+                        p.predicted_yes_probability
+                    ),
                     "confidence": p.confidence,
                     "headline": p.headline,
+                    # Derived synthesis metrics — promoted to top-level
+                    # so retro queries don't have to walk specialist_reports
+                    # to ask "did the override pay off" / "did the stack
+                    # math track outcomes". `stack_team_a_probability` is
+                    # the literal `baseline + sum(shifts)` clipped to
+                    # [0,1]; `stack_vs_final_delta` is signed in the
+                    # team_a frame (positive = director went above stack).
+                    # The gap_to_* fields are also team_a-anchored
+                    # (positive = director above prior). All five are
+                    # null on non-tennis events until other sports declare
+                    # a stacking math, and on events missing the relevant
+                    # prior (sim/GBT cold-start gates).
+                    "stack_baseline_team_a": stack_baseline,
+                    "stack_team_a_probability": stack_team_a_clipped,
+                    "team_a_p_final": team_a_p_final,
+                    "stack_vs_final_delta": stack_vs_final_delta,
+                    "gap_to_market_signed": gap_to_market,
+                    "gap_to_sim_signed": gap_to_sim,
+                    "gap_to_gbt_signed": gap_to_gbt,
+                    # Per-lens coverage tags promoted to a flat dict so
+                    # `jq '.lens_coverage["tennis_form_and_surface"]=="thin"'`
+                    # is one column lookup instead of a notebook walk.
+                    "lens_coverage": _coverage_by_lens(
+                        result.notebooks.get(p.event_id, {})
+                    ),
+                    # Per-event token-usage rollup + the per-call breakdown.
+                    # Summary on top for quick aggregation; full list rides
+                    # underneath for per-stage analysis (which lens cost
+                    # what).
+                    "token_usage_summary": token_summary,
+                    "token_usage_calls": [
+                        u.model_dump(mode="json") for u in event_token_usage
+                    ],
                     # Director synthesis fields — `reasoning` is the 3-6
                     # sentence rationale, `specialist_weights` shows how
                     # the three lenses were weighted, `disagreements_flagged`
@@ -1100,6 +1364,16 @@ def _persist_run(result: RunResult) -> None:
                     "specialist_weights": p.specialist_weights,
                     "disagreements_flagged": p.disagreements_flagged,
                     "uw_flow_note": p.uw_flow_note,
+                    # Per-event audit log — populated by the director when
+                    # it set aside one of the lens-emitted shifts because
+                    # the lens's notebook didn't support the magnitude.
+                    # Empty when the director accepted the literal stack
+                    # math. Drives retro grading of "which shift gets
+                    # retracted most" — a direct calibration signal for
+                    # the offending reasoner.
+                    "retracted_shifts": [
+                        rs.model_dump(mode="json") for rs in p.retracted_shifts
+                    ],
                     "defensibility_score": (
                         da.defensibility_score if da is not None else None
                     ),
@@ -1133,6 +1407,7 @@ def _persist_run(result: RunResult) -> None:
                     "record_type": "error",
                     "run_id": result.run_id,
                     "logged_at_utc": logged_at,
+                    "prompt_version": PROMPT_VERSION,
                     "fetcher_provider": result.fetcher_provider,
                     "fetcher_model": result.fetcher_model,
                     "event_id": err.event_id,
@@ -1151,10 +1426,23 @@ def _persist_run(result: RunResult) -> None:
             # because we're inside the persist call). Empty `stage_timings`
             # on direct-construction paths (tests / non-orchestrator
             # callers) is harmless — the row still records counts.
+            # Slate-level token aggregate: sum across every event's
+            # per-call breakdown plus the judge's call. Promoted to the
+            # meta row so a `jq '.token_usage_summary'` against the meta
+            # record gives a one-line "what did this run cost in tokens"
+            # without parsing prediction rows.
+            all_calls = [
+                u for ev_list in result.token_usage.values() for u in ev_list
+            ] + result.slate_token_usage
+            slate_summary = _aggregate_tokens(all_calls)
             meta_payload = {
                 "record_type": "meta",
                 "run_id": result.run_id,
                 "logged_at_utc": logged_at,
+                # See prediction-row docstring above; same field, same
+                # meaning. Stamped on the meta record so retro grading
+                # can A/B by version with one filter against meta rows.
+                "prompt_version": PROMPT_VERSION,
                 "fetcher_provider": result.fetcher_provider,
                 "fetcher_model": result.fetcher_model,
                 "fetched_events": result.fetched_events,
@@ -1169,6 +1457,10 @@ def _persist_run(result: RunResult) -> None:
                 # time across lenses, e.g.:
                 #   jq 'select(.record_type=="meta") | .lens_timings'
                 "lens_timings": result.lens_timings,
+                "token_usage_summary": slate_summary,
+                "judge_token_usage_calls": [
+                    u.model_dump(mode="json") for u in result.slate_token_usage
+                ],
             }
             f.write(json.dumps(meta_payload, separators=(",", ":")) + "\n")
         log.info(
@@ -1191,6 +1483,7 @@ async def process_event(
     director_sem: asyncio.Semaphore,
     errors: list[ErrorRecord],
     lens_timings_out: dict[str, dict[str, float]],
+    token_usage_out: dict[str, list[TokenUsage]],
 ) -> tuple[
     MarketPrediction, dict[str, LensNotebook], dict[str, BaseModel]
 ] | None:
@@ -1215,10 +1508,12 @@ async def process_event(
     )
     per_event: dict[str, float] = {}
     lens_timings_out[event.id] = per_event
+    per_event_tokens: list[TokenUsage] = []
+    token_usage_out[event.id] = per_event_tokens
     pairs = await _run_lenses(
         provider, anthropic, event, lens_set,
         fetcher_sem, reasoner_sem, errors,
-        per_event,
+        per_event, per_event_tokens,
     )
     if pairs is None:
         return None
@@ -1228,7 +1523,8 @@ async def process_event(
         try:
             with _time_stage(per_event, "director"):
                 prediction = await synthesize_prediction(
-                    anthropic, event, reports, lens_set
+                    anthropic, event, reports, lens_set,
+                    token_sink=per_event_tokens,
                 )
         except Exception as e:  # noqa: BLE001
             errors.append(
@@ -1578,6 +1874,7 @@ async def run_pipeline(
                             director_sem,
                             result.errors,
                             result.lens_timings,
+                            result.token_usage,
                         )
                         for e in events
                     )
@@ -1606,7 +1903,10 @@ async def run_pipeline(
         if result.predictions:
             try:
                 with _time_stage(stage_timings, "judge"):
-                    judgment = await judge_slate(anthropic, result.predictions)
+                    judgment = await judge_slate(
+                        anthropic, result.predictions,
+                        token_sink=result.slate_token_usage,
+                    )
                 for a in judgment.assessments:
                     result.defensibility_assessments[a.event_id] = a
             except Exception as e:  # noqa: BLE001

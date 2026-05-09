@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 from typing import Awaitable, Callable, Protocol
 
-from skimsmarkets.agents.schemas import LensNotebook
+from skimsmarkets.agents.schemas import LensNotebook, TokenUsage
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
@@ -82,6 +82,7 @@ class FetcherProvider(Protocol):
         lens: str,
         *,
         lens_set: LensSet,
+        token_sink: list[TokenUsage] | None = None,
     ) -> LensNotebook: ...
 
     async def aclose(self) -> None: ...

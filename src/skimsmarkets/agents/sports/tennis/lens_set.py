@@ -309,6 +309,20 @@ Tennis conditions-and-context calibration:
     * 'probable' when entry list is final but warm-up issues
       reported on either side.
     * 'uncertain' otherwise.
+- `confidence` (overall reasoning confidence; distinct from
+  `lineup_confidence`):
+    * 'high': fatigue primitives present in the structured block,
+      weather + court well-characterised in the notebook, both
+      players confirmed healthy OR one carries a credible
+      withdrawal-class flag. Quiet pre-match days where the picture
+      is clear should land here.
+    * 'medium': most of the picture is solid but ONE factor is thin
+      (forecast uncertain, fatigue primitives partial, one player's
+      same-day status not yet reported).
+    * 'low': notebook coverage thin, fatigue primitives absent AND
+      player-load unknown, multiple unresolved injury rumors, or any
+      combination that leaves the physical-shift magnitude poorly
+      anchored.
 - Coach changes are technical disruption, not availability — keep
   them OUT of the physical shift even when the notebook flags them.
   Note them in `stakes_summary` if relevant.

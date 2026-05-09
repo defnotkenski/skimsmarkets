@@ -40,6 +40,31 @@ def _case_bucket(score: float | None) -> int | None:
     return rendered.count("█") or None
 
 
+# Per-shift grading rides on the same six fields the tennis lens set
+# emits. Mapping is (lens_name, shift_field, feature_value, feature_correct)
+# so a future lens-set addition is one tuple. Non-tennis events skip
+# this section entirely.
+_TENNIS_SHIFT_GRADING: tuple[tuple[str, str, str, str], ...] = (
+    ("tennis_form_and_surface", "form_signed_shift",
+     "form_signed_shift_value", "form_signed_shift_correct"),
+    ("tennis_form_and_surface", "surface_signed_shift",
+     "surface_signed_shift_value", "surface_signed_shift_correct"),
+    ("tennis_matchup_and_clutch", "h2h_signed_shift",
+     "h2h_signed_shift_value", "h2h_signed_shift_correct"),
+    ("tennis_matchup_and_clutch", "clutch_signed_shift",
+     "clutch_signed_shift_value", "clutch_signed_shift_correct"),
+    ("tennis_conditions_and_context", "physical_signed_shift",
+     "physical_signed_shift_value", "physical_signed_shift_correct"),
+    ("tennis_conditions_and_context", "stakes_signed_shift",
+     "stakes_signed_shift_value", "stakes_signed_shift_correct"),
+)
+
+# Shifts whose absolute value falls below this threshold are treated as
+# "no directional call" — graded as None rather than True/False so a
+# barely-non-zero shift doesn't get credited or penalised.
+_SHIFT_ZERO_TOLERANCE = 0.005
+
+
 def _market_favorite_pick(
     predicted_prob: float | None,
     market_implied: float | None,
@@ -101,7 +126,51 @@ def extract_features(
         ),
         settled=settled,
         won=won,
+        # Promoted derived metrics — straight pass-through from the
+        # prediction row.
+        stack_team_a_probability=row.stack_team_a_probability,
+        stack_vs_final_delta=row.stack_vs_final_delta,
+        gap_to_market_signed=row.gap_to_market_signed,
+        gap_to_sim_signed=row.gap_to_sim_signed,
+        gap_to_gbt_signed=row.gap_to_gbt_signed,
     )
+
+    # Tennis per-shift directional grading. Walk the six known shift
+    # locations in `specialist_reports`; for each, copy the value and
+    # — if the event settled and we can identify team_a — score the
+    # sign against the actual winner. team_a is the favorite by
+    # construction, so winner==team_a means positive shifts were
+    # right. Non-tennis events leave all six null because the lens
+    # set's report keys won't match.
+    team_a_name: str | None = None
+    if row.tennis_stats is not None:
+        team_a_name = row.tennis_stats.player_a.name
+    won_team_a: bool | None = None
+    if settled and team_a_name and row.predicted_winner:
+        # `won` is True iff the predicted winner won. Combine with
+        # whether predicted == team_a to derive whether team_a won.
+        predicted_is_team_a = (
+            row.predicted_winner.strip().lower()
+            == team_a_name.strip().lower()
+        )
+        if won is True:
+            won_team_a = predicted_is_team_a
+        elif won is False:
+            won_team_a = not predicted_is_team_a
+    for lens_name, shift_field, value_col, correct_col in _TENNIS_SHIFT_GRADING:
+        report = row.specialist_reports.get(lens_name)
+        if not isinstance(report, dict):
+            continue
+        v = report.get(shift_field)
+        if not isinstance(v, (int, float)):
+            continue
+        setattr(feats, value_col, float(v))
+        if won_team_a is None or abs(v) < _SHIFT_ZERO_TOLERANCE:
+            continue
+        # Positive shift => predicts team_a wins. Correct iff
+        # team_a actually won.
+        predicted_team_a = v > 0
+        setattr(feats, correct_col, predicted_team_a == won_team_a)
 
     # Tennis-only post-match divergence. Pre-match baseline lives on
     # `tennis_stats.player_a/b`; actuals come from `post_match.player_a/b`.

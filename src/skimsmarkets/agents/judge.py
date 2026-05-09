@@ -39,7 +39,7 @@ from anthropic.types import (
     ThinkingConfigAdaptiveParam,
 )
 
-from skimsmarkets.agents.schemas import MarketPrediction, SlateDefensibilityJudgment
+from skimsmarkets.agents.schemas import MarketPrediction, SlateDefensibilityJudgment, TokenUsage
 
 # Inlined here (formerly `agents/prompts.py:JUDGE_SYSTEM`) as part of the
 # per-sport lens-set refactor — `prompts.py` was the home for cross-sport
@@ -222,6 +222,8 @@ def _render_user_message(predictions: list[MarketPrediction]) -> str:
 async def judge_slate(
     anthropic: AsyncAnthropic,
     predictions: list[MarketPrediction],
+    *,
+    token_sink: list[TokenUsage] | None = None,
 ) -> SlateDefensibilityJudgment:
     """Single LLM call that scores every prediction in the slate.
 
@@ -253,6 +255,14 @@ async def judge_slate(
         raise RuntimeError(
             f"Judge returned no parsed output; stop_reason={parsed.stop_reason}"
         )
+    if token_sink is not None:
+        token_sink.append(TokenUsage(
+            stage="judge",
+            provider="anthropic",
+            model=CLAUDE_MODEL,
+            input_tokens=parsed.usage.input_tokens,
+            output_tokens=parsed.usage.output_tokens,
+        ))
     log.info(
         "judge scored %d/%d events; tokens in/out=%s/%s",
         len(judgment.assessments),
