@@ -93,13 +93,24 @@ matchup:
 - in-matchup serve & break-point percentages (per player, against THIS
   opponent only — sharper signal than career averages)
 
-Per player the block also ships handedness (`plays`: right-handed / left-
-handed) and career BP-save / BP-convert percentages — these belong to
-THIS lens, not the form lens, because they're style/clutch primitives.
+Per player the block also ships:
+- handedness (`plays`: right-handed / left-handed)
+- career BP-save / BP-convert percentages (no time bound)
+- recency-windowed BP-save % (trailing 180 days) — divergence from the
+  career figure flags an upswing/slump the career rate smooths over
+- career-aggregate clutch records computed over the trailing 50 matches,
+  shown as `tiebreaks=W/T  deciders=W/T  comeback=W/T  close=W/T`
+  (comeback denominator counts only matches where the player lost set 1;
+  close = final-set margin ≤2 or final-set tiebreak). Sample sizes are
+  visible — calibrate around denominators, not raw rates.
 
-The block may be absent for first-time meetings between two players who
-also lack handedness AND career BP rates — fall back to web search in
-that case (same posture as before structured matchup data shipped).
+These belong to THIS lens, not the form lens, because they're style /
+clutch primitives.
+
+The block is absent only when both players lack ALL of (handedness,
+career BP rates, 180d BP, career clutch records) AND there's no prior
+H2H — fall back to web search in that case (same posture as before
+structured matchup data shipped).
 
 Copy these verbatim into `research_notes` and lift each numeric entry into
 `computed_numbers` (e.g. `h2h_count_alcaraz_djokovic`, `decider_record_alcaraz_vs_djokovic`,
@@ -150,8 +161,10 @@ evidence on the PHYSICAL REALITY of match day and the STAKES — what changes
 from the absent-conditions baseline.
 
 This lens is web-search-dominated. The structured tennis_stats block
-gives you `last_match_date` (fatigue baseline) and `surface` (so you know
-which conditions matter), but most of your work is fresh search.
+gives you `days_since_last_match` and `match_count_last_14d` per player
+(pre-computed fatigue primitives) plus `surface` and `tournament` in
+the block header (so you know which conditions matter), but most of
+your work is fresh search.
 
 What to capture (use whichever tools fit — your provider's tool list
 specifies them):
@@ -305,10 +318,20 @@ Fields you OWN (verdict — derive from notebook + event context):
   H2H tells you WHY one player has the edge, not how much extra
   surface-driven push to apply.
 - `clutch_signed_shift` — bound `[-0.10, +0.10]`, positive = toward team_a.
-  Drives off in-matchup decider/tiebreak records, comeback / closeout
-  rates, career BP-save vs BP-convert percentages, deep-Slam-run history.
-  When matchup-conditioned records (in-matchup deciders, in-matchup BP %)
-  are present, prefer them over career-wide BP percentages.
+  Three time horizons of clutch evidence ride on the notebook; weight in
+  this order:
+    1. Matchup-conditioned (sharpest, opponent-specific): in-matchup
+       decider/tiebreak records, in-matchup comeback/closeout rates,
+       in-matchup BP %.
+    2. Career-aggregate over the trailing 50 matches: tiebreak / decider
+       / comeback / close-match records + 180d BP-save.
+    3. Career-wide (no time bound): career BP-save / BP-convert
+       percentages.
+  Prefer the most opponent-specific signal with a meaningful
+  denominator — don't average across horizons. A 33% vs 67% in-matchup
+  decider record outranks a small career BP-save delta even when the
+  latter has bigger N. Also weigh deep-Slam-run history when the
+  notebook surfaces it.
 - `style_advantage` — 'team_a' / 'team_b' / 'neutral'. Default to
   'neutral' when no clear stylistic edge.
 - `pressure_handler` — 'team_a' / 'team_b' / 'neutral'. Default to

@@ -1995,6 +1995,7 @@ class MatchStatTennisProvider:
         return TennisStatsContext(
             provider=self.name,
             fetched_at=datetime.now(UTC),
+            surface=identity.surface,
             tournament=identity.tournament_hint,
             player_a=player_a,
             player_b=player_b,

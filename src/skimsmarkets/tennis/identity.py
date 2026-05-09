@@ -127,6 +127,12 @@ class TennisMatchIdentity(BaseModel):
     # tournament context to disambiguate H2H by event; we surface it
     # here and let the provider decide whether to use it.
     tournament_hint: str | None = None
+    # Slug-derived surface for the major tournaments (4 Slams + ATP/WTA
+    # Masters/1000 swing). None for lower tiers / unrecognised slugs —
+    # downstream consumers degrade to inferring surface from market
+    # labels. Pipes into `TennisStatsContext.surface` so all three lens
+    # blocks carry the match surface in their headers.
+    surface: str | None = None
 
 
 def _looks_like_doubles(name: str) -> bool:
@@ -293,4 +299,5 @@ def tennis_match_identity(event: PolymarketEvent) -> TennisMatchIdentity | None:
         player_b=player_b,
         tour=tour,
         tournament_hint=tournament_hint,
+        surface=_slug_surface(event.slug or ""),
     )

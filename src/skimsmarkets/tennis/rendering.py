@@ -570,5 +570,8 @@ def render_tennis_fatigue_block(
     b = _fatigue_lines("Player B", ctx.player_b, today, cutoff)
     if not a and not b:
         return None
-    header = "--- Tennis fatigue (computed from MatchStat recent-matches feed) ---"
+    header = (
+        f"--- Tennis fatigue (computed from MatchStat recent-matches feed)"
+        f"{_header_extras(ctx)} ---"
+    )
     return "\n".join([header] + a + b)
