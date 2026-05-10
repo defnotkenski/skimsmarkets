@@ -139,6 +139,19 @@ def _favorite_label(flag: bool | None) -> str:
     return "favorite" if flag else "underdog"
 
 
+_NEGATIVE_EDGE_ORDER: list[str] = [
+    "negative edge",
+    "non-negative edge",
+    "no market price",
+]
+
+
+def _negative_edge_label(flag: bool | None) -> str:
+    if flag is None:
+        return "no market price"
+    return "negative edge" if flag else "non-negative edge"
+
+
 def _aggregate_one_cut(
     feats: Iterable[EventFeatures],
     name: str,
@@ -201,6 +214,12 @@ def aggregate(
                 "Market-favorite vs underdog pick",
                 list(_FAVORITE_ORDER),
                 lambda f: _favorite_label(f.market_favorite_pick),
+            ),
+            _aggregate_one_cut(
+                scope,
+                "Negative-edge vs non-negative-edge pick",
+                list(_NEGATIVE_EDGE_ORDER),
+                lambda f: _negative_edge_label(f.negative_edge),
             ),
         ]
 

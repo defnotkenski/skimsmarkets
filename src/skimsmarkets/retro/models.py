@@ -55,6 +55,12 @@ class PredictionRow(BaseModel):
     predicted_winner: str
     predicted_yes_probability: float
     polymarket_implied_probability: float | None = None
+    # True when the director picked the same side as the market but with
+    # strictly lower probability than the market priced — agreeing-with-
+    # less-conviction. None on older rows (pre-flag) or when market
+    # implied is missing; `extract_features` recomputes from the two
+    # probability fields as a fallback so older runs benefit too.
+    negative_edge: bool | None = None
     confidence: Literal["low", "medium", "high"]
     headline: str | None = None
     reasoning: str | None = None
@@ -159,6 +165,10 @@ class EventFeatures(BaseModel):
     # Step 2's anti-anchoring cut. True when predicted_winner sits on
     # the side gamma's market priced as the favorite (≥0.5 implied).
     market_favorite_pick: bool | None = None
+    # True when the director picked the same side as the market but
+    # with strictly lower conviction. Mirrors `PredictionRow.negative_edge`
+    # — kept here as a feature so calibrate can cut hit rate by it.
+    negative_edge: bool | None = None
     # Outcome (joined from ResolvedOutcome). `won` is only meaningful
     # when `settled` is True.
     settled: bool

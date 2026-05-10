@@ -84,6 +84,19 @@ def _market_favorite_pick(
     return market_implied >= 0.5
 
 
+def _negative_edge(
+    predicted_prob: float | None,
+    market_implied: float | None,
+) -> bool | None:
+    """True when director's picked-side probability is strictly below
+    the market's. Same picked-winner frame as `polymarket_implied_probability`.
+    None when either input is missing — unknowable.
+    """
+    if predicted_prob is None or market_implied is None:
+        return None
+    return predicted_prob < market_implied
+
+
 def extract_features(
     row: PredictionRow,
     outcome: ResolvedOutcome | None,
@@ -123,6 +136,15 @@ def extract_features(
         market_favorite_pick=_market_favorite_pick(
             row.predicted_yes_probability,
             row.polymarket_implied_probability,
+        ),
+        # Prefer the persisted flag; recompute for old rows that pre-date it.
+        negative_edge=(
+            row.negative_edge
+            if row.negative_edge is not None
+            else _negative_edge(
+                row.predicted_yes_probability,
+                row.polymarket_implied_probability,
+            )
         ),
         settled=settled,
         won=won,

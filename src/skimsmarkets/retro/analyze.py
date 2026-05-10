@@ -136,6 +136,7 @@ def _row_to_csv(f: EventFeatures) -> str:
         _f(f.defensibility_score),
         _s(f.case_bucket),
         _s(f.market_favorite_pick),
+        _s(f.negative_edge),
         _s(f.won),
         _f(f.baseline_first_serve_in_pct_a),
         _f(f.actual_first_serve_in_pct_a),
@@ -167,7 +168,7 @@ def _row_to_csv(f: EventFeatures) -> str:
 _CSV_HEADER = (
     "event_id,event_title,sport_type,surface,predicted_winner,"
     "predicted_prob,market_implied_prob,confidence,defensibility_score,"
-    "case_bucket,market_favorite_pick,won,"
+    "case_bucket,market_favorite_pick,negative_edge,won,"
     "baseline_first_serve_in_pct_a,actual_first_serve_in_pct_a,"
     "divergence_first_serve_in_a,"
     "baseline_first_serve_win_pct_a,actual_first_serve_win_pct_a,"

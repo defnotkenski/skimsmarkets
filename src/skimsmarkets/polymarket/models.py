@@ -873,14 +873,23 @@ class PolymarketEvent(BaseModel):
           handicaps, partial-period winners). These can leak into the base
           moneyline event (e.g. tennis events ship a set-handicap market
           alongside the moneyline).
-        - Skip markets without bid/ask (settled or unfunded) so the
-          tradability invariant holds: every kept market has live prices.
+        - Skip markets without bid/ask (unfunded) so the tradability
+          invariant holds: every kept market has live prices.
+        - Skip settled events (`closed=True` at event level) and settled
+          markets (`closed=True` at market level). Stale bid/ask survives
+          match end, so bid/ask presence alone doesn't gate completed
+          matches out — explicit `closed` check is required.
         """
         slug = payload.get("slug")
         ev_id = payload.get("id")
         if not isinstance(slug, str) or not slug or ev_id is None:
             return None
         if slug.endswith(_GAMMA_VARIANT_EVENT_SUFFIXES):
+            return None
+        # Settled events: drop the whole event so completed matches don't
+        # show up in the slate. bid/ask presence isn't a sufficient proxy —
+        # gamma keeps stale prices on the book for a window after match end.
+        if payload.get("closed") is True:
             return None
 
         # Tipoff resolution. Mirrors the US-side precedence at the NO-side
@@ -929,6 +938,13 @@ class PolymarketEvent(BaseModel):
             if bid is None or ask is None:
                 # Mirror the US tradability filter — drop sides without a
                 # live two-sided book.
+                continue
+            # Settled markets carry stale bid/ask after game end, so the
+            # tradability check above isn't sufficient. Defensive belt to
+            # the event-level `closed` check above for the case where one
+            # market in a multi-market event has settled while siblings
+            # haven't (e.g. tournament brackets).
+            if raw.get("closed") is True:
                 continue
             # Side-label resolution. Soccer-style gamma events split each
             # outcome into its own market with `groupItemTitle` set per side

@@ -1157,7 +1157,24 @@ def _persist_run(result: RunResult) -> None:
     into a future grading script that joins against gamma settlement after
     kickoff. Volume is tiny (≈one line per ranked event + a handful of error
     rows on a bad slate).
+
+    **Incomplete-run gate**: a run with predictions but no judge
+    assessments is treated as incomplete and discarded. The judge is
+    slate-level — if its call failed, every prediction in the slate
+    would land with `defensibility_score: null`, which pollutes retro
+    calibrate's "no judge" bucket without carrying any signal. Skipping
+    persistence avoids that. The operator already saw the upstream error
+    (judge stage logs the BadRequestError at runtime); the JSONL audit
+    trail isn't worth the calibrate-side noise.
     """
+    if result.predictions and not result.defensibility_assessments:
+        log.warning(
+            "skipping run-log persistence for %s: %d predictions but no "
+            "judge assessments — treating as incomplete run.",
+            result.run_id,
+            len(result.predictions),
+        )
+        return
     try:
         _LOG_ROOT.mkdir(parents=True, exist_ok=True)
         path = _LOG_ROOT / f"{result.run_id}.jsonl"
@@ -1311,6 +1328,20 @@ def _persist_run(result: RunResult) -> None:
                     "predicted_winner": p.predicted_winner,
                     "predicted_yes_probability": p.predicted_yes_probability,
                     "polymarket_implied_probability": p.polymarket_implied_probability,
+                    # True iff the director picked the same side as the
+                    # market (predicted_yes_probability and
+                    # polymarket_implied_probability share the same
+                    # picked-winner frame) but with strictly lower
+                    # probability than the market priced. Structurally
+                    # weak: agreeing with consensus at lower conviction
+                    # carries no informational edge. None when the
+                    # market implied is missing.
+                    "negative_edge": (
+                        p.predicted_yes_probability
+                        < p.polymarket_implied_probability
+                        if p.polymarket_implied_probability is not None
+                        else None
+                    ),
                     # Pre-binned 5pp bucket of `predicted_yes_probability`
                     # so calibration-plot scripts can group rows with one
                     # column lookup instead of re-binning every time.
