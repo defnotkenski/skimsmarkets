@@ -100,6 +100,67 @@ class PredictionRow(BaseModel):
     token_usage_calls: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class TradeRow(BaseModel):
+    """One `record_type="trade"` JSONL row in `logs/trades/<run_id>.jsonl`.
+
+    Written by `skims execute`, one per filtered prediction row —
+    whether the trade was placed, skipped, or dry-run. The audit log
+    is the source of truth for the calendar-day spend cap (the trader
+    globs every `*.jsonl` under `logs/trades/` and sums today's
+    `fill_total_cost_cents`).
+
+    Identity fields (`event_id`, `market_slug`) link back to the
+    source `PredictionRow` for retro joins. Diagnostic fields
+    (`kalshi_yes_ask_dollars_at_decision`, `raw_response_excerpt`)
+    capture what we saw at decision time so post-hoc analysis can
+    spot slippage / venue drift without re-fetching.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    record_type: Literal["trade"]
+    run_id: str
+    audit_timestamp: datetime
+    # Source prediction identity
+    event_id: str
+    market_slug: str
+    sport_type: str | None = None
+    event_title: str | None = None
+    predicted_winner: str
+    predicted_yes_probability: float
+    confidence: Literal["low", "medium", "high"]
+    defensibility_score: float | None = None
+    negative_edge: bool | None = None
+    # Kalshi venue identity (None when skipped before matching)
+    kalshi_event_ticker: str | None = None
+    market_ticker: str | None = None
+    side: Literal["yes", "no"] = "yes"
+    # Cost / size
+    bet_size_cents: int
+    kalshi_yes_ask_dollars_at_decision: float | None = None
+    # Execution outcome
+    dry_run: bool
+    order_id: str | None = None
+    client_order_id: str | None = None
+    fill_contracts: int = 0
+    # Contract cost only — what we paid the seller for the contracts.
+    fill_total_cost_cents: int = 0
+    fill_avg_price_cents: int | None = None
+    # Kalshi fees on the fill (taker + maker). Charged on top of
+    # `fill_total_cost_cents` — the account is debited the sum.
+    # The daily-spend cap uses `fill_total_cost_cents` only (matches
+    # the budget knob `bet_size_cents` semantics); fees are recorded
+    # here for transparency and retro analysis.
+    fill_fees_cents: int = 0
+    fill_status: Literal[
+        "filled", "partial", "skipped_dry_run", "skipped", "submitted",
+    ]
+    skip_reason: str | None = None
+    # Forensic capture of Kalshi's raw response. Helps diagnose field-
+    # name drift across SDK versions without re-running the order.
+    raw_response_excerpt: dict[str, Any] | None = None
+
+
 class ResolvedOutcome(BaseModel):
     """One row in `logs/runs/<run_id>.resolutions.jsonl` (Step 1 output).
 

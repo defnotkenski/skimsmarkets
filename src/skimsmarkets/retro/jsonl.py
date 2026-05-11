@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 # `parents[2]` walks src/skimsmarkets/retro/jsonl.py → src/skimsmarkets
 # → src → repo-root.
 _LOG_ROOT = Path(__file__).resolve().parents[3] / "logs" / "runs"
+_TRADES_ROOT = Path(__file__).resolve().parents[3] / "logs" / "trades"
 
 
 def list_run_files() -> list[Path]:
@@ -111,3 +112,22 @@ def log_root() -> Path:
     need to write outside the prediction file (e.g. resolution sidecars).
     """
     return _LOG_ROOT
+
+
+def trades_log_path(run_id: str) -> Path:
+    """Return `logs/trades/<run_id>.jsonl` for the execute audit log.
+
+    Separate directory from `logs/runs/` because trades and predictions
+    are different concerns (compare with the resolutions sidecar,
+    which lives next to the prediction log because it's downstream of
+    a single run). The trades directory is created on first write by
+    `execute/audit.py`.
+    """
+    return _TRADES_ROOT / f"{run_id}.jsonl"
+
+
+def trades_log_root() -> Path:
+    """Module-resolved path to `logs/trades/`. Used by the calendar-day
+    spend tally — it globs every `*.jsonl` here and sums today's fills.
+    """
+    return _TRADES_ROOT

@@ -80,6 +80,109 @@ FETCHER_PROVIDERS: tuple[str, ...] = ("grok", "gemini")
 FETCHER_PROVIDER = "grok"
 
 
+# ---------------------------------------------------------------------------
+# Kalshi execute module — venue config + safety defaults
+# ---------------------------------------------------------------------------
+#
+# Polymarket is the data source (`skims rank` ranks Polymarket events).
+# Kalshi is the execution venue (`skims execute` places trades). Public
+# read endpoints are unauthed; order placement uses an RSA-signed POST
+# (KALSHI_API_KEY_ID + the private key, supplied as either
+# KALSHI_PRIVATE_KEY_PATH for local-disk or KALSHI_PRIVATE_KEY_PEM for
+# cloud env-var-only deploys like Claude routines / GitHub Actions).
+#
+# Defaults below are deliberately tiny — the smoke-test blast radius
+# (one minimum-size contract at $1) lives here so `--live` without
+# override caps a single accidental run at single-digit dollars.
+KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+
+# Tennis match-level series — FALLBACK ONLY.
+#
+# The trader auto-discovers tennis series at runtime via Kalshi's
+# `/series` catalog (filter: KX{ATP|WTA}*MATCH prefix/suffix). This
+# tuple is the safety net used only when discovery fails (Kalshi API
+# down, schema change, etc.) — keep it as the known-good main-tour
+# set so the trader degrades to "trade Rome / Slams only" instead of
+# refusing to run.
+#
+# Discovery catches any future sub-tours Kalshi adds (challenger
+# already covered; ITF could be next) without code changes. To force
+# a particular set instead of trusting discovery, edit this tuple AND
+# bypass the discovery call in `execute/trader.py::_prefetch_events`.
+KALSHI_TENNIS_SERIES_TICKERS: tuple[str, ...] = (
+    "KXATPMATCH",
+    "KXWTAMATCH",
+    "KXATPCHALLENGERMATCH",
+    "KXWTACHALLENGERMATCH",
+)
+
+# --- Spend caps ------------------------------------------------------------
+# All money is in CENTS (integer). 100 = $1.00, 2500 = $25.00, 100000 = $1000.
+# CLI flags override per-invocation; constants here are the defaults.
+
+# Per-trade spend cap. Passed to Kalshi as `buy_max_cost` on each market
+# buy. Kalshi fills as many whole contracts as fit at current asks; if the
+# book is thin, actual fill cost may be slightly less than this.
+# Common values: 100 ($1) for smoke tests, 2500 ($25) typical, 10000 ($100).
+KALSHI_DEFAULT_BET_SIZE_CENTS = 2500
+
+# Slippage buffer for market orders. Kalshi requires a price field on every
+# order — even "market" type — which acts as a per-contract ceiling for the
+# sweep. We send `yes_price = current_ask_cents + this_buffer`, so the
+# order fills any contracts at the current ask up to a few cents above it.
+# 0 = limit-at-ask (won't fill if book ticks up between decision and order
+# arrival). Higher = more headroom for volatile books, at the cost of
+# accepting more slippage per contract. 5¢ is a sensible default for tennis
+# books which typically move in 1-2¢ ticks. Capped at 99¢ wire-side
+# (Kalshi rejects yes_price > 99).
+KALSHI_MARKET_ORDER_SLIPPAGE_CENTS = 5
+
+# Belt-and-suspenders ceiling. `bet_size_cents` must be ≤ this or execute
+# refuses to start (fail-fast guard against typos like a stray zero).
+# Set this once at your "trades this big or smaller" comfort level and
+# leave it pinned; adjust `bet_size_cents` underneath as needed.
+KALSHI_DEFAULT_MAX_POSITION_CENTS = 5000
+
+# Calendar-day spend ceiling (UTC). Summed across every `logs/trades/*.jsonl`
+# row whose `audit_timestamp` is today. Survives multiple ranker runs in
+# one day — if you run rank + execute twice and trade $20 each time, the
+# second run will refuse the $21st dollar with cap=4000.
+# Sizing rule of thumb: ≥ N × bet_size_cents where N is "max trades I
+# expect to place per day". A 25-trade day at $25/trade = 62500.
+KALSHI_DEFAULT_MAX_DAILY_SPEND_CENTS = 25000
+
+# --- Filter-flag defaults for `skims execute` ------------------------------
+# Empty tuple / None / False here = filter is OFF (every row passes).
+# Edit a constant non-empty to lock that filter on for every invocation.
+# CLI flags always win when present.
+
+# Which confidence tiers to keep. Valid values: "low", "medium", "high".
+# Empty = all tiers pass. Common: ("high", "medium") to skip low-conviction
+# rows; ("high",) for the strictest filter.
+KALSHI_DEFAULT_CONFIDENCE_TIERS: tuple[str, ...] = ("high", "medium")
+
+# Minimum judge defensibility score. Bar boundaries (see `_defensibility_stars`
+# in reporting.py): 0.85 = 5 bars, 0.65 = 4 bars, 0.45 = 3 bars, 0.25 = 2 bars.
+# Set to 0.65 to keep only 4-5 bar rows. None = no cutoff.
+# IMPORTANT: rows with `defensibility_score=None` (judge failure) always FAIL
+# this gate when a cutoff is set — they're treated as "can't verify".
+KALSHI_DEFAULT_MIN_DEFENSIBILITY: float | None = 0.45
+
+# Drop predictions where the director agrees with Polymarket's market but
+# with lower conviction (= negative expected value vs the market). When the
+# flag is True (drop), rows with `negative_edge=None` are also dropped
+# (None = "can't verify, safe-default to drop").
+# Per-invocation override: `--negative-edge` (allow) or `--no-negative-edge`
+# (drop). Set True here if you want the safety filter ON by default.
+KALSHI_DEFAULT_NO_NEGATIVE_EDGE: bool = True
+
+# Sport-type allowlist. v1 only supports "tennis" — any other value will
+# raise at startup. Set to ("tennis",) to lock the v1 scope at the config
+# layer; leave empty to let all rows through the sport gate (the matcher
+# will still skip non-tennis rows as `no_kalshi_match`).
+KALSHI_DEFAULT_SPORTS: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class Config:
     # Provider keys are conditionally required based on `fetcher_provider`:
@@ -104,18 +207,43 @@ class Config:
     # it without the CLI threading a separate argument through every call
     # site. Defaults False so env-only runs still pick up the key.
     tennis_stats_disabled: bool = False
+    # Optional — Kalshi execution credentials. Only the order-placement
+    # path (`skims execute --live`) requires the key; read-only probes
+    # of `/events` / `/markets` work without it. Mirrors the optional-
+    # vendor posture: silently absent → `skims execute --live` fails
+    # loudly at startup; dry-run is unaffected.
+    #
+    # The private key can be supplied two ways. Pick one:
+    #   - KALSHI_PRIVATE_KEY_PATH: filesystem path to a .pem (local-disk
+    #     pattern; works on your laptop / VMs / containers with mounted
+    #     volumes).
+    #   - KALSHI_PRIVATE_KEY_PEM: inline PEM contents in the env var
+    #     itself (cloud-scheduler pattern — Claude routines, GitHub
+    #     Actions, Lambda, etc. where the platform only exposes env
+    #     vars and there's no persistent disk).
+    # If both are set, the inline PEM wins.
+    kalshi_api_key_id: str | None = None
+    kalshi_private_key_path: str | None = None
+    kalshi_private_key_pem: str | None = None
 
     @classmethod
     def from_env(
         cls,
         *,
         tennis_stats_disabled: bool = False,
+        require_llm: bool = True,
     ) -> "Config":
         # Reads .env from the current directory (and parents) if present. Does not
         # override vars that are already set in the shell, so explicit exports win.
         # `fetcher_provider` is hand-edited in this file's `FETCHER_PROVIDER`
         # constant — there is no env var or CLI override. Validated here so a
         # typo in the constant fails loudly at startup.
+        #
+        # `require_llm=False` is for code paths that don't talk to any LLM
+        # (e.g. `skims execute` reading the JSONL → placing Kalshi orders).
+        # In that mode the Anthropic / Grok / Gemini key checks are skipped
+        # and the placeholder anthropic_api_key is set to an empty string
+        # so callers that mistakenly try to reach the LLM later fail loudly.
         load_dotenv()
         provider = FETCHER_PROVIDER
         if provider not in FETCHER_PROVIDERS:
@@ -128,18 +256,25 @@ class Config:
         anth = os.environ.get("ANTHROPIC_API_KEY", "").strip()
         uw = os.environ.get("UNUSUAL_WHALES_API_KEY", "").strip() or None
         tennis_key = os.environ.get("TENNIS_STATS_API_KEY", "").strip() or None
-        missing: list[str] = []
-        if not anth:
-            missing.append("ANTHROPIC_API_KEY")
-        if provider == "grok" and not xai:
-            missing.append("XAI_API_KEY (required when fetcher_provider=grok)")
-        if provider == "gemini" and not google:
-            missing.append("GOOGLE_API_KEY (required when fetcher_provider=gemini)")
-        if missing:
-            raise RuntimeError(
-                f"Missing required env var(s): {', '.join(missing)}. "
-                "Add them to a .env file at the project root or export them in your shell."
-            )
+        kalshi_id = os.environ.get("KALSHI_API_KEY_ID", "").strip() or None
+        kalshi_pk = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "").strip() or None
+        # Don't .strip() the PEM — leading/trailing newlines around the
+        # `-----BEGIN/END-----` markers are legal in PEM-format text and
+        # `load_pem_private_key` handles them. We only treat "" as absent.
+        kalshi_pem = os.environ.get("KALSHI_PRIVATE_KEY_PEM") or None
+        if require_llm:
+            missing: list[str] = []
+            if not anth:
+                missing.append("ANTHROPIC_API_KEY")
+            if provider == "grok" and not xai:
+                missing.append("XAI_API_KEY (required when fetcher_provider=grok)")
+            if provider == "gemini" and not google:
+                missing.append("GOOGLE_API_KEY (required when fetcher_provider=gemini)")
+            if missing:
+                raise RuntimeError(
+                    f"Missing required env var(s): {', '.join(missing)}. "
+                    "Add them to a .env file at the project root or export them in your shell."
+                )
         return cls(
             anthropic_api_key=anth,
             fetcher_provider=provider,
@@ -148,4 +283,7 @@ class Config:
             unusual_whales_api_key=uw,
             tennis_stats_api_key=tennis_key,
             tennis_stats_disabled=tennis_stats_disabled,
+            kalshi_api_key_id=kalshi_id,
+            kalshi_private_key_path=kalshi_pk,
+            kalshi_private_key_pem=kalshi_pem,
         )

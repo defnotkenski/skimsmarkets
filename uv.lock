@@ -1555,6 +1555,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "catboost" },
+    { name = "cryptography" },
     { name = "google-genai" },
     { name = "httpx" },
     { name = "numpy" },
@@ -1571,6 +1572,7 @@ dependencies = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
     { name = "catboost", specifier = ">=1.2.10" },
+    { name = "cryptography", specifier = ">=43" },
     { name = "google-genai", specifier = ">=0.3" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "numpy", specifier = ">=2.4.4" },

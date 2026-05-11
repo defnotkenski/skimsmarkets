@@ -218,6 +218,74 @@ async def _cmd_gbt(args: argparse.Namespace) -> int:
     return 1
 
 
+async def _cmd_execute(args: argparse.Namespace) -> int:
+    """Place Kalshi market-buy orders against `--run-id`'s ranked predictions.
+
+    Reads `logs/runs/<run_id>.jsonl`, applies the deterministic filter
+    set (`--confidence`, `--min-defensibility`, `--no-negative-edge`,
+    `--sport tennis`), matches each survivor to a Kalshi market by
+    player-surname pair, and (if `--live`) places one market-buy order
+    capped at `--bet-size-cents`. Defaults to `--dry-run`.
+
+    Audit log: `logs/trades/<run_id>.jsonl`, one row per filtered
+    prediction whether placed, skipped, or dry-run.
+    """
+    from skimsmarkets.execute.trader import ExecuteOptions, run_execute
+
+    # Fall-through: an explicit CLI value (truthy list, non-None scalar,
+    # explicit boolean) wins; otherwise consult the config constants.
+    # `--no-negative-edge` produces `args.negative_edge=False`, so the
+    # `is not None` check distinguishes that from the omitted case.
+    confidence = (
+        list(args.confidence) if args.confidence
+        else (list(cfg.KALSHI_DEFAULT_CONFIDENCE_TIERS) or None)
+    )
+    min_defensibility = (
+        args.min_defensibility if args.min_defensibility is not None
+        else cfg.KALSHI_DEFAULT_MIN_DEFENSIBILITY
+    )
+    if args.negative_edge is None:
+        no_negative_edge = cfg.KALSHI_DEFAULT_NO_NEGATIVE_EDGE
+    else:
+        # `--negative-edge` (True) means allow them through → don't filter.
+        # `--no-negative-edge` (False) means drop them → filter on.
+        no_negative_edge = not args.negative_edge
+    sports = (
+        list(args.sport) if args.sport
+        else (list(cfg.KALSHI_DEFAULT_SPORTS) or None)
+    )
+
+    opts = ExecuteOptions(
+        run_id=args.run_id,
+        dry_run=not args.live,
+        bet_size_cents=args.bet_size_cents,
+        max_position_cents=args.max_position_cents,
+        max_daily_spend_cents=args.max_daily_spend_cents,
+        confidence=confidence,
+        min_defensibility=min_defensibility,
+        no_negative_edge=no_negative_edge,
+        sports=sports,
+    )
+    config = cfg.Config.from_env(require_llm=False)
+    summary = await run_execute(opts, config=config)
+    print(
+        f"execute: predictions={summary.total_predictions} "
+        f"passed={summary.passed_filters} "
+        f"filled={summary.filled} "
+        f"partial={summary.partial} "
+        f"submitted={summary.submitted} "
+        f"dry_run={summary.skipped_dry_run} "
+        f"skipped={summary.skipped} "
+        f"total_cost_cents={summary.total_filled_cost_cents}"
+    )
+    if summary.skip_reasons:
+        reasons = ", ".join(
+            f"{k}={v}" for k, v in sorted(summary.skip_reasons.items())
+        )
+        print(f"skip reasons: {reasons}")
+    return 0
+
+
 async def _cmd_retro(args: argparse.Namespace) -> int:
     """Self-improvement layer — read past JSONL run logs, resolve outcomes
     against gamma, compute hit-rate cuts, and run a batched LLM pattern
@@ -263,7 +331,7 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
 # user invoked `skims` with bare slate flags (no subcommand) so we can default
 # to `rank`. Kept as a module-level constant so the default-injection in
 # `main()` and the subparser registration stay in sync.
-_SUBCOMMANDS = ("rank", "fetch", "backtest", "retro", "gbt")
+_SUBCOMMANDS = ("rank", "fetch", "backtest", "retro", "gbt", "execute")
 
 
 def _build_slate_parser() -> argparse.ArgumentParser:
@@ -354,7 +422,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     slate = _build_slate_parser()
     sub = parser.add_subparsers(
-        dest="command", metavar="{rank,fetch,backtest,retro,gbt}"
+        dest="command", metavar="{rank,fetch,backtest,retro,gbt,execute}"
     )
 
     p_rank = sub.add_parser(
@@ -385,6 +453,128 @@ def _build_parser() -> argparse.ArgumentParser:
     p_backtest.add_argument("--max-events", type=int, default=800)
     p_backtest.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+
+    p_execute = sub.add_parser(
+        "execute",
+        help=(
+            "Place Kalshi market-buy orders against a ranked run "
+            "(tennis only in v1). Defaults to --dry-run; --live is "
+            "the explicit opt-in to send real orders."
+        ),
+    )
+    p_execute.add_argument(
+        "--run-id",
+        required=True,
+        metavar="RUN_ID",
+        help="Run log under logs/runs/ to consume (e.g. `8f55201f`).",
+    )
+    p_execute.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Place real Kalshi orders. Default is --dry-run, which "
+            "writes audit rows without hitting the order endpoint. "
+            "--live requires KALSHI_API_KEY_ID and "
+            "KALSHI_PRIVATE_KEY_PATH."
+        ),
+    )
+    p_execute.add_argument(
+        "--bet-size-cents",
+        type=int,
+        default=cfg.KALSHI_DEFAULT_BET_SIZE_CENTS,
+        metavar="N",
+        help=(
+            "Hard spend cap per trade in cents (passed to Kalshi as "
+            f"`buy_max_cost`). Default: {cfg.KALSHI_DEFAULT_BET_SIZE_CENTS} "
+            "(${:.2f}).".format(cfg.KALSHI_DEFAULT_BET_SIZE_CENTS / 100)
+        ),
+    )
+    p_execute.add_argument(
+        "--max-position-cents",
+        type=int,
+        default=cfg.KALSHI_DEFAULT_MAX_POSITION_CENTS,
+        metavar="N",
+        help=(
+            "Per-trade ceiling in cents — execute refuses to send any "
+            "order whose `bet_size_cents` exceeds this. Belt-and-"
+            f"suspenders against an accidental large bet. Default: "
+            f"{cfg.KALSHI_DEFAULT_MAX_POSITION_CENTS}."
+        ),
+    )
+    p_execute.add_argument(
+        "--max-daily-spend-cents",
+        type=int,
+        default=cfg.KALSHI_DEFAULT_MAX_DAILY_SPEND_CENTS,
+        metavar="N",
+        help=(
+            "Calendar-day spend cap (UTC). The trader globs every "
+            "`logs/trades/*.jsonl`, sums today's fills, adds the "
+            "current trade's ceiling, and refuses if the total would "
+            "exceed this. Default: "
+            f"{cfg.KALSHI_DEFAULT_MAX_DAILY_SPEND_CENTS}."
+        ),
+    )
+    # Filter flags use `default=None` so we can distinguish "user
+    # didn't pass it" (fall through to KALSHI_DEFAULT_* in config.py)
+    # from "user passed it explicitly" (override config). Without this
+    # split, action="append" with a config-driven non-empty default
+    # would APPEND user flags rather than replace — confusing.
+    p_execute.add_argument(
+        "--confidence",
+        action="append",
+        choices=("low", "medium", "high"),
+        default=None,
+        metavar="TIER",
+        help=(
+            "Keep only predictions at these confidence tiers. "
+            "Repeatable. Falls through to "
+            "`KALSHI_DEFAULT_CONFIDENCE_TIERS` in config.py when "
+            "omitted; empty config tuple = all tiers pass."
+        ),
+    )
+    p_execute.add_argument(
+        "--min-defensibility",
+        type=float,
+        default=None,
+        metavar="SCORE",
+        help=(
+            "Drop predictions whose judge defensibility_score is below "
+            "this cutoff (or None — missing scores fail this gate). "
+            "Falls through to `KALSHI_DEFAULT_MIN_DEFENSIBILITY` in "
+            "config.py when omitted."
+        ),
+    )
+    # BooleanOptionalAction generates BOTH `--negative-edge` (allow)
+    # and `--no-negative-edge` (drop) so the user can override either
+    # direction of the config default. `default=None` signals "fall
+    # through to config".
+    p_execute.add_argument(
+        "--negative-edge",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "`--no-negative-edge` drops predictions flagged "
+            "`negative_edge=True` (director agrees with the market "
+            "but with lower conviction) or `None` (market-implied "
+            "missing). `--negative-edge` keeps them. Falls through "
+            "to `KALSHI_DEFAULT_NO_NEGATIVE_EDGE` in config.py when "
+            "neither is passed."
+        ),
+    )
+    p_execute.add_argument(
+        "--sport",
+        action="append",
+        default=None,
+        metavar="SPORT",
+        help=(
+            "Restrict to one or more sport types. v1 only supports "
+            "`tennis` — other sports raise at startup. Falls through "
+            "to `KALSHI_DEFAULT_SPORTS` in config.py when omitted."
+        ),
+    )
+    p_execute.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging.",
     )
 
     p_retro = sub.add_parser(
@@ -530,6 +720,7 @@ def main() -> int:
         "backtest": _cmd_backtest,
         "retro": _cmd_retro,
         "gbt": _cmd_gbt,
+        "execute": _cmd_execute,
     }
     return asyncio.run(dispatch[args.command](args))
 
