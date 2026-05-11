@@ -72,7 +72,7 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
 
     `argparse` gives us bare lists for repeatable flags (always a list,
     possibly empty), so we don't need to coerce `None`. `--horizon` and
-    `--max-implied-prob` default to `None` at the argparse layer; the
+    `--max-prob` default to `None` at the argparse layer; the
     fall-through below resolves to the config constants when the user
     didn't pass an override, so passing the flag wins and omitting it
     quietly inherits config.
@@ -85,8 +85,8 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
             args.horizon if args.horizon is not None else cfg.DEFAULT_HORIZON_HOURS
         ),
         max_implied_probability=(
-            args.max_implied_prob
-            if args.max_implied_prob is not None
+            args.max_prob
+            if args.max_prob is not None
             else cfg.MAX_IMPLIED_PROBABILITY
         ),
     )
@@ -324,7 +324,7 @@ def _build_slate_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--max-implied-prob",
+        "--max-prob",
         type=float,
         default=None,
         metavar="PROB",
@@ -349,7 +349,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "confidence-ranker pipeline. Horizon and favorite-blowout "
             f"threshold default to {cfg.DEFAULT_HORIZON_HOURS}h / "
             f"{cfg.MAX_IMPLIED_PROBABILITY:.2f} from config.py; override "
-            "per-invocation with --horizon / --max-implied-prob."
+            "per-invocation with --horizon / --max-prob."
         ),
     )
     slate = _build_slate_parser()

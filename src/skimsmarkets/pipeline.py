@@ -193,8 +193,8 @@ class SlateOptions:
     sports: list[str] = field(default_factory=list)
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS
     # Favorite-blowout threshold on the YES mid. Defaults to the config
-    # constant; CLI surfaces `--max-implied-prob` for ad-hoc overrides
-    # without editing config.py.
+    # constant; CLI surfaces `--max-prob` for ad-hoc overrides without
+    # editing config.py.
     max_implied_probability: float = cfg.MAX_IMPLIED_PROBABILITY
 
 

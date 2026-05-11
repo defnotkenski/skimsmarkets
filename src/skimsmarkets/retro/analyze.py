@@ -47,6 +47,13 @@ _PARSE_RETRY_ATTEMPTS = 2
 # user message (the feature table) varies between sports. Lens vocabulary
 # is the only sport-coupled bit and lives in the user message so the
 # cache hits across sports as the system gets sharded later.
+#
+# A parallel playbook at `playbooks/retro-analysis.md` carries the
+# same discipline for the conversational mode (when the operator asks
+# Claude in a session rather than invoking `--step analyze`, skipping
+# the API cost). The two are independent — if you change discipline
+# here, mirror it in the playbook (and vice versa) to keep them
+# aligned.
 _SYSTEM_PROMPT = """\
 You are a retrospective analysis specialist for a Polymarket sports
 prediction system. You are given a CSV-shaped table of past events,
