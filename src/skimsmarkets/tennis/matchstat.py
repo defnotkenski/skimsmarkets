@@ -85,6 +85,7 @@ from skimsmarkets.tennis.models import (
 )
 from skimsmarkets.tennis.provider import (
     MatchHistoryRow,
+    MatchStatsFixture,
     _match_completeness,
     _parse_set_scores,
     parse_score_details,
@@ -211,6 +212,42 @@ def _normalize_name(name: str) -> str:
     nfkd = unicodedata.normalize("NFKD", name)
     stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
     return " ".join(stripped.replace("-", " ").lower().split())
+
+
+def _surname_token(name: str | None) -> str | None:
+    """Last whitespace-separated token of `_normalize_name(name)`,
+    further stripped to alnum-only.
+
+    Mirrors `kalshi/slate.py:_surname_from_yes_sub_title` so the
+    fixtures-overlay index keys line up with the slug-synthesised
+    surnames the slate adapter writes. Returns None for empty / null
+    input or names that strip to empty.
+    """
+    if not name:
+        return None
+    norm = _normalize_name(name)
+    if not norm:
+        return None
+    last = norm.split()[-1]
+    cleaned = "".join(c for c in last if c.isalnum())
+    return cleaned or None
+
+
+def _surname_pair_key(
+    name_a: str | None, name_b: str | None
+) -> frozenset[str] | None:
+    """`frozenset({surname_a, surname_b})` for fixture-index keys.
+
+    Returns None when either side strips to empty or both surnames
+    collide (a same-surname matchup would key to a singleton set,
+    making lookup ambiguous — defer to the singleton handler upstream
+    rather than risk wrong attribution).
+    """
+    a = _surname_token(name_a)
+    b = _surname_token(name_b)
+    if a is None or b is None or a == b:
+        return None
+    return frozenset({a, b})
 
 
 def _coerce_int(v: Any) -> int | None:
@@ -1963,6 +2000,132 @@ class MatchStatTennisProvider:
             first_serve_win_pct=first_serve_win,
             break_point_convert_pct=bp_convert,
         )
+
+    # ----- Slate-build helper (per-date scheduled fixtures) -----
+
+    async def fetch_fixtures_for_date(
+        self, *, tour: str, date_iso: str
+    ) -> dict[frozenset[str], MatchStatsFixture]:
+        """`/tennis/v2/{tour}/fixtures/{date}` → surname-pair →
+        `MatchStatsFixture` (date, player IDs, tournament, surface,
+        round).
+
+        Pulls the fixtures payload with
+        `include=tournament,tournament.court,round` so the response
+        carries everything the slate-overlay stage needs in a single
+        HTTP — tipoff, player IDs, tournament name, surface, round.
+
+        **Side effect**: seeds the internal rankings index with
+        fixture-derived `(player_id, None, None)` entries for any
+        player not already present. Position and points stay None
+        for these entries (we don't have rankings for ITF futures
+        players), but the IDs themselves unlock every per-player
+        stats endpoint downstream — `_player_profile`,
+        `_player_recent_matches`, `_head_to_head`, etc. are
+        ID-keyed, not rank-keyed. Existing ranked players are NEVER
+        overwritten; the seeding only fills empty slots.
+
+        Returns a dict keyed by `frozenset({surname_a, surname_b})`
+        (lowercased, diacritic-stripped, alnum-only — same canonical
+        form `kalshi/slate.py:_surname_from_yes_sub_title` produces).
+        Empty dict on any failure or when the vendor has no fixtures
+        for that date — overlay degrades silently per missing match.
+
+        `pageSize=500` covers the busiest tournament-day combination
+        (M-tier futures days can ship 100+ singles fixtures per tour);
+        the endpoint paginates beyond that but the slate horizon
+        filter upstream caps practical demand well below that ceiling.
+        """
+        # Ensure the index exists for this tour BEFORE seeding —
+        # otherwise our setdefault writes would land in an empty dict
+        # that then gets overwritten by `_ensure_index`'s populate.
+        await self._ensure_index(tour)
+
+        path = f"/tennis/v2/{tour}/fixtures/{date_iso}"
+        payload = await self._get(
+            path,
+            params={
+                "pageSize": 500,
+                "include": "tournament,tournament.court,round",
+            },
+        )
+        out: dict[frozenset[str], MatchStatsFixture] = {}
+        if not isinstance(payload, dict):
+            return out
+        items = payload.get("data") or []
+        if not isinstance(items, list):
+            return out
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            p1_obj = item.get("player1") or {}
+            p2_obj = item.get("player2") or {}
+            p1_name = p1_obj.get("name") if isinstance(p1_obj, dict) else None
+            p2_name = p2_obj.get("name") if isinstance(p2_obj, dict) else None
+            key = _surname_pair_key(p1_name, p2_name)
+            if key is None:
+                continue
+            # `date` may be null on early-round matches whose tipoff
+            # tour officials haven't confirmed. Carry None through —
+            # the overlay stage skips dateless rows (Kalshi's
+            # `occurrence_datetime` stays). The non-date fields
+            # (player IDs, tournament, surface, round) are still
+            # useful and worth indexing.
+            tipoff: datetime | None = None
+            raw_date = item.get("date")
+            if isinstance(raw_date, str) and raw_date:
+                try:
+                    tipoff = datetime.fromisoformat(
+                        raw_date.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    tipoff = None
+            tourn_obj = item.get("tournament") or {}
+            tourn_name = (
+                tourn_obj.get("name")
+                if isinstance(tourn_obj, dict) else None
+            )
+            court_obj = (
+                tourn_obj.get("court")
+                if isinstance(tourn_obj, dict) else None
+            )
+            surface = None
+            if isinstance(court_obj, dict):
+                court_name = court_obj.get("name")
+                if isinstance(court_name, str) and court_name.strip():
+                    surface = court_name.strip().lower()
+            round_obj = item.get("round") or {}
+            round_name = (
+                round_obj.get("name")
+                if isinstance(round_obj, dict) else None
+            )
+            p1_id = _coerce_int(item.get("player1Id"))
+            p2_id = _coerce_int(item.get("player2Id"))
+            fixture = MatchStatsFixture(
+                date=tipoff,
+                player_a_id=p1_id,
+                player_b_id=p2_id,
+                player_a_name=p1_name,
+                player_b_name=p2_name,
+                tournament_name=tourn_name,
+                surface=surface,
+                round_name=round_name,
+            )
+            # First match wins on duplicate keys — the vendor occasionally
+            # ships the same matchup twice within a tournament when both
+            # rounds advance through the bracket; the first (typically
+            # earliest) row is the right pick.
+            out.setdefault(key, fixture)
+            # Seed the rankings index with fixture-derived IDs so ITF
+            # players outside the top-500 ranking still resolve. Only
+            # fill empty slots — never overwrite ranked entries (which
+            # carry richer position+points data).
+            tour_index = self._index.setdefault(tour, {})
+            if p1_id is not None and p1_name:
+                tour_index.setdefault(_normalize_name(p1_name), (p1_id, None, None))
+            if p2_id is not None and p2_name:
+                tour_index.setdefault(_normalize_name(p2_name), (p2_id, None, None))
+        return out
 
     # ----- Public entry point -----
 

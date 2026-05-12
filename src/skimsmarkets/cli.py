@@ -9,7 +9,13 @@ import httpx
 
 from skimsmarkets import config as cfg
 from skimsmarkets.backtest.dataset import build_dataset
-from skimsmarkets.pipeline import SlateOptions, fetch_slate, run_pipeline
+from skimsmarkets.pipeline import (
+    SlateOptions,
+    apply_horizon_filter,
+    fetch_slate,
+    overlay_matchstats_tipoffs,
+    run_pipeline,
+)
 from skimsmarkets.reporting import print_events_table, print_run_summary
 from skimsmarkets.selection import select_top_events
 from skimsmarkets.tennis.provider import build_tennis_provider
@@ -71,11 +77,11 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
     """Translate the shared slate-flags namespace into a `SlateOptions`.
 
     `argparse` gives us bare lists for repeatable flags (always a list,
-    possibly empty), so we don't need to coerce `None`. `--horizon` and
-    `--max-prob` default to `None` at the argparse layer; the
-    fall-through below resolves to the config constants when the user
-    didn't pass an override, so passing the flag wins and omitting it
-    quietly inherits config.
+    possibly empty), so we don't need to coerce `None`. `--horizon`,
+    `--max-prob`, and `--min-oi` default to `None` at the argparse
+    layer; the fall-through below resolves to the config constants
+    when the user didn't pass an override, so passing the flag wins
+    and omitting it quietly inherits config.
     """
     return SlateOptions(
         leagues=args.league,
@@ -89,6 +95,11 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
             if args.max_prob is not None
             else cfg.MAX_IMPLIED_PROBABILITY
         ),
+        min_open_interest_dollars=(
+            args.min_oi
+            if args.min_oi is not None
+            else cfg.MIN_OPEN_INTEREST_DOLLARS
+        ),
     )
 
 
@@ -101,6 +112,7 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
         leagues=opts.leagues or None,
         horizon_hours=opts.horizon_hours,
         max_implied_probability=opts.max_implied_probability,
+        min_open_interest_dollars=opts.min_open_interest_dollars,
         slugs=opts.slugs or None,
         sports=opts.sports or None,
         tennis_stats_disabled=args.no_tennis_stats,
@@ -137,6 +149,13 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
         build_tennis_provider(config) as tennis_provider,
     ):
         events = await fetch_slate(opts, http=http, gamma_sem=gamma_sem)
+        # Mirror run_pipeline's stage order: overlay MatchStats tipoffs
+        # onto each event, then apply the horizon filter against the
+        # now-precise times. Without this, fetch would print events the
+        # ranker would later drop (or vice versa) — same drift the
+        # `select_top_events` call below already prevents for selection.
+        await overlay_matchstats_tipoffs(events, tennis_provider)
+        events = apply_horizon_filter(events, horizon_hours=opts.horizon_hours)
         events = await select_top_events(
             events,
             max_events=cfg.MAX_SLATE_EVENTS,
@@ -401,6 +420,20 @@ def _build_slate_parser() -> argparse.ArgumentParser:
             f"favorite is priced at or above this on the YES mid are "
             f"dropped before the LLM path. Range [0, 1]. Defaults to "
             f"{cfg.MAX_IMPLIED_PROBABILITY:.2f} from config.py."
+        ),
+    )
+    p.add_argument(
+        "--min-oi",
+        type=float,
+        default=None,
+        metavar="DOLLARS",
+        help=(
+            f"Minimum open interest (dollars at par) for at least one "
+            f"side of an event to survive the slate filter. Drops "
+            f"thinly-traded events — useful for ITF futures where "
+            f"books often open at $0/$0 OI. Set to 0 to disable. "
+            f"Defaults to ${cfg.MIN_OPEN_INTEREST_DOLLARS:.0f} from "
+            f"config.py."
         ),
     )
     p.add_argument(

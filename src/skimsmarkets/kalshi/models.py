@@ -8,13 +8,49 @@ and permissive coercion keeps us forward-compatible.
 Money fields arrive as strings in the public read paths (`"0.1700"`)
 but as integer cents in the order paths. We preserve both conventions
 verbatim — the matcher reads dollar floats; the order code writes cents.
+
+The slate adapter (`kalshi/slate.py`) consumes the full set of
+`/events?with_nested_markets=true` fields for ranker discovery, not
+just the matcher's bid/ask subset. Most fields ship as strings on the
+wire (`"942.00"`, `"0.4000"`) — `_coerce_dollars` handles them
+identically since both qty and price strings parse to floats.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class KalshiProductMetadata(BaseModel):
+    """Nested `/events.markets[].product_metadata` block.
+
+    `competition` is the human-readable tournament label (e.g.
+    `"ATP Rome"`) — the slate adapter slugifies it for
+    `series_slug` so `tennis/identity.py` surface/tier lookups can
+    fire. Other fields (e.g. `competition_scope`) are forward-compat
+    only.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    competition: str | None = None
+
+
+class KalshiCustomStrike(BaseModel):
+    """Nested `/events.markets[].custom_strike` block.
+
+    `tennis_competitor` is Kalshi's opaque player UUID. No public
+    `/competitors/{uuid}` lookup endpoint exists (verified 2026-05-11),
+    so it functions only as a stable within-Kalshi player key — kept
+    for forward-compat in case Kalshi ships a competitor lookup later.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    tennis_competitor: str | None = None
 
 
 class KalshiMarket(BaseModel):
@@ -25,6 +61,12 @@ class KalshiMarket(BaseModel):
     `yes_sub_title` is the full player name (first + last); the
     matcher resolves the predicted winner to one of these by
     last-token substring.
+
+    Both YES sides expose **independent books** (verified 2026-05-11):
+    Tirante's `yes_bid=0.40` and Medvedev's `yes_ask=0.61` don't
+    perfectly cross — they're separate order books that happen to be
+    tightly arbitraged. Read each side's quote and depth directly
+    rather than inverting the favorite's book.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -38,9 +80,49 @@ class KalshiMarket(BaseModel):
     # unparseable → None, which the trader treats as "no ask, skip".
     yes_ask_dollars: float | None = None
     yes_bid_dollars: float | None = None
+    no_ask_dollars: float | None = None
+    no_bid_dollars: float | None = None
     status: str | None = None
+    # Tipoff (`"2026-05-12T21:30:00Z"`) — load-bearing for the slate
+    # adapter's horizon filter. Verified 100% populated across ATP,
+    # WTA, and Challenger series.
+    occurrence_datetime: datetime | None = None
+    # Top-of-book size in contracts (string-encoded float).
+    yes_bid_size_fp: float | None = None
+    yes_ask_size_fp: float | None = None
+    # Lifetime + 24h volume in contracts; open interest in contracts.
+    volume_fp: float | None = None
+    volume_24h_fp: float | None = None
+    open_interest_fp: float | None = None
+    # Kalshi's resting-book liquidity number (dollars).
+    liquidity_dollars: float | None = None
+    # Last trade + previous-tick references for derived 1d move.
+    last_price_dollars: float | None = None
+    previous_yes_bid_dollars: float | None = None
+    previous_yes_ask_dollars: float | None = None
+    previous_price_dollars: float | None = None
+    # Settlement rules (natural language) — director context fallback
+    # in lieu of Polymarket's AI-generated `context_description`.
+    rules_primary: str | None = None
+    custom_strike: KalshiCustomStrike | None = None
 
-    @field_validator("yes_ask_dollars", "yes_bid_dollars", mode="before")
+    @field_validator(
+        "yes_ask_dollars",
+        "yes_bid_dollars",
+        "no_ask_dollars",
+        "no_bid_dollars",
+        "yes_bid_size_fp",
+        "yes_ask_size_fp",
+        "volume_fp",
+        "volume_24h_fp",
+        "open_interest_fp",
+        "liquidity_dollars",
+        "last_price_dollars",
+        "previous_yes_bid_dollars",
+        "previous_yes_ask_dollars",
+        "previous_price_dollars",
+        mode="before",
+    )
     @classmethod
     def _coerce_dollars(cls, v: Any) -> float | None:
         if v is None or v == "":
@@ -49,6 +131,22 @@ class KalshiMarket(BaseModel):
             return float(v)
         except (TypeError, ValueError):
             return None
+
+    @field_validator("occurrence_datetime", mode="before")
+    @classmethod
+    def _coerce_datetime(cls, v: Any) -> datetime | None:
+        if v is None or v == "":
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, str):
+            try:
+                # Kalshi ships `"2026-05-12T21:30:00Z"` — fromisoformat
+                # accepts the `+00:00` form, so swap the trailing `Z`.
+                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return None
 
 
 class KalshiEvent(BaseModel):
@@ -67,7 +165,62 @@ class KalshiEvent(BaseModel):
     title: str | None = None
     sub_title: str | None = None
     mutually_exclusive: bool | None = None
+    # Tournament metadata — `product_metadata.competition` is the
+    # human-readable label (e.g. `"ATP Rome"`) the slate adapter
+    # slugifies for `series_slug` so `tennis/identity.py` surface and
+    # tier lookups can fire.
+    product_metadata: KalshiProductMetadata | None = None
     markets: list[KalshiMarket] = Field(default_factory=list)
+
+
+class KalshiOrderbook(BaseModel):
+    """`/markets/{ticker}/orderbook` response.
+
+    Wire shape: `{"orderbook_fp": {"yes_dollars": [[price_str,
+    size_str], ...], "no_dollars": [...]}}`. Each side is
+    `list[(price_dollars, size_contracts)]`. Levels arrive low-to-high
+    by price; the slate adapter reverses bids so top-of-book is `[0]`
+    on both sides (mirrors `clob/__init__.py:fetch_book` convention).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    yes_levels: list[tuple[float, float]] = Field(default_factory=list)
+    no_levels: list[tuple[float, float]] = Field(default_factory=list)
+
+
+class KalshiCandle(BaseModel):
+    """One bucket from `/series/{s}/markets/{t}/candlesticks`.
+
+    Each bucket carries OHLC for `yes_bid`, `yes_ask`, and `price`
+    (last trade) separately, plus per-bucket `volume_fp` and
+    `open_interest_fp`. Only `period_interval=1` and `=60` are legal
+    (verified 2026-05-11; 5/15/30 all return HTTP 400).
+
+    The slate enrichment uses `yes_bid.close_dollars` for the
+    sparkline + recency moves so the rendered series matches what
+    Polymarket's CLOB price-history exposed (a single mid-price
+    stream per market, indexed at the bid).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    end_period_ts: int | None = None
+    yes_bid: dict[str, Any] = Field(default_factory=dict)
+    yes_ask: dict[str, Any] = Field(default_factory=dict)
+    price: dict[str, Any] = Field(default_factory=dict)
+    volume_fp: float | None = None
+    open_interest_fp: float | None = None
+
+    @field_validator("volume_fp", "open_interest_fp", mode="before")
+    @classmethod
+    def _coerce_dollars(cls, v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
 
 
 class OrderRequest(BaseModel):

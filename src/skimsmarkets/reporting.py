@@ -98,7 +98,7 @@ def print_events_table(
     horizon_note = f", within {horizon_hours}h" if horizon_hours is not None else ""
     league_note = f" — leagues={','.join(leagues)}" if leagues else ""
     title = (
-        "Live sports events (Polymarket)"
+        "Live sports events (Kalshi)"
         + league_note
         + horizon_note
         + f" ({len(events)} events)"

@@ -18,6 +18,7 @@ public-only run (dry-run, matcher probes) works with no Kalshi config.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import time
@@ -28,12 +29,36 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from skimsmarkets.kalshi.models import (
+    KalshiCandle,
     KalshiEvent,
+    KalshiOrderbook,
     OrderRequest,
     OrderResponse,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _parse_book_side(levels: object) -> list[tuple[float, float]]:
+    """Parse one side of `/markets/{ticker}/orderbook`'s `orderbook_fp`.
+
+    Wire shape: `[[price_str, size_str], ...]` (e.g. `[["0.0100",
+    "9025.00"], ["0.0200", "36372.00"]]`). Drops any level whose
+    fields don't parse as floats.
+    """
+    if not isinstance(levels, list):
+        return []
+    out: list[tuple[float, float]] = []
+    for level in levels:
+        if not isinstance(level, list | tuple) or len(level) < 2:
+            continue
+        try:
+            px = float(level[0])
+            sz = float(level[1])
+        except (TypeError, ValueError):
+            continue
+        out.append((px, sz))
+    return out
 
 
 class KalshiOrderError(Exception):
@@ -99,6 +124,12 @@ class KalshiClient:
         one page, but the cursor loop is cheap and future-proofs against
         Grand Slam early rounds where 64-128 first-round matches could
         all be open at once.
+
+        Retries up to 3 times on HTTP 429 with exponential backoff
+        (1s, 2s, 4s). The slate adapter fans out across all tennis
+        series in parallel (6 series after ITF was added), which
+        bursts harder than `/events` likes — without backoff, the
+        last 1-2 series in the gather call frequently 429.
         """
         path = "/events"
         params: dict[str, str] = {
@@ -113,8 +144,15 @@ class KalshiClient:
         while True:
             if cursor:
                 params["cursor"] = cursor
-            r = await self._http.get(f"{self._base}{path}", params=params)
-            r.raise_for_status()
+            backoff = 1.0
+            for attempt in range(4):
+                r = await self._http.get(f"{self._base}{path}", params=params)
+                if r.status_code == 429 and attempt < 3:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                r.raise_for_status()
+                break
             payload = r.json()
             for raw in payload.get("events", []):
                 events.append(KalshiEvent.model_validate(raw))
@@ -123,14 +161,112 @@ class KalshiClient:
                 break
         return events
 
+    async def fetch_orderbook(
+        self,
+        *,
+        ticker: str,
+    ) -> KalshiOrderbook | None:
+        """`GET /markets/{ticker}/orderbook` → full bid/ask book.
+
+        Returns `KalshiOrderbook` with `yes_levels` and `no_levels`,
+        each `list[(price_dollars, size_contracts)]` ordered top-of-
+        book first (best bid descending, best ask ascending — same
+        convention as `clob/__init__.py:fetch_book`). Public,
+        unauthed. Returns None on any HTTP / shape failure
+        (degrade-silently posture; the ranker treats missing book
+        as "no depth signal").
+        """
+        path = f"/markets/{ticker}/orderbook"
+        try:
+            r = await self._http.get(f"{self._base}{path}")
+            r.raise_for_status()
+            payload = r.json()
+        except Exception as e:  # noqa: BLE001
+            log.warning("kalshi orderbook ticker=%s failed: %s", ticker, e)
+            return None
+        ob = payload.get("orderbook_fp") if isinstance(payload, dict) else None
+        if not isinstance(ob, dict):
+            return None
+        yes = _parse_book_side(ob.get("yes_dollars"))
+        no = _parse_book_side(ob.get("no_dollars"))
+        # Wire shape lists levels worst-first (lowest bid first, lowest
+        # ask first). Reverse the bid side so callers can read `[0]` as
+        # top-of-book on both sides without thinking about it.
+        yes.reverse()
+        no.reverse()
+        return KalshiOrderbook(yes_levels=yes, no_levels=no)
+
+    async def fetch_candlesticks(
+        self,
+        *,
+        series_ticker: str,
+        ticker: str,
+        period_interval: int,
+        start_ts: int,
+        end_ts: int,
+    ) -> list[KalshiCandle] | None:
+        """`GET /series/{s}/markets/{t}/candlesticks` → list[KalshiCandle].
+
+        `period_interval` is in minutes. **Only `1` and `60` are legal**
+        — verified 2026-05-11; 5/15/30 all return HTTP 400. `start_ts`
+        and `end_ts` are Unix epoch seconds. Returns the bucket list
+        (each carrying OHLC for `yes_bid`, `yes_ask`, `price`, plus
+        `volume_fp` and `open_interest_fp`). Public, unauthed.
+
+        Retries up to 3 times on HTTP 429 with exponential backoff
+        (1s, 2s, 4s). Kalshi's `/candlesticks` endpoint is much more
+        rate-limited than `/orderbook` and `/events` — even small
+        bursts trip a per-IP cooldown. Degrade-silently if all
+        retries fail.
+        """
+        path = f"/series/{series_ticker}/markets/{ticker}/candlesticks"
+        params = {
+            "period_interval": str(period_interval),
+            "start_ts": str(start_ts),
+            "end_ts": str(end_ts),
+        }
+        backoff = 1.0
+        for attempt in range(4):
+            try:
+                r = await self._http.get(f"{self._base}{path}", params=params)
+                if r.status_code == 429 and attempt < 3:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                r.raise_for_status()
+                payload = r.json()
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt < 3:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                log.warning(
+                    "kalshi candlesticks ticker=%s failed: %s", ticker, e,
+                )
+                return None
+        sticks = payload.get("candlesticks") if isinstance(payload, dict) else None
+        if not isinstance(sticks, list):
+            return None
+        out: list[KalshiCandle] = []
+        for raw in sticks:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                out.append(KalshiCandle.model_validate(raw))
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
     async def list_tennis_match_series(self) -> list[str]:
         """Discover all per-match-winner tennis series tickers at runtime.
 
         Two-layer filter:
-          1. Ticker pattern: starts with `KXATP`/`KXWTA`, ends with
-             `MATCH`. Catches `KXATPMATCH`, `KXWTAMATCH`,
-             `KXATPCHALLENGERMATCH`, `KXWTACHALLENGERMATCH`, and any
-             future sub-tour Kalshi adds.
+          1. Ticker pattern: starts with `KXATP` / `KXWTA` / `KXITF`,
+             ends with `MATCH`. Catches `KXATPMATCH`, `KXWTAMATCH`,
+             `KXATPCHALLENGERMATCH`, `KXWTACHALLENGERMATCH`,
+             `KXITFMATCH` (men's futures), `KXITFWMATCH` (women's
+             futures), and any future sub-tour Kalshi adds.
           2. Substring blocklist: tokens that mark a *different market
              structure* on the same per-event surface (not a winner
              market). Currently blocks `EXACT` — series like
@@ -144,13 +280,20 @@ class KalshiClient:
         Returns a sorted list for deterministic ordering. Caller is
         responsible for falling back to a hardcoded list if this
         returns empty or raises.
+
+        ITF note: per the slate adapter's tour mapping, `KXITFMATCH`
+        (men's M-tier futures) is treated as `tour="atp"` for
+        downstream MatchStats lookups, and `KXITFWMATCH` as
+        `tour="wta"`. MatchStats classifies M15/M25/M35 events under
+        their `/atp/fixtures/{date}` endpoint and W15/W25/W35/W75
+        under `/wta/fixtures/{date}` — same convention.
         """
         # Tokens that mark a non-winner-format series sharing the same
         # ticker-name surface. Compared case-insensitively against the
-        # substring of the ticker BETWEEN the ATP/WTA prefix and the
-        # MATCH suffix — `KXATPCHALLENGERMATCH` is allowed (CHALLENGER
-        # is a tour qualifier), `KXATPEXACTMATCH` is not (EXACT is a
-        # market-type qualifier).
+        # substring of the ticker BETWEEN the ATP/WTA/ITF prefix and
+        # the MATCH suffix — `KXATPCHALLENGERMATCH` is allowed
+        # (CHALLENGER is a tour qualifier), `KXATPEXACTMATCH` is not
+        # (EXACT is a market-type qualifier).
         non_winner_tokens = ("EXACT", "SPREAD", "SET", "GAME")
         out: set[str] = set()
         cursor: str | None = None
@@ -167,8 +310,13 @@ class KalshiClient:
                     continue
                 if not ticker.endswith("MATCH"):
                     continue
+                # `KXITF` covers both `KXITFMATCH` (men) and
+                # `KXITFWMATCH` (women) — gender split is decoded at
+                # the slate-adapter layer via `_TOUR_BY_PREFIX`.
                 if not (
-                    ticker.startswith("KXATP") or ticker.startswith("KXWTA")
+                    ticker.startswith("KXATP")
+                    or ticker.startswith("KXWTA")
+                    or ticker.startswith("KXITF")
                 ):
                     continue
                 if any(tok in ticker for tok in non_winner_tokens):

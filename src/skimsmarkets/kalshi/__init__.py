@@ -17,15 +17,23 @@ from skimsmarkets.kalshi.matcher import (
     last_token,
 )
 from skimsmarkets.kalshi.models import (
+    KalshiCandle,
+    KalshiCustomStrike,
     KalshiEvent,
     KalshiMarket,
+    KalshiOrderbook,
+    KalshiProductMetadata,
     OrderRequest,
     OrderResponse,
 )
 
 __all__ = [
+    "KalshiCandle",
+    "KalshiCustomStrike",
     "KalshiEvent",
     "KalshiMarket",
+    "KalshiOrderbook",
+    "KalshiProductMetadata",
     "MatchOutcome",
     "OrderRequest",
     "OrderResponse",

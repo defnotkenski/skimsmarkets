@@ -22,6 +22,31 @@ DEFAULT_HORIZON_HOURS = 8
 # filter — explicit slug fetches are user-driven.
 MAX_IMPLIED_PROBABILITY = 0.60
 
+# Minimum open interest (in dollars) for BOTH sides of an event
+# to survive the slate filter. Kalshi reports OI in CONTRACTS but
+# for binary markets each contract has $1 par value, so the
+# contract count equals dollars-at-par (mirrors Polymarket's
+# `liquidity_dollars` framing). Threshold compares against the
+# MIN OI across markets in the event — both sides must clear so
+# the trader has ask-side liquidity on whichever side the ranker
+# picks. (One-sided liquidity is a trap: an event with $4000 OI
+# on one side and $30 on the other looks active in aggregate but
+# you can't reliably trade the cold side.)
+#
+# Why this exists: ITF futures (M15/M25/W15-W75) often open with
+# $0/$0 OI on both sides for hours after market creation, and
+# many Challenger early-rounds have one-sided OI for the first
+# day. Trading into a market with no resting interest means you
+# ARE the market — slippage is unbounded. Polymarket didn't expose
+# ITF, so this wasn't a problem; Kalshi does, so we floor below
+# the tier where books are reliably populated.
+#
+# Tunable: 1000 ≈ "1000 contracts at par on both sides" — usually
+# clears most main-tour matches and the more-liquid Challengers,
+# drops fresh ITF events and one-sided Challenger early-rounds.
+# Set to 0 to disable. CLI override: `--min-oi N`.
+MIN_OPEN_INTEREST_DOLLARS = 1000.0
+
 # Cap on the number of events sent through the LLM chain from the default
 # browse. Survivors of all upstream filters (league + horizon + tradability
 # + blowout) are sorted by earliest market tipoff ascending and the top N
@@ -96,6 +121,22 @@ FETCHER_PROVIDER = "grok"
 # override caps a single accidental run at single-digit dollars.
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
+# Backstop window on the SLATE side — the Kalshi adapter keeps events
+# whose `occurrence_datetime` lies in `[now - KALSHI_HORIZON_BACKSTOP_
+# HOURS, now + horizon_hours]`. The backstop catches matches that
+# tipped off in the last few hours but haven't settled (overtime,
+# weather delays, long-format five-setters). Mirrors the hardcoded
+# 6h backstop the legacy `fetch_gamma_slate` used.
+KALSHI_HORIZON_BACKSTOP_HOURS = 6
+
+# Candlestick bucket size in MINUTES for the slate price-history
+# enrichment (`enrich_kalshi_history`). Kalshi's `/candlesticks` only
+# accepts `period_interval=1` and `=60` (verified 2026-05-11 — 5/15/30
+# all return HTTP 400). 60 gives 24 hourly buckets across a 24h window
+# which is enough to derive 1h/4h/24h scalar moves and a 5-point
+# sparkline without hammering the endpoint.
+KALSHI_SLATE_HISTORY_INTERVAL_MINUTES = 60
+
 # Tennis match-level series — FALLBACK ONLY.
 #
 # The trader auto-discovers tennis series at runtime via Kalshi's
@@ -114,6 +155,13 @@ KALSHI_TENNIS_SERIES_TICKERS: tuple[str, ...] = (
     "KXWTAMATCH",
     "KXATPCHALLENGERMATCH",
     "KXWTACHALLENGERMATCH",
+    # ITF futures — M-tier (M15/M25/M35) men's and W-tier
+    # (W15/W25/W35/W75) women's. Folded into atp/wta downstream
+    # via `kalshi/slate.py:_TOUR_BY_PREFIX` (matches MatchStats's
+    # classification — they expose M-events under /atp/fixtures/
+    # and W-events under /wta/fixtures/).
+    "KXITFMATCH",
+    "KXITFWMATCH",
 )
 
 # --- Spend caps ------------------------------------------------------------

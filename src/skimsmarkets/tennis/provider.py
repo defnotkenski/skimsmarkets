@@ -27,7 +27,7 @@ from types import TracebackType
 from typing import Protocol, Self
 
 from skimsmarkets import config as cfg
-from datetime import date
+from datetime import date, datetime
 
 from skimsmarkets.tennis.identity import TennisMatchIdentity
 from skimsmarkets.tennis.models import (
@@ -202,6 +202,45 @@ def parse_score_details(
         final_set_margin=final_set_margin,
         is_close_match=is_close_match,
     )
+
+
+@dataclass(frozen=True)
+class MatchStatsFixture:
+    """One scheduled fixture from `/tennis/v2/{tour}/fixtures/{date}`,
+    parsed and indexed by surname-pair for the slate-overlay stage.
+
+    Carries everything Phase 1 of the ITF data-recovery effort needs:
+      - `date`: per-match scheduled tipoff (None for early-round
+        matches whose schedule hasn't been confirmed yet).
+      - `player_*_id`: vendor player IDs — load-bearing for ITF
+        because most ITF futures players sit outside the top-500
+        ATP/WTA rankings index. Seeding these IDs into the
+        rankings cache (as a side effect of `fetch_fixtures_for_date`)
+        unlocks every per-player MatchStats endpoint
+        (`/player/profile`, `/player/past-matches`, `/h2h`, etc.)
+        for ITF events.
+      - `tournament_name`: specific name (e.g. `"W75 Trnava"`)
+        replacing the generic `"ITF"` tag from Kalshi's
+        `product_metadata.competition`.
+      - `surface`: court surface (`"Hard"` / `"Clay"` / `"Grass"` /
+        `"Carpet"`) — currently None for ITF events because the
+        slug-prefix surface map doesn't index ITF tournaments.
+      - `round_name`: tournament round (e.g. `"First"`,
+        `"Quarter-Final"`).
+
+    Sourced from the fixtures endpoint with
+    `include=tournament,tournament.court,round`. All optional
+    fields fall back to None when the vendor payload omits them.
+    """
+
+    date: datetime | None
+    player_a_id: int | None
+    player_b_id: int | None
+    player_a_name: str | None
+    player_b_name: str | None
+    tournament_name: str | None
+    surface: str | None
+    round_name: str | None
 
 
 @dataclass(frozen=True)
@@ -483,6 +522,35 @@ class TennisStatsProvider(Protocol):
         """
         ...
 
+    async def fetch_fixtures_for_date(
+        self, *, tour: str, date_iso: str
+    ) -> dict[frozenset[str], MatchStatsFixture]:
+        """Pull scheduled fixtures + tournament metadata for one
+        (tour, date) from the vendor.
+
+        Returns a dict mapping `frozenset({surname_a, surname_b})` →
+        `MatchStatsFixture` carrying tipoff, player IDs, tournament
+        name, surface, and round. Used by the slate-build path
+        (`pipeline.overlay_matchstats_tipoffs`) to:
+          1. Overlay per-match tipoff precision onto Kalshi's
+             session-bucketed `occurrence_datetime`.
+          2. Seed the rankings index with fixture-derived player IDs
+             so ITF players outside the top-500 ATP/WTA rankings
+             still resolve through `_resolve(tour, name)` and unlock
+             the per-player stats endpoints.
+
+        Surnames are normalised via
+        `tennis/matchstat.py:_normalize_name` last-token so the index
+        matches the slug-synthesised surnames in
+        `kalshi/slate.py:_surname_from_yes_sub_title`.
+
+        `date_iso` is `YYYY-MM-DD`. Empty dict on any failure or when
+        the vendor has no fixtures for that date — the overlay
+        degrades silently per missing match. Concrete adapters MAY
+        also seed their internal rankings index as a side effect.
+        """
+        ...
+
     async def __aenter__(self) -> Self: ...
 
     async def __aexit__(
@@ -597,6 +665,13 @@ class StubTennisStatsProvider:
         opponent_name: str,
     ) -> PerMatchStats | None:
         return None
+
+    async def fetch_fixtures_for_date(
+        self, *, tour: str, date_iso: str
+    ) -> dict[frozenset[str], MatchStatsFixture]:
+        # No backing vendor — the overlay stage falls through to the
+        # existing Kalshi `occurrence_datetime` for every market.
+        return {}
 
     async def __aenter__(self) -> Self:
         return self
