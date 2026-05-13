@@ -2,8 +2,6 @@
 
 Use when triggered by a scheduled run (cron / cloud scheduler) to walk the full end-to-end trading flow: exposure pre-flight → slate probe → rank → execute live. This playbook IS the trigger prompt — the scheduler invokes Claude with this file as the instruction set.
 
-**Scope: scheduled-only.** `--live` is allowed here because this is the scheduled-routine exception in `memory/feedback_kalshi_execute_live.md`. If you're reading this in an interactive chat with a human at the other end, **stop** and tell the operator to use `/schedule` or their cloud cron instead — don't execute the steps inline.
-
 ## Flow
 
 ```
@@ -126,4 +124,3 @@ Only "error" rows warrant alerting the operator. "Clean" aborts are the expected
 - **Don't override `--max-open-exposure-cents` upward to fit a trade.** The cap is the portfolio safety limit; if there's no headroom, the answer is "trade fewer / smaller" or "wait", not "widen the limit".
 - **Don't skip step 1** even though `skims execute --live` re-reads exposure internally. The pre-flight saves the LLM cost of `skims rank` on days when there's no headroom anyway.
 - **Don't add edge gates, EV thresholds, or sizing logic.** Per CLAUDE.md the trade layer is deterministic by design. All knobs are CLI flags: `--bet-size-cents`, `--max-open-exposure-cents`, `--confidence`, `--min-defensibility`, `--no-negative-edge`, `--sport`.
-- **Don't run interactively.** If a human is on the other side, redirect them to `/schedule` and exit. The whole point of this playbook is that the trigger is a deterministic scheduler, not a chat.
