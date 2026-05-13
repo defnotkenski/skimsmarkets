@@ -105,7 +105,7 @@ CLOB_HISTORY_ENABLED = True
 # loudly rather than later in `build_provider`. Add new providers to the
 # tuple when they ship.
 FETCHER_PROVIDERS: tuple[str, ...] = ("grok", "gemini")
-FETCHER_PROVIDER = "gemini"
+FETCHER_PROVIDER = "grok"
 
 
 # ---------------------------------------------------------------------------
