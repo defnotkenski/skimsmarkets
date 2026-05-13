@@ -98,7 +98,7 @@ def print_events_table(
     horizon_note = f", within {horizon_hours}h" if horizon_hours is not None else ""
     league_note = f" — leagues={','.join(leagues)}" if leagues else ""
     title = (
-        "Live sports events (Kalshi)"
+        "Live sports events (Polymarket)"
         + league_note
         + horizon_note
         + f" ({len(events)} events)"
@@ -116,9 +116,9 @@ def print_events_table(
     table.add_column("Bid/ask", justify="right")
     table.add_column("Implied", justify="right")
     table.add_column("Volume", justify="right")
-    # polymarket-us doesn't publish order-book liquidity as a dollar figure;
-    # what we have is dollar open interest (outstanding shares × price), which
-    # is a market-size proxy rather than "how much can I trade right now."
+    # Gamma's `liquidity` field — resting CLOB book depth in dollars
+    # (forward-looking, populated from minute one by market makers).
+    # Same number `MIN_OPEN_INTEREST_DOLLARS` filters on.
     table.add_column("Open interest", justify="right")
     table.add_column("Tips in", justify="right")
 

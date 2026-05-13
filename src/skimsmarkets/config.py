@@ -5,11 +5,23 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
-# Default horizon window — markets whose game_start_time sits further out than
-# this are left out of the slate. 24h catches "today's slate"; use 48-72 on the
-# CLI to pull in tomorrow. Enforced server-side via Polymarket's startTimeMax,
-# so events outside the window never hit the matcher/LLM path.
+# Default horizon window — markets whose game_start_time sits further out
+# than this are left out of the slate. 24h catches "today's slate"; use
+# 48-72 on the CLI to pull in tomorrow. Filter runs client-side after the
+# gamma `/events` listing (gamma's order=endDate is settlement-window
+# ordered, not tipoff, so a server-side cut would miss rescheduled
+# fixtures whose endDate is stale).
 DEFAULT_HORIZON_HOURS = 8
+
+# Symmetric "look behind now" window on the slate-level horizon filter.
+# Markets whose earliest `game_start_time` sits within
+# `[now - HORIZON_BACKSTOP_HOURS, now + horizon_hours]` survive the
+# slate filter. The backstop catches long-tail endings (overtime,
+# weather delays) that haven't settled yet. Applied twice — once in
+# `polymarket/slate.py:fetch_gamma_slate` on raw gamma tipoffs, then
+# again in `pipeline.apply_horizon_filter` AFTER MatchStats overlays
+# per-match precise tipoffs on tennis events.
+HORIZON_BACKSTOP_HOURS = 6
 
 # Max implied probability for the event's favorite. Events whose favorite
 # is priced at or above this on the YES mid (`(bid+ask)/2`) are dropped
@@ -22,29 +34,20 @@ DEFAULT_HORIZON_HOURS = 8
 # filter — explicit slug fetches are user-driven.
 MAX_IMPLIED_PROBABILITY = 0.60
 
-# Minimum open interest (in dollars) for BOTH sides of an event
-# to survive the slate filter. Kalshi reports OI in CONTRACTS but
-# for binary markets each contract has $1 par value, so the
-# contract count equals dollars-at-par (mirrors Polymarket's
-# `liquidity_dollars` framing). Threshold compares against the
-# MIN OI across markets in the event — both sides must clear.
+# Minimum gamma `liquidity` (resting CLOB book depth, in dollars) for
+# BOTH sides of an event to survive the slate filter. Threshold compares
+# against the MIN value across markets in the event — both sides must
+# clear. Default is OFF (0.0): the executor already filters
+# per-prediction against the specific side it wants to buy, so the
+# slate filter is redundant for the typical use case and would just
+# silently drop events without making the rationale visible. CLI
+# override `--min-oi N` enables it for runs that want a strict slate.
 #
-# DEFAULT IS OFF (0.0). Live audit on 2026-05-12 showed only 6/311
-# in-window Kalshi tennis events clear $1000 min-OI; the median
-# in-window event has $0 OI on at least one side because Kalshi's
-# resting-order book builds up over hours/days while the bid/ask
-# itself is quoted by market makers from minute one. A $1000 min-OI
-# default was masking 99% of the slate as a side effect.
-#
-# Liquidity-gating belongs in the execute layer (`skims execute`),
-# which already filters per-prediction against the SPECIFIC side it
-# wants to buy — see `execute/cli.py`. The ranker doesn't need to
-# pre-filter on tradability because it produces a ranked list, not
-# trades; events the executor can't fill get dropped there.
-#
-# CLI override: `--min-oi N` re-enables the filter for runs that
-# want to mirror executor constraints at slate-build time. Pre-2026-
-# 05-12 default was 1000.0.
+# Unlike the Kalshi-era `open_interest_fp` (which tracked settled
+# trade count and showed $0 for 99% of in-window events), gamma's
+# `liquidity` is forward-looking real book depth — typical values for
+# live ATP/WTA H2H matches are $10k-$60k from minute one, so this
+# filter behaves predictably when turned on.
 MIN_OPEN_INTEREST_DOLLARS = 0.0
 
 # Cap on the number of events sent through the LLM chain from the default
@@ -121,22 +124,6 @@ FETCHER_PROVIDER = "grok"
 # override caps a single accidental run at single-digit dollars.
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-# Backstop window on the SLATE side — the Kalshi adapter keeps events
-# whose `occurrence_datetime` lies in `[now - KALSHI_HORIZON_BACKSTOP_
-# HOURS, now + horizon_hours]`. The backstop catches matches that
-# tipped off in the last few hours but haven't settled (overtime,
-# weather delays, long-format five-setters). Mirrors the hardcoded
-# 6h backstop the legacy `fetch_gamma_slate` used.
-KALSHI_HORIZON_BACKSTOP_HOURS = 6
-
-# Candlestick bucket size in MINUTES for the slate price-history
-# enrichment (`enrich_kalshi_history`). Kalshi's `/candlesticks` only
-# accepts `period_interval=1` and `=60` (verified 2026-05-11 — 5/15/30
-# all return HTTP 400). 60 gives 24 hourly buckets across a 24h window
-# which is enough to derive 1h/4h/24h scalar moves and a 5-point
-# sparkline without hammering the endpoint.
-KALSHI_SLATE_HISTORY_INTERVAL_MINUTES = 60
-
 # Tennis match-level series — FALLBACK ONLY.
 #
 # The trader auto-discovers tennis series at runtime via Kalshi's
@@ -156,10 +143,11 @@ KALSHI_TENNIS_SERIES_TICKERS: tuple[str, ...] = (
     "KXATPCHALLENGERMATCH",
     "KXWTACHALLENGERMATCH",
     # ITF futures — M-tier (M15/M25/M35) men's and W-tier
-    # (W15/W25/W35/W75) women's. Folded into atp/wta downstream
-    # via `kalshi/slate.py:_TOUR_BY_PREFIX` (matches MatchStats's
-    # classification — they expose M-events under /atp/fixtures/
-    # and W-events under /wta/fixtures/).
+    # (W15/W25/W35/W75) women's. MatchStats classifies M-events
+    # under /atp/fixtures/ and W-events under /wta/fixtures/, so
+    # the executor matches both into the tour-keyed Kalshi series
+    # at trade time via surname pair (no per-tour split needed
+    # on this side).
     "KXITFMATCH",
     "KXITFWMATCH",
 )

@@ -218,10 +218,12 @@ def _surname_token(name: str | None) -> str | None:
     """Last whitespace-separated token of `_normalize_name(name)`,
     further stripped to alnum-only.
 
-    Mirrors `kalshi/slate.py:_surname_from_yes_sub_title` so the
-    fixtures-overlay index keys line up with the slug-synthesised
-    surnames the slate adapter writes. Returns None for empty / null
-    input or names that strip to empty.
+    Canonical surname form for the fixtures-overlay index. Same
+    transform `pipeline._event_surname_pair` reads off the slug
+    (lowercased, diacritic-stripped, alnum-only), so the surname pair
+    extracted from the gamma slug matches the keys built off the
+    MatchStats fixture rows. Returns None for empty / null input or
+    names that strip to empty.
     """
     if not name:
         return None
@@ -2065,9 +2067,9 @@ class MatchStatTennisProvider:
 
         Returns a dict keyed by `frozenset({surname_a, surname_b})`
         (lowercased, diacritic-stripped, alnum-only — same canonical
-        form `kalshi/slate.py:_surname_from_yes_sub_title` produces).
-        Empty dict on any failure or when the vendor has no fixtures
-        for that date — overlay degrades silently per missing match.
+        form `_surname_token` above produces). Empty dict on any
+        failure or when the vendor has no fixtures for that date —
+        overlay degrades silently per missing match.
 
         `pageSize=500` covers the busiest tournament-day combination
         (M-tier futures days can ship 100+ singles fixtures per tour);
@@ -2105,10 +2107,10 @@ class MatchStatTennisProvider:
                 continue
             # `date` may be null on early-round matches whose tipoff
             # tour officials haven't confirmed. Carry None through —
-            # the overlay stage skips dateless rows (Kalshi's
-            # `occurrence_datetime` stays). The non-date fields
-            # (player IDs, tournament, surface, round) are still
-            # useful and worth indexing.
+            # the overlay stage skips dateless rows (gamma's
+            # `gameStartTime` stays). The non-date fields (player IDs,
+            # tournament, surface, round) are still useful and worth
+            # indexing.
             tipoff: datetime | None = None
             raw_date = item.get("date")
             if isinstance(raw_date, str) and raw_date:

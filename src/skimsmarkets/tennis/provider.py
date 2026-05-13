@@ -219,9 +219,9 @@ class MatchStatsFixture:
         unlocks every per-player MatchStats endpoint
         (`/player/profile`, `/player/past-matches`, `/h2h`, etc.)
         for ITF events.
-      - `tournament_name`: specific name (e.g. `"W75 Trnava"`)
-        replacing the generic `"ITF"` tag from Kalshi's
-        `product_metadata.competition`.
+      - `tournament_name`: specific name (e.g. `"W75 Trnava"`) —
+        more precise than gamma's slug-derived hint (which collapses
+        all ITF events under a single sport tag).
       - `surface`: court surface (`"Hard"` / `"Clay"` / `"Grass"` /
         `"Carpet"`) — currently None for ITF events because the
         slug-prefix surface map doesn't index ITF tournaments.
@@ -541,8 +541,8 @@ class TennisStatsProvider(Protocol):
 
         Surnames are normalised via
         `tennis/matchstat.py:_normalize_name` last-token so the index
-        matches the slug-synthesised surnames in
-        `kalshi/slate.py:_surname_from_yes_sub_title`.
+        matches the surname pair `pipeline._event_surname_pair` reads
+        off the gamma event slug.
 
         `date_iso` is `YYYY-MM-DD`. Empty dict on any failure or when
         the vendor has no fixtures for that date — the overlay

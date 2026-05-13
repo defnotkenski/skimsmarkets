@@ -1,8 +1,14 @@
 """Async Kalshi v2 trade API client.
 
-Public endpoints (`GET /events`, `GET /markets`) need no auth and are
-used by the matcher. `POST /portfolio/orders` requires the RSA-PSS
-signature trio:
+Polymarket is the data source; Kalshi is the execution venue. This
+client exposes only what `skims execute` needs:
+
+- `list_events` / `list_tennis_match_series` — public, unauthed event
+  discovery used by the trader to map a ranker prediction to a Kalshi
+  market via surname-pair matching at trade time.
+- `place_order` — RSA-PSS-signed `POST /portfolio/orders`.
+
+Signature trio (only on `place_order`):
 
     KALSHI-ACCESS-KEY        api key UUID
     KALSHI-ACCESS-TIMESTAMP  Unix epoch in milliseconds (as string)
@@ -29,36 +35,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from skimsmarkets.kalshi.models import (
-    KalshiCandle,
     KalshiEvent,
-    KalshiOrderbook,
     OrderRequest,
     OrderResponse,
 )
 
 log = logging.getLogger(__name__)
-
-
-def _parse_book_side(levels: object) -> list[tuple[float, float]]:
-    """Parse one side of `/markets/{ticker}/orderbook`'s `orderbook_fp`.
-
-    Wire shape: `[[price_str, size_str], ...]` (e.g. `[["0.0100",
-    "9025.00"], ["0.0200", "36372.00"]]`). Drops any level whose
-    fields don't parse as floats.
-    """
-    if not isinstance(levels, list):
-        return []
-    out: list[tuple[float, float]] = []
-    for level in levels:
-        if not isinstance(level, list | tuple) or len(level) < 2:
-            continue
-        try:
-            px = float(level[0])
-            sz = float(level[1])
-        except (TypeError, ValueError):
-            continue
-        out.append((px, sz))
-    return out
 
 
 class KalshiOrderError(Exception):
@@ -161,103 +143,6 @@ class KalshiClient:
                 break
         return events
 
-    async def fetch_orderbook(
-        self,
-        *,
-        ticker: str,
-    ) -> KalshiOrderbook | None:
-        """`GET /markets/{ticker}/orderbook` → full bid/ask book.
-
-        Returns `KalshiOrderbook` with `yes_levels` and `no_levels`,
-        each `list[(price_dollars, size_contracts)]` ordered top-of-
-        book first (best bid descending, best ask ascending — same
-        convention as `clob/__init__.py:fetch_book`). Public,
-        unauthed. Returns None on any HTTP / shape failure
-        (degrade-silently posture; the ranker treats missing book
-        as "no depth signal").
-        """
-        path = f"/markets/{ticker}/orderbook"
-        try:
-            r = await self._http.get(f"{self._base}{path}")
-            r.raise_for_status()
-            payload = r.json()
-        except Exception as e:  # noqa: BLE001
-            log.warning("kalshi orderbook ticker=%s failed: %s", ticker, e)
-            return None
-        ob = payload.get("orderbook_fp") if isinstance(payload, dict) else None
-        if not isinstance(ob, dict):
-            return None
-        yes = _parse_book_side(ob.get("yes_dollars"))
-        no = _parse_book_side(ob.get("no_dollars"))
-        # Wire shape lists levels worst-first (lowest bid first, lowest
-        # ask first). Reverse the bid side so callers can read `[0]` as
-        # top-of-book on both sides without thinking about it.
-        yes.reverse()
-        no.reverse()
-        return KalshiOrderbook(yes_levels=yes, no_levels=no)
-
-    async def fetch_candlesticks(
-        self,
-        *,
-        series_ticker: str,
-        ticker: str,
-        period_interval: int,
-        start_ts: int,
-        end_ts: int,
-    ) -> list[KalshiCandle] | None:
-        """`GET /series/{s}/markets/{t}/candlesticks` → list[KalshiCandle].
-
-        `period_interval` is in minutes. **Only `1` and `60` are legal**
-        — verified 2026-05-11; 5/15/30 all return HTTP 400. `start_ts`
-        and `end_ts` are Unix epoch seconds. Returns the bucket list
-        (each carrying OHLC for `yes_bid`, `yes_ask`, `price`, plus
-        `volume_fp` and `open_interest_fp`). Public, unauthed.
-
-        Retries up to 3 times on HTTP 429 with exponential backoff
-        (1s, 2s, 4s). Kalshi's `/candlesticks` endpoint is much more
-        rate-limited than `/orderbook` and `/events` — even small
-        bursts trip a per-IP cooldown. Degrade-silently if all
-        retries fail.
-        """
-        path = f"/series/{series_ticker}/markets/{ticker}/candlesticks"
-        params = {
-            "period_interval": str(period_interval),
-            "start_ts": str(start_ts),
-            "end_ts": str(end_ts),
-        }
-        backoff = 1.0
-        for attempt in range(4):
-            try:
-                r = await self._http.get(f"{self._base}{path}", params=params)
-                if r.status_code == 429 and attempt < 3:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                    continue
-                r.raise_for_status()
-                payload = r.json()
-                break
-            except Exception as e:  # noqa: BLE001
-                if attempt < 3:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                    continue
-                log.warning(
-                    "kalshi candlesticks ticker=%s failed: %s", ticker, e,
-                )
-                return None
-        sticks = payload.get("candlesticks") if isinstance(payload, dict) else None
-        if not isinstance(sticks, list):
-            return None
-        out: list[KalshiCandle] = []
-        for raw in sticks:
-            if not isinstance(raw, dict):
-                continue
-            try:
-                out.append(KalshiCandle.model_validate(raw))
-            except Exception:  # noqa: BLE001
-                continue
-        return out
-
     async def list_tennis_match_series(self) -> list[str]:
         """Discover all per-match-winner tennis series tickers at runtime.
 
@@ -311,8 +196,10 @@ class KalshiClient:
                 if not ticker.endswith("MATCH"):
                     continue
                 # `KXITF` covers both `KXITFMATCH` (men) and
-                # `KXITFWMATCH` (women) — gender split is decoded at
-                # the slate-adapter layer via `_TOUR_BY_PREFIX`.
+                # `KXITFWMATCH` (women); the trader doesn't need to
+                # split by gender since the matcher resolves by
+                # surname pair across the union of all match-winner
+                # series.
                 if not (
                     ticker.startswith("KXATP")
                     or ticker.startswith("KXWTA")

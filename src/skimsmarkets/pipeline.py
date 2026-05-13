@@ -28,17 +28,15 @@ from skimsmarkets.agents.schemas import (
 from skimsmarkets.agents.sports._director_shared import PROMPT_VERSION
 from skimsmarkets.agents.sports import resolve_lens_set
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
-from skimsmarkets.kalshi.client import KalshiClient
-from skimsmarkets.kalshi.enrichment import (
-    enrich_kalshi_book,
-    enrich_kalshi_history,
+from skimsmarkets.polymarket.enrichment import (
+    enrich_clob_book,
+    enrich_price_history,
 )
-from skimsmarkets.kalshi.slate import (
-    KalshiSlateOptions,
-    fetch_kalshi_slate,
-)
-from skimsmarkets.polymarket.matcher import find_polymarket_slug
 from skimsmarkets.polymarket.models import PolymarketEvent
+from skimsmarkets.polymarket.slate import (
+    fetch_gamma_events,
+    fetch_gamma_slate,
+)
 from skimsmarkets.selection import select_top_events
 from skimsmarkets.tennis import (
     TennisGbtContext,
@@ -47,6 +45,7 @@ from skimsmarkets.tennis import (
 )
 from skimsmarkets.tennis.gbt import predict_for_event as gbt_predict_for_event
 from skimsmarkets.tennis.identity import tennis_match_identity
+from skimsmarkets.tennis.matchstat import _surname_token
 from skimsmarkets.tennis.provider import (
     TennisStatsProvider,
     build_tennis_provider,
@@ -55,7 +54,6 @@ from skimsmarkets.tennis.simulation import simulate_for_event
 from skimsmarkets.unusual_whales import (
     GammaTokenResolver,
     UnusualWhalesClient,
-    list_gamma_events,
 )
 
 log = logging.getLogger(__name__)
@@ -208,41 +206,55 @@ async def fetch_slate(
     opts: SlateOptions,
     *,
     http: httpx.AsyncClient,
-    gamma_sem: asyncio.Semaphore,  # noqa: ARG001 — kept for signature compat
+    gamma_sem: asyncio.Semaphore,
 ) -> list[PolymarketEvent]:
-    """Build the tennis slate from Kalshi `/events`. Single source of truth
-    used by both `run_pipeline` and the `skims fetch` CLI path so they can
-    never drift.
+    """Build the unified Polymarket slate from gamma. Single source of
+    truth used by both `run_pipeline` and the `skims fetch` CLI path so
+    they can never drift.
 
-    The Kalshi adapter (`kalshi/slate.py:fetch_kalshi_slate`) returns
-    `PolymarketEvent` objects so the rest of the pipeline (selection,
-    lens dispatch, director, judge, JSONL persistence, retro grading)
-    keeps working unchanged. The misleading `PolymarketEvent` type
-    name is the one cost we accept to avoid touching ~84 call sites
-    in this swap; rename to `MarketEvent` is deferred.
+    Composition rules — chosen so each flag matches its instinctive read:
+    - bare (no flags): default browse, all sports within horizon.
+    - `--league` only: default browse filtered by those league prefixes.
+    - `--sport` only: gamma listing scoped to those sport tags
+      (server-side `tag_slug=<sport>`).
+    - `--slug` only: those events specifically. The default browse is
+      SKIPPED — `skims fetch --slug X` means "show me X", not "show me X
+      plus today's whole slate".
+    - `--league` and/or `--sport` + `--slug`: union (filtered default
+      browse plus the explicit slugs added on top, deduped by event id).
 
-    `opts.leagues`, `opts.slugs`, and `opts.sports` are no-ops on the
-    Kalshi path — Kalshi's slate is tennis-only by series-discovery,
-    and per-slug fetching isn't supported (users don't carry Kalshi
-    tickers in their head). A non-empty value triggers a one-line
-    warning so a stale CLI flag doesn't silently disappear.
+    `--slug` always bypasses the horizon filter so the user can pull a
+    specific event regardless of when it starts. CLOB book + price-history
+    enrichment runs in the caller after `fetch_slate` returns, so the
+    heavy HTTP fan-out happens once on the deduped union rather than
+    per-fetcher.
     """
-    if opts.leagues or opts.slugs or opts.sports:
-        log.warning(
-            "fetch_slate: --league / --slug / --sport flags are no-ops on "
-            "the Kalshi path (got leagues=%s slugs=%s sports=%s); "
-            "all kalshi tennis events within horizon will be returned",
-            opts.leagues, opts.slugs, opts.sports,
-        )
-    kalshi_client = KalshiClient(base_url=cfg.KALSHI_API_BASE, http=http)
-    return await fetch_kalshi_slate(
-        kalshi_client,
-        KalshiSlateOptions(
-            horizon_hours=opts.horizon_hours,
+    # Skip the default browse when the user gave only `--slug` and no
+    # `--league` / `--sport` — they're asking for those events
+    # specifically, not "those events plus today's full slate". When any
+    # filter flag is present alongside `--slug`, the default browse
+    # runs (scoped by those filters) and slugs add on top.
+    if opts.slugs and not opts.leagues and not opts.sports:
+        events: list[PolymarketEvent] = []
+    else:
+        events = await fetch_gamma_slate(
+            http,
+            opts.leagues,
+            opts.horizon_hours,
+            sports=opts.sports,
             max_implied_probability=opts.max_implied_probability,
             min_open_interest_dollars=opts.min_open_interest_dollars,
-        ),
-    )
+        )
+
+    if opts.slugs:
+        extra = await fetch_gamma_events(http, opts.slugs, gamma_sem)
+        seen: set[str] = {ev.id for ev in events}
+        for ev in extra:
+            if ev.id in seen:
+                continue
+            seen.add(ev.id)
+            events.append(ev)
+    return events
 
 
 async def overlay_matchstats_tipoffs(
@@ -252,16 +264,12 @@ async def overlay_matchstats_tipoffs(
     """Overlay MatchStats per-match scheduled tipoffs onto each market's
     `game_start_time`.
 
-    Why: Kalshi's `occurrence_datetime` is session-resolution, not
-    match-resolution. Multiple matches in one tournament-session
-    typically share an `occurrence_datetime` value (verified
-    2026-05-11: 7/8 ATP Rome events on the same day all stamped
-    `12:00Z`). MatchStats's `/tennis/v2/{tour}/fixtures/{date}`
-    `date` field is documented as the per-match scheduled tipoff —
-    sourced from tour-official schedules and authoritative for
-    tennis. Without this overlay, the horizon filter coarsens to
-    "session-resolution" and the user's predict→settle loop can lag
-    by 3-9 hours on event-rich days.
+    Why: gamma's `gameStartTime` is best-effort vendor data and can drift
+    when tour officials reshuffle the session schedule late. MatchStats's
+    `/tennis/v2/{tour}/fixtures/{date}` `date` field is sourced from
+    tour-official schedules and is authoritative for tennis. The overlay
+    runs before `apply_horizon_filter` so the time window cut operates
+    on the most accurate available tipoff.
 
     Implementation:
       1. Build the set of unique `(tour, date_iso)` combinations
@@ -273,19 +281,21 @@ async def overlay_matchstats_tipoffs(
       3. Index returned fixtures by surname-pair (frozenset) and
          look up each event's pair in the matching index.
       4. When a hit lands, overlay the MatchStats tipoff onto every
-         market in the event. Silent fallback to Kalshi's value
+         market in the event. Silent fallback to the gamma value
          when the surname pair isn't in the index (minor matches,
          doubles, walkovers, last-minute reschedules).
 
-    Pre-condition: `events` are already adapter-built `PolymarketEvent`
-    instances with `slug` matching `kalshi/slate.py:_synthesize_slug`
-    (`{tour}-{tournament...}-{lastA}-{lastB}-{yyyy-mm-dd}`).
+    Pre-condition: `events` are `PolymarketEvent` instances whose
+    `slug` carries the tennis canonical shape — `{tour}-{last_a}-{last_b}
+    -{yyyy-mm-dd}` (or `{tour}-{tournament}-{last_a}-{last_b}-{yyyy-mm-dd}`
+    with extra tokens between tour and surnames). `_event_surname_pair`
+    reads the last two pre-date tokens, so either shape works.
     Post-condition: each market's `game_start_time` reflects the most
     accurate available source, NEVER less accurate than before.
 
-    Stub provider returns empty dict from `fetch_fixtures_for_date`
-    so this is a no-op when no MatchStats key is configured —
-    pipeline still runs with Kalshi's session-bucket precision.
+    Stub provider returns empty dict from `fetch_fixtures_for_date` so
+    this is a no-op when no MatchStats key is configured — pipeline
+    still runs with the raw gamma tipoff.
     """
     needed: set[tuple[str, str]] = set()
     for ev in events:
@@ -336,7 +346,7 @@ async def overlay_matchstats_tipoffs(
         # `date`. Early-round Challenger / ITF matches often ship with
         # `date=None` in the fixtures payload — the bracket exists but
         # tour officials haven't confirmed the slot yet. Fall through
-        # to Kalshi's `occurrence_datetime` in that case.
+        # to gamma's `gameStartTime` in that case.
         if fixture.date is not None:
             for i, m in enumerate(ev.markets):
                 ev.markets[i] = m.model_copy(update={"game_start_time": fixture.date})
@@ -358,18 +368,21 @@ def apply_horizon_filter(
     horizon_hours: int,
 ) -> list[PolymarketEvent]:
     """Drop events whose earliest market `game_start_time` falls outside
-    `[now - cfg.KALSHI_HORIZON_BACKSTOP_HOURS, now + horizon_hours]`.
+    `[now - cfg.HORIZON_BACKSTOP_HOURS, now + horizon_hours]`.
 
-    Lifted out of `kalshi/slate.py:fetch_kalshi_slate` so the
-    `overlay_matchstats_tipoffs` stage can run BETWEEN slate-build
-    and horizon-cut, ensuring the filter operates on the most
-    accurate available tipoff (MatchStats > Kalshi). Events without
-    any market `game_start_time` after the overlay are dropped — the
-    slate filter's no-tradable / no-tipoff drops still happen
-    upstream; this stage only enforces the time window.
+    Runs AFTER `overlay_matchstats_tipoffs` so the cut operates on the
+    most accurate available tipoff (MatchStats per-match precision when
+    present, raw gamma `gameStartTime` otherwise). Events without any
+    market `game_start_time` after the overlay are dropped — the slate
+    filter's no-tradable / no-tipoff drops still happen upstream; this
+    stage only enforces the time window.
+
+    The slate-level horizon cut in `polymarket/slate.py:fetch_gamma_slate`
+    uses the same constant — this is the second pass, which can drop
+    events the MatchStats overlay revealed to be outside the window.
     """
     now = datetime.now(tz=UTC)
-    backstop = now - timedelta(hours=cfg.KALSHI_HORIZON_BACKSTOP_HOURS)
+    backstop = now - timedelta(hours=cfg.HORIZON_BACKSTOP_HOURS)
     horizon_end = now + timedelta(hours=horizon_hours)
     kept: list[PolymarketEvent] = []
     dropped = 0
@@ -385,7 +398,7 @@ def apply_horizon_filter(
         kept.append(ev)
     log.info(
         "horizon filter: kept %d events, dropped %d outside [%dh back, +%dh]",
-        len(kept), dropped, cfg.KALSHI_HORIZON_BACKSTOP_HOURS, horizon_hours,
+        len(kept), dropped, cfg.HORIZON_BACKSTOP_HOURS, horizon_hours,
     )
     return kept
 
@@ -399,86 +412,96 @@ def _tour_from_slug(slug: str) -> str | None:
 
 
 def _event_surname_pair(ev: PolymarketEvent) -> frozenset[str] | None:
-    """Pull both surnames from the slate adapter's slug
-    (`{tour}-{tournament}-{lastA}-{lastB}-{yyyy-mm-dd}`) into a
-    `frozenset` keyed the same way `tennis/matchstat.py:
-    _surname_pair_key` indexes fixture rows. Returns None on shape
-    mismatch or singleton-collision (same surname both sides).
+    """Pull both surnames from the event's YES/NO market labels into a
+    `frozenset` keyed the same way `tennis/matchstat.py:_surname_pair_key`
+    indexes fixture rows.
+
+    Reads the FULL player name from `yes_sub_title` on each side rather
+    than parsing the slug. Polymarket truncates surnames to ~7 chars in
+    the slug (`atp-virtane-perrica-2026-05-13` for Virtanen vs Perricard),
+    which would miss the MatchStats index keyed on full surnames.
+    `_surname_token` applies the same canonicalisation MatchStats uses
+    (lowercase, diacritic-strip, alnum-only last token), so the surname
+    pair built here lines up directly with the fixture row keys.
+
+    Returns None if either side lacks a `yes_sub_title`, either surname
+    extracts to empty, or both surnames collide (same surname both sides
+    — would key as a singleton frozenset which the index doesn't carry).
     """
-    if not ev.slug:
+    yes_market = next((m for m in ev.markets if not m.is_no_side and m.yes_sub_title), None)
+    no_market = next((m for m in ev.markets if m.is_no_side and m.yes_sub_title), None)
+    if yes_market is None or no_market is None:
         return None
-    parts = ev.slug.split("-")
-    if len(parts) < 5 or not all(p.isdigit() for p in parts[-3:]):
+    a = _surname_token(yes_market.yes_sub_title)
+    b = _surname_token(no_market.yes_sub_title)
+    if not a or not b or a == b:
         return None
-    fav, dog = parts[-5], parts[-4]
-    if not fav or not dog or fav == dog:
-        return None
-    return frozenset({fav, dog})
+    return frozenset({a, b})
 
 
-async def bridge_uw_context(
+async def resolve_uw_context(
     uw: UnusualWhalesClient,
     events: list[PolymarketEvent],
     sem: asyncio.Semaphore,
     *,
     resolver: GammaTokenResolver,
-    http: httpx.AsyncClient,
 ) -> None:
-    """Attach UW wallet-flow context to Kalshi-sourced events via the
-    Polymarket bridge.
+    """Attach UW wallet-flow context to each event by its native gamma slug.
 
-    UW indexes wallet flow on Polymarket markets, keyed by Polymarket
-    `asset_id` (the YES-side ERC-1155 token). To carry that signal
-    across to a Kalshi-sourced ranker event, we:
+    UW indexes wallet flow on Polymarket markets, keyed by the YES-side
+    ERC-1155 `asset_id`. Since the slate is already gamma-sourced, the
+    event slug is the lookup key directly — no cross-venue surname
+    matching needed.
 
-      1. Fetch all open gamma tennis events ONCE (~126 as of probing
-         2026-05-11) — one HTTP, cached in-memory.
-      2. For each Kalshi event, find the matching Polymarket slug via
-         `polymarket/matcher.py:find_polymarket_slug` (surnames + tour
-         + tipoff window).
-      3. Resolve the slug to its YES-side `asset_id` via the gamma
-         resolver (same one the legacy `resolve_unusual_whales` used).
-      4. GET UW's `/predictions/market/{asset_id}` and attach if it
-         carries an actionable signal.
+    For each event:
+      1. Resolve the FIRST market's slug to `(yes_asset_id, no_asset_id)`
+         via the gamma resolver (cache-shared with the CLOB book + history
+         enrichers, so this is a free re-hit per slug).
+      2. GET UW's `/predictions/market/{yes_asset_id}` for the compact
+         flow snapshot.
+      3. Attach if it carries an actionable signal — skip empty contexts
+         (offshore markets, low-volume events) so the director's UW block
+         isn't rendered as all `?`s.
 
-    Silent degrade at every step — events with no Polymarket sibling,
-    no actionable UW signal, or any HTTP failure leave `uw_context=
-    None`. The pipeline already tolerates this (UW disabled is the
-    same code path).
+    Silent degrade at every step — events with no matching gamma snapshot,
+    no actionable UW signal, or any HTTP failure leave `uw_context=None`.
+    UW disabled at the client level (no API key) is the same code path
+    and short-circuits before any HTTP fires.
 
-    Replaces the legacy `resolve_unusual_whales`. The gamma piggyback
-    fields it also populated (`gamma_spread`, `gamma_one_day_price_
-    change`, etc.) are NOT carried over — they're Polymarket-specific
-    and the director already gates each on `is not None` at
-    `agents/director.py:110-115`, so leaving them None is safe.
+    Per-market gamma piggyback (`gamma_spread`, `gamma_one_day_price_
+    change`, etc.) is populated INSIDE `PolymarketEvent.from_gamma`
+    directly from the listing payload — no separate piggyback merge here.
     """
     if not uw.enabled:
         return
-    try:
-        gamma_payloads = await list_gamma_events(http, tag_slug="tennis")
-    except Exception as e:  # noqa: BLE001
-        log.warning("uw bridge: gamma tennis listing failed (%s); skipping", e)
-        return
-    if not gamma_payloads:
+
+    by_slug: dict[str, list[PolymarketEvent]] = {}
+    for ev in events:
+        # Use the first market slug — gamma's `/markets?slug=` resolves on
+        # per-market slugs, and head-to-head events expose their YES side
+        # as the first market under `from_gamma` (the inverted NO clone
+        # shares the same slug).
+        first_market_slug = next((m.slug for m in ev.markets if m.slug), None)
+        if first_market_slug:
+            by_slug.setdefault(first_market_slug, []).append(ev)
+    if not by_slug:
         return
 
-    async def _one(ev: PolymarketEvent) -> None:
+    async def _one(slug: str, evs: list[PolymarketEvent]) -> None:
         async with sem:
-            slug = find_polymarket_slug(ev, gamma_payloads)
-            if slug is None:
-                return
             snap = await resolver.resolve_snapshot(slug)
             if snap is None or snap.clob_token_ids is None:
                 return
             yes_asset_id, _no_asset_id = snap.clob_token_ids
             ctx = await uw.get_market_detail(yes_asset_id)
             if ctx is not None and ctx.has_actionable_signal():
-                ev.uw_context = ctx
+                for e in evs:
+                    e.uw_context = ctx
 
-    await asyncio.gather(*(_one(ev) for ev in events))
+    await asyncio.gather(*(_one(s, evs) for s, evs in by_slug.items()))
     attached = sum(1 for ev in events if ev.uw_context is not None)
     log.info(
-        "attached unusual-whales context to %d/%d events via polymarket bridge",
+        "attached unusual-whales context to %d/%d events",
         attached, len(events),
     )
 
@@ -1474,25 +1497,25 @@ async def run_pipeline(
     clob_sem = asyncio.Semaphore(cfg.CLOB_FETCH_SEM)
     tennis_sem = asyncio.Semaphore(cfg.TENNIS_STATS_FETCH_SEM)
 
-    # `public_http` is a shared httpx client for both vendors:
-    #   - Kalshi `/events` + `/markets/{ticker}/orderbook` +
-    #     `/series/{s}/markets/{t}/candlesticks` (slate + enrichment).
-    #   - Polymarket gamma `/events?tag_slug=tennis` + `/markets?slug=`
-    #     (UW bridge — the only remaining Polymarket dependency).
-    # Shared so the connection pool is reused across stages.
+    # `public_http` is a shared httpx client for the Polymarket vendors:
+    #   - Gamma `/events` (slate listing), `/markets?slug=` (token-id
+    #     resolution for UW + CLOB enrichment), `/events?slug=` (per-slug
+    #     lookups).
+    #   - CLOB `/book?token_id=...` + `/prices-history?market=...`
+    #     (per-market enrichment).
+    # Shared so the connection pool is reused across stages. Kalshi is
+    # the execution venue (`skims execute`), not a data source — the
+    # ranker doesn't open a Kalshi connection.
     async with (
         UnusualWhalesClient(config.unusual_whales_api_key) as uw,
         httpx.AsyncClient(timeout=20.0) as public_http,
         build_tennis_provider(config) as tennis_provider,
     ):
         gamma_resolver = GammaTokenResolver(public_http)
-        kalshi_client = KalshiClient(
-            base_url=cfg.KALSHI_API_BASE, http=public_http,
-        )
         # `fetch_slate` is the single source of truth used by both
         # `run_pipeline` and the `skims fetch` CLI path. Internally
-        # the Kalshi adapter discovers tennis series, lists events per
-        # series, and adapts each into a `PolymarketEvent` so the
+        # it lists gamma events, applies league + horizon + tradability
+        # filters, and returns `PolymarketEvent` objects so the
         # downstream pipeline (selection / lens dispatch / director /
         # judge / JSONL persistence / retro grading) is unchanged.
         slate_opts = SlateOptions(
@@ -1509,14 +1532,13 @@ async def run_pipeline(
             )
         result.fetched_events = len(events)
 
-        # MatchStats tipoff overlay — replaces Kalshi's session-bucketed
-        # `occurrence_datetime` with per-match precision from
-        # `/tennis/v2/{tour}/fixtures/{date}` where available. Runs
-        # BEFORE the horizon filter so the cut uses the more accurate
-        # source. Stub provider no-ops (returns empty fixtures dict),
-        # so this is free when no MatchStats key is configured —
-        # horizon filter then operates on raw Kalshi times same as
-        # before.
+        # MatchStats tipoff overlay — refines gamma's `gameStartTime`
+        # with per-match precision from `/tennis/v2/{tour}/fixtures/
+        # {date}` where available. Runs BEFORE the horizon filter so
+        # the cut uses the more accurate source. Stub provider no-ops
+        # (returns empty fixtures dict), so this is free when no
+        # MatchStats key is configured — horizon filter then operates
+        # on the raw gamma tipoff.
         with _time_stage(stage_timings, "overlay_matchstats_tipoffs"):
             await overlay_matchstats_tipoffs(events, tennis_provider)
 
@@ -1591,36 +1613,32 @@ async def run_pipeline(
             _emit_timings()
             return result
 
-        # Enrichment stages. UW bridge runs first because it depends on
-        # a one-shot gamma listing call (`tag_slug=tennis`) that can be
-        # done while Kalshi enrichment fires below. Kalshi book +
-        # history enrichers each fan out one HTTP per unique market
-        # ticker.
+        # Enrichment stages. UW context, CLOB book, and CLOB price
+        # history all ride the shared `gamma_resolver` cache for
+        # slug → token_id lookups — first stage to touch a slug pays
+        # the gamma round-trip, subsequent stages hit the cache.
         with _time_stage(stage_timings, "enrich_uw"):
-            await bridge_uw_context(
+            await resolve_uw_context(
                 uw,
                 events,
                 uw_sem,
                 resolver=gamma_resolver,
-                http=public_http,
             )
-        # Kalshi orderbook — top-of-book size, depth, full-book $
-        # totals. One HTTP per unique market ticker. Each side of a
-        # Kalshi event reads its OWN ticker's book (Kalshi exposes
-        # both YES sides as independent native books — load-bearing
-        # difference vs the legacy Polymarket inversion semantics).
-        with _time_stage(stage_timings, "enrich_kalshi_book"):
-            await enrich_kalshi_book(events, kalshi_client, clob_sem)
-        # Optional Kalshi price-history enrichment — opt-in via the
-        # `CLOB_HISTORY_ENABLED` constant in `config.py` (kept the
-        # name during the swap to preserve the env-var contract;
-        # rename to `KALSHI_HISTORY_ENABLED` is a follow-up). When off,
-        # this is a no-op (zero `/candlesticks` calls).
+        # CLOB orderbook — top-of-book size, depth, full-book $ totals.
+        # One HTTP per unique market slug; NO-side clones swap bid/ask
+        # sides off the same YES-token book.
+        with _time_stage(stage_timings, "enrich_clob_book"):
+            await enrich_clob_book(events, gamma_resolver, public_http, clob_sem)
+        # Optional CLOB price-history enrichment — opt-in via the
+        # `CLOB_HISTORY_ENABLED` constant in `config.py`. When off,
+        # this is a no-op (zero `/prices-history` calls).
         if cfg.CLOB_HISTORY_ENABLED:
-            with _time_stage(stage_timings, "enrich_kalshi_history"):
-                await enrich_kalshi_history(events, kalshi_client, clob_sem)
+            with _time_stage(stage_timings, "enrich_clob_history"):
+                await enrich_price_history(
+                    events, gamma_resolver, public_http, clob_sem,
+                )
         else:
-            log.info("kalshi price history disabled (cfg.CLOB_HISTORY_ENABLED=False)")
+            log.info("clob price history disabled (cfg.CLOB_HISTORY_ENABLED=False)")
         # Tennis stats run LAST among enrichers — gated per-event by sport,
         # so deferring its work means non-tennis events have already paid
         # all the upstream gamma/CLOB enrichment costs we want anyway.

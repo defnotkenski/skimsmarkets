@@ -301,19 +301,21 @@ class PolymarketMarket(BaseModel):
     # vs a 500-share rip carry very different information about that
     # last_trade_price.
     last_trade_qty: float | None = None
-    # Dollar volume is derived in `PolymarketClient.get_book` as
-    # `sharesTraded × reference_price` when `notional_traded_dollars` is
-    # absent. When present, `notional_traded_dollars` is the truth and
-    # this number falls back to it for backwards compat.
+    # Lifetime dollar volume from gamma's `volume` field. Fallback /
+    # alias for `notional_traded_dollars` when the latter is absent.
+    # Both are populated by `from_gamma` directly off the gamma listing
+    # payload; the only-`volume`-set case is rare on live H2H markets.
     volume_dollars: float | None = None
-    # `open_interest_dollars` is the canonical name for "outstanding shares ×
-    # price" — what user-facing renderers should read. `liquidity_dollars` is
-    # populated identically and kept as a backwards-compat alias for any
-    # external consumer (logs, downstream tools) that already reads the old
-    # field name. The misleading "liquidity" framing is what we're moving
-    # away from: this number is open interest, NOT order-book depth.
-    # Real CLOB liquidity arrives via `gamma_liquidity_dollars` below when
-    # the gamma piggyback fires.
+    # Gamma's `liquidity` field, copied into both names for backwards-compat.
+    # On the gamma data path this is the **resting CLOB book depth in
+    # dollars** (forward-looking, populated from minute one by market
+    # makers) — empirically equal to `gamma_liquidity_dollars` below
+    # (gamma's `liquidityClob`) on live H2H markets. The field name
+    # `open_interest_dollars` is historical: in the pre-gamma polymarket-us
+    # SDK era it actually was "outstanding shares × price", but gamma's
+    # `liquidity` semantic is book-depth. Renderers and the slate-level
+    # `MIN_OPEN_INTEREST_DOLLARS` filter still read these names, so the
+    # rename is deferred.
     open_interest_dollars: float | None = None
     liquidity_dollars: float | None = None
     # Per-side W/L record string (e.g. "28-6"), pulled from
@@ -338,11 +340,12 @@ class PolymarketMarket(BaseModel):
     gamma_one_day_price_change: float | None = None
     gamma_one_month_price_change: float | None = None
     gamma_competitive: float | None = None
-    # `gamma_liquidity_dollars` is gamma's `liquidityClob` — the *real*
-    # CLOB order-book liquidity in dollars, distinct from our derived
-    # `open_interest_dollars`. Renderers can show both side-by-side so
-    # the LLM sees "how much sits on the book" and "how much is held" as
-    # separate signals.
+    # `gamma_liquidity_dollars` is gamma's `liquidityClob` — resting CLOB
+    # order-book depth in dollars. Empirically equal to
+    # `open_interest_dollars` (gamma `liquidity`) on live H2H markets;
+    # kept as a separate field so the source is greppable in JSONL logs
+    # and so a future gamma schema split between the two fields wouldn't
+    # silently collapse them.
     gamma_liquidity_dollars: float | None = None
     gamma_volume_dollars: float | None = None
     gamma_accepting_orders: bool | None = None
@@ -1160,6 +1163,14 @@ def _is_non_moneyline_gamma_slug(slug: str) -> bool:
     `-assists-`) and a first-half moneyline (`-1h-moneyline`) inline next
     to the full-match moneyline — same pattern as set-handicap, also
     filtered here.
+
+    `-completed-match` is the "did this match complete normally?" yes/no
+    auxiliary that ships inline next to the tennis (and other sport)
+    moneylines. It carries `groupItemTitle="Completed Match"` and a
+    distinct slug suffix; the question resolves on walkover/retirement
+    rather than match winner. Filtered out so a non-zero `--min-oi`
+    slate filter doesn't drag the event-level MIN down to this market's
+    typical $1-$4 of resting interest.
     """
     s = slug.lower()
     return (
@@ -1178,6 +1189,7 @@ def _is_non_moneyline_gamma_slug(slug: str) -> bool:
         or "-1h-" in s
         or s.endswith("-1h-moneyline")
         or "-nrfi" in s
+        or s.endswith("-completed-match")
         or _PARTIAL_PERIOD_WINNER_RE.search(s) is not None
     )
 

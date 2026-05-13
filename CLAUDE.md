@@ -4,9 +4,9 @@ Orientation for future sessions. Read the code for specifics.
 
 ## What this is
 
-A confidence-ranked list of today's Kalshi tennis matches, **plus
-an opt-in Kalshi trader (`skims execute`) that consumes the ranker's
-JSONL**. The two halves are deliberately separated:
+A confidence-ranked list of today's Polymarket sports markets (tennis
+in v1), **plus an opt-in Kalshi trader (`skims execute`) that consumes
+the ranker's JSONL**. The two halves are deliberately separated:
 
 - **Ranker** (`skims rank` and everything under `pipeline.py`,
   `agents/`, lens providers) is **not** an edge finder. No buy/pass
@@ -17,16 +17,20 @@ JSONL**. The two halves are deliberately separated:
   deterministic trade layer. Reads `logs/runs/<run_id>.jsonl`,
   applies a flag-based filter (no LLM), places Kalshi orders.
 
-Kalshi = data + execution (single venue, tighter loop). Polymarket
-survives only as a UW bridge: gamma `/events?tag_slug=tennis`
-provides the slug Kalshi events resolve to so Unusual Whales wallet
-flow can attach to `event.uw_context`. If you're adding trade logic
-to the ranker, you're in the wrong package — push it into `execute/`.
+**Dual-venue.** Polymarket = data (gamma `/events` for slate, gamma
+`/markets?slug=` for token-id resolution, CLOB `/book` + `/prices-
+history` for per-market enrichment). Kalshi = execution (RSA-signed
+`POST /portfolio/orders`). Cross-venue bridge: surname matching at
+trade time in `kalshi/matcher.py` — Polymarket-sourced predictions
+that have no Kalshi counterpart drop with `MatchOutcome.kind=
+"no_kalshi_match"`. The single-venue collapse was tried briefly
+(2026-05-11 → 2026-05-12) and reverted on data-quality grounds; the
+split is intentional. If you're adding trade logic to the ranker,
+you're in the wrong package — push it into `execute/`.
 
-`PolymarketEvent` is the venue-neutral pipeline event type despite
-the misleading name — Kalshi-sourced events are also `PolymarketEvent`
-instances, built by `kalshi/slate.py`. Rename to `MarketEvent` is
-deferred to avoid touching ~84 call sites + the JSONL schema.
+`PolymarketEvent` is the pipeline event type (now correctly named
+since the slate is Polymarket-sourced again). Built by
+`polymarket/slate.py:fetch_gamma_slate` → `PolymarketEvent.from_gamma`.
 
 ## Toolchain
 
@@ -37,19 +41,19 @@ deferred to avoid touching ~84 call sites + the JSONL schema.
 ## Pipeline shape
 
 ```
-kalshi /series + /events  →  pre-LLM selection (fundamental imbalance)
-                          →  per-sport lens chains (provider fetcher → Claude reasoner, parallel)
-                          →  Claude director per event (synthesises lens reports)
-                          →  Claude judge over the slate (defensibility score)
-                          →  deterministic post-processing (rendering, ranking, JSONL persistence)
+gamma /events  →  CLOB book + price-history enrichment
+               →  pre-LLM selection (fundamental imbalance)
+               →  per-sport lens chains (provider fetcher → Claude reasoner, parallel)
+               →  Claude director per event (synthesises lens reports)
+               →  Claude judge over the slate (defensibility score)
+               →  deterministic post-processing (rendering, ranking, JSONL persistence)
 ```
 
 LLMs only in the agent layer; everything else is deterministic.
-Data + execution venue: `api.elections.kalshi.com` (public reads:
-`/series`, `/events`, `/markets/{ticker}/orderbook`,
-`/series/{s}/markets/{t}/candlesticks`. RSA-signed POST `/portfolio/
-orders` — opt-in via `skims execute`). UW bridge: `gamma-api.
-polymarket.com /events?tag_slug=tennis` (one HTTP per pipeline run).
+Data hosts: `gamma-api.polymarket.com` (slate listing, slug→token-id),
+`clob.polymarket.com` (order book + price history). Execution host:
+`api.elections.kalshi.com` (RSA-signed POST `/portfolio/orders`,
+opt-in via `skims execute`).
 
 ## Where things live
 
@@ -59,11 +63,12 @@ polymarket.com /events?tag_slug=tennis` (one HTTP per pipeline run).
 | `src/skimsmarkets/cli.py` | `skims` entry point (rank / fetch / backtest / retro / gbt / execute) |
 | `src/skimsmarkets/agents/` | LLM layer (director, reasoners, judge, fetcher providers) |
 | `src/skimsmarkets/agents/sports/<sport>/` | Per-sport lens registration |
-| `src/skimsmarkets/polymarket/` | UW bridge: `PolymarketEvent` model (venue-neutral type), `find_polymarket_slug` reverse matcher |
+| `src/skimsmarkets/polymarket/` | Slate + CLOB enrichment: `slate.py` (gamma `/events` listing), `enrichment.py` (CLOB book + history), `models.py` (`PolymarketEvent`, `PolymarketMarket`, `from_gamma`) |
+| `src/skimsmarkets/clob/` | Bare CLOB HTTP fetchers (book + price history) + summarizers — shared by live + backtest |
 | `src/skimsmarkets/tennis/` | Tennis stats vendor (MatchStat) + sim |
-| `src/skimsmarkets/unusual_whales/` | UW flow context (gamma slug → asset_id → wallet flow) |
+| `src/skimsmarkets/unusual_whales/` | UW flow context + gamma slug → asset_id resolver (shared cache with CLOB enrichment) |
 | `src/skimsmarkets/retro/` | Self-improvement layer (`skims retro`) |
-| `src/skimsmarkets/kalshi/` | Kalshi venue adapter — `slate.py` (Polymarket → Kalshi data swap), `enrichment.py` (book + history), `client.py` (read + RSA-signed orders), `matcher.py` |
+| `src/skimsmarkets/kalshi/` | Kalshi execution venue — `client.py` (events read + RSA-signed orders), `matcher.py` (surname-pair matching, used at trade time) |
 | `src/skimsmarkets/execute/` | Deterministic trader: ranked JSONL → Kalshi orders |
 | `logs/runs/<run_id>.jsonl` | One file per pipeline run |
 | `logs/trades/<run_id>.jsonl` | Audit log for one `skims execute` invocation |
@@ -73,16 +78,24 @@ polymarket.com /events?tag_slug=tennis` (one HTTP per pipeline run).
 - **Sport-keyed lens registry is strict.** Events with no registered
   sport drop at `lens_dispatch` BEFORE enrichment fan-out. Adding a
   sport: build `agents/sports/<sport>/`, register in `SPORT_LENS_SETS`.
-- **Kalshi bid/ask is a PRIOR, not a ceiling.** The director can
+- **Polymarket bid/ask is a PRIOR, not a ceiling.** The director can
   name the market underdog as winner when synthesis genuinely supports
   it. Don't soften "pull back toward the market" language back into
   the prompt.
-- **Both Kalshi YES sides are independent books.** A tennis match
-  event holds two `KalshiMarket` records (one per player), each with
-  its own native YES book. The slate adapter constructs one
-  `PolymarketMarket` per side reading prices/depth directly from that
-  side — never inverts the favorite's book. Don't reintroduce
-  `inverted_no_side` semantics on the Kalshi data path.
+- **Tennis NO-clone inversion is one-sided in CLOB enrichment.**
+  `PolymarketEvent.from_gamma` synthesises one inverted NO clone per
+  binary head-to-head via `PolymarketMarket.inverted_no_side`. The
+  CLOB book + history endpoints expose data per-token, so the YES
+  token's data is fetched once and applied to both clones — bid/ask
+  sides swap on the NO clone for the book, scalars sign-flip for
+  history. Don't fetch the NO token separately; it's the same book
+  inverted.
+- **Cross-venue surname matching is the trade-time bridge.** The
+  Polymarket-sourced JSONL row carries no Kalshi ticker. `execute/`
+  pre-fetches Kalshi events at trade time and routes each prediction
+  to a `KalshiMarket` via player-surname pair (in `kalshi/matcher.py`).
+  Some Polymarket events have no Kalshi counterpart — that's an
+  expected `MatchOutcome.kind="no_kalshi_match"` skip, not an error.
 - **`confidence` measures real-world contingency robustness**, not
   matchup lopsidedness. Lens-internal agreement is what
   `defensibility_score` measures separately.
