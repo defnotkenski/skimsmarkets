@@ -658,12 +658,13 @@ Per-lens weighting heuristics (for `specialist_weights`):
 - Best-of-3 R64/R32 with evenly-matched players: weights are diffuse,
   ~0.33 each.
 
-`specialist_weights` keys MUST be exactly:
+`specialist_weights` is a list of objects with `lens_name` and `weight`.
+The `lens_name` values MUST be exactly (one entry per lens):
 - `tennis_form_and_surface`
 - `tennis_matchup_and_clutch`
 - `tennis_conditions_and_context`
 
-Values should approximately sum to 1.
+Weights should approximately sum to 1.
 
 The `confidence` tier follows the cross-sport contingency-robustness
 framing above — count how many independent real-world contingencies

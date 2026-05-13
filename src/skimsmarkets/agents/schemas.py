@@ -215,6 +215,40 @@ class RetractedShift(BaseModel):
     )
 
 
+class SpecialistWeight(BaseModel):
+    """One per-lens weight entry in the director's synthesis.
+
+    Used as the element type of `EventPrediction.specialist_weights` so the
+    field can carry a JSON-schema `minItems: 1` constraint that Anthropic's
+    structured-output compiler enforces during generation. Previously this
+    was a `dict[str, float]` with `min_length=1` (→ `minProperties: 1`),
+    which Anthropic does NOT enforce during generation — the model would
+    frequently emit `{}` and parse retries had to clean up. List-of-records
+    sidesteps the unenforced-constraint trap.
+
+    Downstream consumers (audit JSONL, judge prompt, retro readers) still
+    see a `dict[str, float]` shape via projection at the EventPrediction
+    boundary; this list type is only the wire format between the model
+    and Pydantic validation.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    lens_name: str = Field(
+        description=(
+            "Exact lens name from the active LensSet — e.g. for tennis: "
+            "'tennis_form_and_surface' / 'tennis_matchup_and_clutch' / "
+            "'tennis_conditions_and_context'. Must match the report block "
+            "names verbatim."
+        ),
+    )
+    weight: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Weight in [0, 1]. Sum across all entries should roughly equal 1.",
+    )
+
+
 class EventPrediction(BaseModel):
     """Event-level synthesis emitted by the director (LLM output).
 
@@ -249,26 +283,27 @@ class EventPrediction(BaseModel):
             "contingency could flip it IS still high confidence."
         ),
     )
-    # Position note: `specialist_weights` is placed BEFORE `headline` /
-    # `reasoning` (which are always-emitted strings) so it's never the
-    # last field in the wire output. The downstream fields
-    # (`disagreements_flagged`, `uw_flow_note`, `retracted_shifts`) all
-    # default to empty/None and the model often omits them — if
-    # `specialist_weights` were last in those cases, an empty `{}` value
-    # tends to trigger a trailing-comma grammar bug in Anthropic's
-    # structured-output compiler (`{},}`). Keeping `headline` and
-    # `reasoning` after it works around that. See director.py for the
-    # complementary prompt-level instruction that names the lens keys.
-    specialist_weights: dict[str, float] = Field(
+    # `specialist_weights` is a `list[SpecialistWeight]` rather than a
+    # `dict[str, float]` so the `min_length=1` constraint generates JSON
+    # schema `minItems: 1` (which Anthropic's structured-output compiler
+    # DOES enforce during generation) instead of `minProperties: 1`
+    # (which it does NOT enforce — verified against their docs). The
+    # model is structurally prevented from emitting an empty list, which
+    # closes out the long-running empty-`{}` + trailing-comma failure
+    # cluster that the per-event retry loop had been masking. Downstream
+    # consumers project this back to a `dict[str, float]` at the
+    # EventPrediction → MarketPrediction boundary; the JSONL audit shape
+    # and retro readers continue to see the dict form.
+    specialist_weights: list[SpecialistWeight] = Field(
         min_length=1,
         description=(
-            "Per-specialist weight in [0,1]; should roughly sum to 1. Keys are the "
-            "lens names declared by the active LensSet (e.g. tennis emits "
+            "One entry per lens you weighted in the synthesis. Each entry has "
+            "`lens_name` (exact name from the active LensSet — for tennis: "
             "'tennis_form_and_surface' / 'tennis_matchup_and_clutch' / "
-            "'tennis_conditions_and_context'). REQUIRED: must contain one entry "
-            "per lens in the active set — empty dict is not acceptable. Without "
-            "these weights the slate judge's specialist-weights diffusion "
-            "defensibility check (`agents/judge.py`) cannot fire."
+            "'tennis_conditions_and_context') and `weight` in [0, 1]. Weights "
+            "across entries should roughly sum to 1. REQUIRED: must contain at "
+            "least one entry — the empty list is rejected by the schema's "
+            "minItems constraint."
         ),
     )
     headline: str = Field(

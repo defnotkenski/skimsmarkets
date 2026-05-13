@@ -120,9 +120,10 @@ Cross-sport synthesis rules:
       coming off back-to-back deciders and a fitness scare would end it. Also
       use 'low' when the specialists themselves mostly reported `confidence='low'`
       — your robustness can't exceed the data quality you're built on.
-- specialist_weights keys must be the exact lens names declared by your sport's
-  lens set (the sport-specific tail below names them). Values should approximately
-  sum to 1.
+- specialist_weights is a list of objects, each with `lens_name` (must match the
+  exact lens names declared by your sport's lens set — the sport-specific tail
+  below names them) and `weight` in [0, 1]. Weights across entries should
+  approximately sum to 1.
 
 If a "Flow signals (Unusual Whales, side='<team>'...)" block appears in the event context, it
 is raw on-chain flow data from Polymarket — wallet behavior reads on the same orderbook the

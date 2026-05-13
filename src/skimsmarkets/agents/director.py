@@ -187,22 +187,19 @@ def _render_user_message(
         )
     reports_str = "\n\n".join(report_blocks)
 
-    # Explicit specialist_weights instruction. Anthropic's structured-
-    # output compiler does NOT enforce `minProperties: 1` during
-    # generation (verified against their docs — object cardinality
-    # constraints are post-hoc only), so without this nudge the model
-    # frequently emits `"specialist_weights": {}` on attempt 1 and the
-    # Pydantic retry loop has to do the work. Listing the lens keys
-    # inline preempts the empty-dict failure (and the downstream
-    # trailing-comma grammar bug it sometimes triggers) so attempt 1
-    # lands cleanly. Keys are pulled from the active LensSet so this
-    # stays sport-agnostic — works for any future sport without code.
-    lens_keys = ", ".join(spec.name for spec in lens_set.lenses)
+    # Explicit specialist_weights instruction. `specialist_weights` is a
+    # `list[SpecialistWeight]` (each with `lens_name` + `weight`) precisely
+    # so the schema's `min_length=1` generates `minItems: 1`, which
+    # Anthropic's structured-output compiler DOES enforce during
+    # generation. The directive below names the lens_name values inline so
+    # the model doesn't have to look them up from the schema description.
+    # Pulled from `lens_set.lenses` at render time — sport-agnostic.
+    lens_names = ", ".join(f"'{spec.name}'" for spec in lens_set.lenses)
     specialist_weights_directive = (
         f"REQUIRED: populate `specialist_weights` with one entry per lens "
-        f"you weighted in the synthesis. Keys must be the exact lens names "
-        f"from the reports above ({lens_keys}). Values are weights in [0, 1] "
-        f"that roughly sum to 1.0. An empty dict will fail validation."
+        f"you weighted in the synthesis. Each entry is an object with "
+        f"`lens_name` (one of: {lens_names}) and `weight` in [0, 1]. "
+        f"Weights across entries should roughly sum to 1.0."
     )
     return (
         _render_event_context_block(event)
@@ -247,7 +244,13 @@ def _project_to_market_prediction(
         confidence=event_pred.confidence,
         headline=event_pred.headline,
         reasoning=event_pred.reasoning,
-        specialist_weights=event_pred.specialist_weights,
+        # Project the wire-format list[SpecialistWeight] back to the
+        # dict[str, float] shape that MarketPrediction (audit JSONL,
+        # retro readers, judge prompt) expects. List shape only exists
+        # so Anthropic enforces `minItems: 1` during generation.
+        specialist_weights={
+            sw.lens_name: sw.weight for sw in event_pred.specialist_weights
+        },
         disagreements_flagged=event_pred.disagreements_flagged,
         uw_flow_note=event_pred.uw_flow_note,
         retracted_shifts=event_pred.retracted_shifts,
