@@ -27,7 +27,6 @@ htmlcov/
 .vscode/
 
 # Claude Code
-CLAUDE.md
 .claude/
 
 # OS

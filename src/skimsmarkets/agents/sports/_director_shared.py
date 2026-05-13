@@ -31,7 +31,7 @@ from __future__ import annotations
 # after a change without joining against git history. Format is a short
 # semver-ish string; bump the minor on prompt tweaks, the major on
 # breaking schema changes.
-PROMPT_VERSION = "2026.05.09-1"
+PROMPT_VERSION = "2026.05.12-2"
 
 
 DIRECTOR_SHARED_PREAMBLE = """

@@ -27,25 +27,25 @@ MAX_IMPLIED_PROBABILITY = 0.60
 # for binary markets each contract has $1 par value, so the
 # contract count equals dollars-at-par (mirrors Polymarket's
 # `liquidity_dollars` framing). Threshold compares against the
-# MIN OI across markets in the event — both sides must clear so
-# the trader has ask-side liquidity on whichever side the ranker
-# picks. (One-sided liquidity is a trap: an event with $4000 OI
-# on one side and $30 on the other looks active in aggregate but
-# you can't reliably trade the cold side.)
+# MIN OI across markets in the event — both sides must clear.
 #
-# Why this exists: ITF futures (M15/M25/W15-W75) often open with
-# $0/$0 OI on both sides for hours after market creation, and
-# many Challenger early-rounds have one-sided OI for the first
-# day. Trading into a market with no resting interest means you
-# ARE the market — slippage is unbounded. Polymarket didn't expose
-# ITF, so this wasn't a problem; Kalshi does, so we floor below
-# the tier where books are reliably populated.
+# DEFAULT IS OFF (0.0). Live audit on 2026-05-12 showed only 6/311
+# in-window Kalshi tennis events clear $1000 min-OI; the median
+# in-window event has $0 OI on at least one side because Kalshi's
+# resting-order book builds up over hours/days while the bid/ask
+# itself is quoted by market makers from minute one. A $1000 min-OI
+# default was masking 99% of the slate as a side effect.
 #
-# Tunable: 1000 ≈ "1000 contracts at par on both sides" — usually
-# clears most main-tour matches and the more-liquid Challengers,
-# drops fresh ITF events and one-sided Challenger early-rounds.
-# Set to 0 to disable. CLI override: `--min-oi N`.
-MIN_OPEN_INTEREST_DOLLARS = 1000.0
+# Liquidity-gating belongs in the execute layer (`skims execute`),
+# which already filters per-prediction against the SPECIFIC side it
+# wants to buy — see `execute/cli.py`. The ranker doesn't need to
+# pre-filter on tradability because it produces a ranked list, not
+# trades; events the executor can't fill get dropped there.
+#
+# CLI override: `--min-oi N` re-enables the filter for runs that
+# want to mirror executor constraints at slate-build time. Pre-2026-
+# 05-12 default was 1000.0.
+MIN_OPEN_INTEREST_DOLLARS = 0.0
 
 # Cap on the number of events sent through the LLM chain from the default
 # browse. Survivors of all upstream filters (league + horizon + tradability

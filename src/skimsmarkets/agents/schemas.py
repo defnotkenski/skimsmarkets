@@ -262,11 +262,15 @@ class EventPrediction(BaseModel):
         description="3-6 sentences explaining the synthesis and how specialists were weighted.",
     )
     specialist_weights: dict[str, float] = Field(
+        min_length=1,
         description=(
             "Per-specialist weight in [0,1]; should roughly sum to 1. Keys are the "
             "lens names declared by the active LensSet (e.g. tennis emits "
             "'tennis_form_and_surface' / 'tennis_matchup_and_clutch' / "
-            "'tennis_conditions_and_context')."
+            "'tennis_conditions_and_context'). REQUIRED: must contain one entry "
+            "per lens in the active set — empty dict is not acceptable. Without "
+            "these weights the slate judge's specialist-weights diffusion "
+            "defensibility check (`agents/judge.py`) cannot fire."
         ),
     )
     disagreements_flagged: list[str] = Field(

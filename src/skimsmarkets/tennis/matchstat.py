@@ -511,6 +511,21 @@ class MatchStatTennisProvider:
         self._h2h_cache: dict[
             tuple[str, int, int], TennisHeadToHead | None
         ] = {}
+        # Per-fixture cache keyed by `(tour, frozenset({surname_a,
+        # surname_b}))` → the `MatchStatsFixture` returned for that
+        # matchup. Populated as a side effect of
+        # `fetch_fixtures_for_date` (the same call already runs at
+        # slate-overlay time for the tipoff overlay) and read by
+        # `fetch()` so `TennisStatsContext.surface` can pick up the
+        # vendor's `tournament.court.name` for events the slug-prefix
+        # surface map misses (lower tiers, the standard slug format
+        # `{tour}-{lastA}-{lastB}-{date}` carries no tournament token).
+        # Cached for the provider's lifetime; surname-pair collisions
+        # across dates fall back to the latest-written fixture, which
+        # is benign because surface is tournament-property-stable.
+        self._fixture_cache: dict[
+            tuple[str, frozenset[str]], MatchStatsFixture
+        ] = {}
 
     async def __aenter__(self) -> Self:
         headers = {
@@ -834,6 +849,17 @@ class MatchStatTennisProvider:
         info = data.get("information")
         if isinstance(info, dict):
             birth = _parse_iso_date(info.get("birthdate"))
+            if birth is None:
+                # MatchStat dropped `information.birthdate` from this
+                # endpoint as of mid-2025 (verified by probing 2026-05-06
+                # in `gbt_backfill.py`). Synthesise from `turnedPro` —
+                # ATP/WTA average turn-pro age of ~17 — same shape the
+                # backfill path uses. Coarse (actual birth year drifts
+                # ±2y around this) but a noisy age signal beats every
+                # downstream consumer reading None.
+                turned_pro = info.get("turnedPro")
+                if isinstance(turned_pro, str) and turned_pro.isdigit():
+                    birth = date(int(turned_pro) - 17, 7, 1)
             if birth is not None:
                 age_years = _years_between(birth, datetime.now(UTC).date())
             raw_plays = info.get("plays")
@@ -1027,6 +1053,18 @@ class MatchStatTennisProvider:
                     bp_faced = opp_conv_of
                     bp_saved = opp_conv_of - opp_conv
 
+        # Vendor's `best_of` is unpopulated on every probed row — empirically
+        # 0/24 across the recent slate. `parse_score_details` requires
+        # `best_of` to mark deciders (`went_to_decider = n_sets == best_of`),
+        # so a None vendor field silently nukes `career_decider_record` on
+        # every player. Mirror `simulation.detect_best_of`'s tier-based
+        # inference per-row: Grand Slam → 5, everything else → 3. Most
+        # tour-level matches are bo3, so the inferred value is right ≥99%
+        # of the time; the alternative (None for every row) is wrong 100%
+        # of the time.
+        bo = _coerce_int(row.get("best_of"))
+        if bo is None:
+            bo = 5 if tier == "grand_slam" else 3
         return MatchHistoryRow(
             date=row_date,
             opponent_name=opp_name.strip(),
@@ -1038,7 +1076,7 @@ class MatchStatTennisProvider:
             tournament_tier=tier,
             match_completeness=completeness,
             first_serve_win_pct=first_serve_win_pct,
-            best_of=_coerce_int(row.get("best_of")),
+            best_of=bo,
             winner_side=winner_side,
             bp_saved=bp_saved,
             bp_faced=bp_faced,
@@ -2089,8 +2127,19 @@ class MatchStatTennisProvider:
                 tourn_obj.get("court")
                 if isinstance(tourn_obj, dict) else None
             )
-            surface = None
+            # Prefer the courtId path so indoor-hard ("I.hard") collapses
+            # to canonical "hard" via `_COURT_ID_TO_SURFACE` — matches the
+            # vocabulary `TennisPlayerStats.surface_win_loss` and the
+            # tennis sport hint already use. The `include=tournament.court`
+            # expansion ships the court as a nested object with `id`/`name`,
+            # but flat `courtId` exists on some payload shapes too —
+            # check both before falling through to raw lowercased name.
+            surface: str | None = None
             if isinstance(court_obj, dict):
+                surface = _surface_from_court_id(court_obj.get("id"))
+            if surface is None and isinstance(tourn_obj, dict):
+                surface = _surface_from_court_id(tourn_obj.get("courtId"))
+            if surface is None and isinstance(court_obj, dict):
                 court_name = court_obj.get("name")
                 if isinstance(court_name, str) and court_name.strip():
                     surface = court_name.strip().lower()
@@ -2116,6 +2165,13 @@ class MatchStatTennisProvider:
             # rounds advance through the bracket; the first (typically
             # earliest) row is the right pick.
             out.setdefault(key, fixture)
+            # Same first-write-wins for the cross-call fixture cache so
+            # the same-matchup-twice case picks the same fixture both
+            # `out` and the cache resolve to. The cache is keyed by
+            # `(tour, surname-pair)` so `fetch()` can look up the
+            # fixture for a matchup without knowing the date — identity
+            # doesn't carry one.
+            self._fixture_cache.setdefault((tour, key), fixture)
             # Seed the rankings index with fixture-derived IDs so ITF
             # players outside the top-500 ranking still resolve. Only
             # fill empty slots — never overwrite ranked entries (which
@@ -2159,11 +2215,33 @@ class MatchStatTennisProvider:
                 identity.player_b,
             )
 
+        # `identity.surface` is set by `tennis_match_identity` from a
+        # slug-prefix lookup that only matches Slams + Masters/1000s.
+        # For everything else (250s, Challengers, ITF futures, WTA 125s
+        # — and even Slams/Masters whose per-match slug format
+        # `{tour}-{lastA}-{lastB}-{date}` carries no tournament token)
+        # it returns None. The fixtures payload we already fetched at
+        # slate-overlay time carries the vendor's `tournament.court.name`
+        # for the same matchup — fall back to that. `tournament_hint`
+        # gets a parallel upgrade from the cached fixture when the
+        # gamma-question prefix didn't supply one.
+        surface = identity.surface
+        tournament = identity.tournament_hint
+        if surface is None or tournament is None:
+            pair = _surname_pair_key(identity.player_a, identity.player_b)
+            if pair is not None:
+                fixture = self._fixture_cache.get((identity.tour, pair))
+                if fixture is not None:
+                    if surface is None and fixture.surface is not None:
+                        surface = fixture.surface
+                    if tournament is None and fixture.tournament_name is not None:
+                        tournament = fixture.tournament_name
+
         return TennisStatsContext(
             provider=self.name,
             fetched_at=datetime.now(UTC),
-            surface=identity.surface,
-            tournament=identity.tournament_hint,
+            surface=surface,
+            tournament=tournament,
             player_a=player_a,
             player_b=player_b,
             head_to_head=h2h,

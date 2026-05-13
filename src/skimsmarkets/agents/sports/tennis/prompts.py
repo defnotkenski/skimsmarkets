@@ -556,6 +556,26 @@ Material deviations from market (>1000 bps) still require a justification
 sentence in `reasoning` — but "justification" means naming the shifts
 that drive the gap, not apologising for the gap.
 
+Matchup-lens override discipline: when `h2h_signed_shift + clutch_signed_shift`
+nets OPPOSITE to your pick (net sign opposite to the predicted side) AND
+|net| ≥ 0.05, your `reasoning` MUST name the concrete mechanism — a
+specific form/surface data point or court condition present in the
+respective lens reports — by which form/surface evidence overrides the
+matchup/clutch read. A diffuse weighting (e.g. 0.40/0.30/0.30) is NOT a
+mechanism; "lenses agree on net direction" is NOT a mechanism. If you
+cannot name a specific mechanism that is plausibly stronger than the
+matchup/clutch signal, the pick is indefensible at the current
+probability — either pull team_a_p_final at least halfway toward the
+direction the matchup+clutch net points, or drop `confidence` to `low`.
+
+When the pick is ALSO the market underdog (the picked side's implied
+probability < 0.5 — i.e. `polymarket_implied_probability` recorded for
+the predicted side is < 0.5) AND |matchup+clutch net opposed| ≥ 0.05,
+`confidence` MUST be `low`. Going against the market AND against the
+matchup/clutch lens simultaneously is the loss-overrepresented regime
+in retro grading; the system has not earned the right to call medium
+or high confidence on that combination.
+
 Career-baseline Monte Carlo prior (when present): the per-event
 context block may carry a `--- Tennis match simulator ---` block with
 `p(team_a wins)` plus a 95% sampling CI. This is a SECOND deterministic
@@ -571,7 +591,11 @@ Use it as a sanity check on the synthesized read:
   contextual signals netted to roughly zero — fine, no anomaly.
 - If team_a_p_final deviates from the sim by ≥1000 bps (10pp),
   `reasoning` MUST name WHICH lens-shift signals justify the
-  deviation. Same discipline as for material market deviation.
+  deviation — citing the shift FIELD name and VALUE (e.g.
+  `surface_signed_shift = +0.06`), not a free-text gesture toward
+  the lens generically. At least one cited shift must have magnitude
+  ≥ 0.05 — a 10pp deviation cannot be carried by a stack of
+  sub-0.02 shifts. Same discipline as for material market deviation.
 - Sim DISAGREES with market: sim is a long-run prior, market is
   current sentiment. A gap between them is itself information — the
   market may be reading a contextual factor the sim ignores by
@@ -600,7 +624,11 @@ Use it together with the sim as the deterministic backstop:
   contextual deltas the sim ignores point one way.
 - If team_a_p_final deviates from the GBT by ≥1000 bps (10pp),
   `reasoning` MUST name WHICH lens-shift signals justify the
-  deviation. Same discipline as for material market and sim
+  deviation — citing the shift FIELD name and VALUE (e.g.
+  `surface_signed_shift = +0.06`), not a free-text gesture toward
+  the lens generically. At least one cited shift must have magnitude
+  ≥ 0.05 — a 10pp deviation cannot be carried by a stack of
+  sub-0.02 shifts. Same discipline as for material market and sim
   deviation.
 - The GBT's `top_features` list shows what the model leaned on for
   THIS prediction (per-row SHAP, anchor-relative). Read it as a
