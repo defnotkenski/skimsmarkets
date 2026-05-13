@@ -16,6 +16,19 @@ Step 5: report
 
 Each step gates the next. Failing the gate at any step aborts the routine and reports — that's the normal happy path for "nothing to do today."
 
+## Error handling (applies to every step)
+
+**If ANY command fails — non-zero exit, network error, unexpected output, parse failure, anything — STOP IMMEDIATELY.** "Stop" means:
+
+- **Do NOT proceed to the next step.** No matter what step you're on.
+- **Do NOT retry the failed command.** Kalshi orders are not idempotent across retries; even read-only commands shouldn't be re-fired blindly.
+- **Do NOT try to diagnose or fix the cause.** No editing config files, no installing packages, no running additional shell commands to investigate. The only allowed follow-up is reading captured stderr / the most recent JSONL log via `Read` for context to include in your report.
+- **Do NOT continue silently past the failure.** A step's failure means the routine is done for this fire.
+
+Emit a final report with: which step failed, the exit code, the captured stderr (verbatim), and the relevant log path if one exists (`logs/runs/<run_id>.jsonl` for rank failures, `logs/trades/<run_id>.jsonl` for execute failures). Then exit. A human will investigate outside the routine.
+
+This applies to ALL steps. The per-step decision logic below distinguishes "abort clean" (the step intentionally produced an empty result — nothing to trade today, exit normally) from "abort error" (the step failed unexpectedly — also stop, but flag as error in the report). In both cases: stop. Do not continue.
+
 ## Step 1 — Exposure pre-flight
 
 ```
