@@ -126,8 +126,3 @@ def trades_log_path(run_id: str) -> Path:
     return _TRADES_ROOT / f"{run_id}.jsonl"
 
 
-def trades_log_root() -> Path:
-    """Module-resolved path to `logs/trades/`. Used by the calendar-day
-    spend tally — it globs every `*.jsonl` here and sums today's fills.
-    """
-    return _TRADES_ROOT

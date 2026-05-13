@@ -156,9 +156,13 @@ KALSHI_TENNIS_SERIES_TICKERS: tuple[str, ...] = (
 # All money is in CENTS (integer). 100 = $1.00, 2500 = $25.00, 100000 = $1000.
 # CLI flags override per-invocation; constants here are the defaults.
 
-# Per-trade spend cap. Passed to Kalshi as `buy_max_cost` on each market
-# buy. Kalshi fills as many whole contracts as fit at current asks; if the
-# book is thin, actual fill cost may be slightly less than this.
+# Per-trade spend cap. Worst-case order spend is enforced by sizing
+# `count = bet_size_cents // yes_price_cents` (floor-div) and sending
+# `yes_price = current_ask + KALSHI_MARKET_ORDER_SLIPPAGE_CENTS`, so
+# `count × yes_price ≤ bet_size_cents` as a hard ceiling. We deliberately
+# DON'T pass Kalshi's `buy_max_cost` field — per Kalshi's docs that
+# forces FOK behaviour which rejects on insufficient resting volume
+# (the common case for thin tennis books).
 # Common values: 100 ($1) for smoke tests, 2500 ($25) typical, 10000 ($100).
 KALSHI_DEFAULT_BET_SIZE_CENTS = 2500
 
@@ -179,13 +183,17 @@ KALSHI_MARKET_ORDER_SLIPPAGE_CENTS = 5
 # leave it pinned; adjust `bet_size_cents` underneath as needed.
 KALSHI_DEFAULT_MAX_POSITION_CENTS = 5000
 
-# Calendar-day spend ceiling (UTC). Summed across every `logs/trades/*.jsonl`
-# row whose `audit_timestamp` is today. Survives multiple ranker runs in
-# one day — if you run rank + execute twice and trade $20 each time, the
-# second run will refuse the $21st dollar with cap=4000.
-# Sizing rule of thumb: ≥ N × bet_size_cents where N is "max trades I
-# expect to place per day". A 25-trade day at $25/trade = 62500.
-KALSHI_DEFAULT_MAX_DAILY_SPEND_CENTS = 25000
+# Portfolio open-exposure ceiling. Read live from Kalshi's
+# `/portfolio/positions` (`market_exposure_dollars` summed across all
+# markets with non-zero contract count) at the start of every
+# `skims execute` invocation; this run's pending fills accumulate on
+# top, and each trade's `bet_size_cents` ceiling is the per-trade
+# delta. Refuses to place when the projected total would exceed this
+# cap. Replaced the calendar-day flow cap on 2026-05-12 — "how much
+# do I currently have at risk" is the metric most users actually
+# monitor, and the API field lets us check it directly against the
+# live account state.
+KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS = 10000
 
 # --- Filter-flag defaults for `skims execute` ------------------------------
 # Empty tuple / None / False here = filter is OFF (every row passes).

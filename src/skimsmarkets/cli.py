@@ -279,7 +279,7 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         dry_run=not args.live,
         bet_size_cents=args.bet_size_cents,
         max_position_cents=args.max_position_cents,
-        max_daily_spend_cents=args.max_daily_spend_cents,
+        max_open_exposure_cents=args.max_open_exposure_cents,
         confidence=confidence,
         min_defensibility=min_defensibility,
         no_negative_edge=no_negative_edge,
@@ -302,6 +302,63 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
             f"{k}={v}" for k, v in sorted(summary.skip_reasons.items())
         )
         print(f"skip reasons: {reasons}")
+    return 0
+
+
+async def _cmd_positions(args: argparse.Namespace) -> int:
+    """Print live Kalshi open-exposure summary in key=value form.
+
+    Authenticated GET `/portfolio/positions?count_filter=position`, sums
+    `market_exposure_dollars` across markets with non-zero contract
+    count, and prints exposure + cap + headroom + can_place_bet for
+    consumption by scheduled trading routines (the cloud routine
+    playbook parses this output to decide whether to proceed to rank +
+    execute). Same arithmetic as the trader's pre-flight gate, exposed
+    as a standalone subcommand so the orchestrator doesn't need a
+    Python snippet.
+    """
+    from skimsmarkets.execute.trader import sum_exposure_cents
+    from skimsmarkets.kalshi.client import KalshiClient
+
+    config = cfg.Config.from_env(require_llm=False)
+    has_credentials = bool(
+        config.kalshi_api_key_id
+        and (config.kalshi_private_key_path or config.kalshi_private_key_pem)
+    )
+    if not has_credentials:
+        print(
+            "ERROR: skims positions needs Kalshi credentials. Set "
+            "KALSHI_API_KEY_ID and either KALSHI_PRIVATE_KEY_PATH or "
+            "KALSHI_PRIVATE_KEY_PEM.",
+            file=sys.stderr,
+        )
+        return 1
+
+    async with httpx.AsyncClient(timeout=20.0) as http:
+        client = KalshiClient(
+            base_url=cfg.KALSHI_API_BASE,
+            http=http,
+            api_key_id=config.kalshi_api_key_id,
+            private_key_path=config.kalshi_private_key_path,
+            private_key_pem=config.kalshi_private_key_pem,
+        )
+        positions = await client.list_positions()
+
+    exposure = sum_exposure_cents(positions)
+    cap = args.max_open_exposure_cents
+    bet = args.bet_size_cents
+    headroom = cap - exposure
+    can_place = exposure + bet <= cap
+
+    print(f"open_exposure_cents={exposure}")
+    print(f"open_exposure_dollars={exposure / 100:.2f}")
+    print(f"max_open_exposure_cents={cap}")
+    print(f"max_open_exposure_dollars={cap / 100:.2f}")
+    print(f"headroom_cents={headroom}")
+    print(f"headroom_dollars={headroom / 100:.2f}")
+    print(f"bet_size_cents={bet}")
+    print(f"can_place_bet={'true' if can_place else 'false'}")
+    print(f"positions_count={len(positions)}")
     return 0
 
 
@@ -350,7 +407,9 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
 # user invoked `skims` with bare slate flags (no subcommand) so we can default
 # to `rank`. Kept as a module-level constant so the default-injection in
 # `main()` and the subparser registration stay in sync.
-_SUBCOMMANDS = ("rank", "fetch", "backtest", "retro", "gbt", "execute")
+_SUBCOMMANDS = (
+    "rank", "fetch", "backtest", "retro", "gbt", "execute", "positions",
+)
 
 
 def _build_slate_parser() -> argparse.ArgumentParser:
@@ -455,7 +514,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     slate = _build_slate_parser()
     sub = parser.add_subparsers(
-        dest="command", metavar="{rank,fetch,backtest,retro,gbt,execute}"
+        dest="command",
+        metavar="{rank,fetch,backtest,retro,gbt,execute,positions}",
     )
 
     p_rank = sub.add_parser(
@@ -518,8 +578,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=cfg.KALSHI_DEFAULT_BET_SIZE_CENTS,
         metavar="N",
         help=(
-            "Hard spend cap per trade in cents (passed to Kalshi as "
-            f"`buy_max_cost`). Default: {cfg.KALSHI_DEFAULT_BET_SIZE_CENTS} "
+            "Hard spend cap per trade in cents. Enforced via "
+            "`count = bet_size_cents // yes_price_cents` (floor-div) "
+            f"so worst-case spend is bounded. Default: "
+            f"{cfg.KALSHI_DEFAULT_BET_SIZE_CENTS} "
             "(${:.2f}).".format(cfg.KALSHI_DEFAULT_BET_SIZE_CENTS / 100)
         ),
     )
@@ -536,16 +598,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_execute.add_argument(
-        "--max-daily-spend-cents",
+        "--max-open-exposure-cents",
         type=int,
-        default=cfg.KALSHI_DEFAULT_MAX_DAILY_SPEND_CENTS,
+        default=cfg.KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS,
         metavar="N",
         help=(
-            "Calendar-day spend cap (UTC). The trader globs every "
-            "`logs/trades/*.jsonl`, sums today's fills, adds the "
-            "current trade's ceiling, and refuses if the total would "
-            "exceed this. Default: "
-            f"{cfg.KALSHI_DEFAULT_MAX_DAILY_SPEND_CENTS}."
+            "Portfolio exposure cap. The trader reads Kalshi's open "
+            "positions (`market_exposure_dollars` summed across markets "
+            "with non-zero contract count), adds this run's pending "
+            "fills + the current trade's ceiling, and refuses if the "
+            "total would exceed this. Default: "
+            f"{cfg.KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS}."
         ),
     )
     # Filter flags use `default=None` so we can distinguish "user
@@ -607,6 +670,37 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_execute.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging.",
+    )
+
+    p_positions = sub.add_parser(
+        "positions",
+        help=(
+            "Print live Kalshi open-exposure summary in key=value form "
+            "(used by scheduled trading routines to gate further work)."
+        ),
+    )
+    p_positions.add_argument(
+        "--max-open-exposure-cents",
+        type=int,
+        default=cfg.KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS,
+        metavar="N",
+        help=(
+            "Exposure cap to compare against. Default matches "
+            f"`skims execute`: {cfg.KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS}."
+        ),
+    )
+    p_positions.add_argument(
+        "--bet-size-cents",
+        type=int,
+        default=cfg.KALSHI_DEFAULT_BET_SIZE_CENTS,
+        metavar="N",
+        help=(
+            "Per-trade bet size used to compute can_place_bet. Default "
+            f"matches `skims execute`: {cfg.KALSHI_DEFAULT_BET_SIZE_CENTS}."
+        ),
+    )
+    p_positions.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging.",
     )
 
@@ -754,6 +848,7 @@ def main() -> int:
         "retro": _cmd_retro,
         "gbt": _cmd_gbt,
         "execute": _cmd_execute,
+        "positions": _cmd_positions,
     }
     return asyncio.run(dispatch[args.command](args))
 

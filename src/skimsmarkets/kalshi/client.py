@@ -36,6 +36,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from skimsmarkets.kalshi.models import (
     KalshiEvent,
+    MarketPosition,
     OrderRequest,
     OrderResponse,
 )
@@ -213,6 +214,62 @@ class KalshiClient:
             if not cursor:
                 break
         return sorted(out)
+
+    # ------------------------------------------------------------------
+    # Signed, authed reads
+    # ------------------------------------------------------------------
+
+    async def list_positions(self) -> list[MarketPosition]:
+        """`GET /portfolio/positions?count_filter=position` — open positions only.
+
+        Returns one `MarketPosition` per market with non-zero contract
+        count. `count_filter=position` is the documented way to exclude
+        closed/settled markets (which carry `position_fp=0`), so we
+        don't have to filter client-side. Pages via `cursor` until
+        exhausted.
+
+        Signed with the same RSA-PSS trio as `place_order` — Kalshi
+        treats `/portfolio/*` reads as authed even though they're GETs.
+        """
+        has_key_material = bool(
+            self._private_key_path or self._private_key_pem
+        )
+        if not self._api_key_id or not has_key_material:
+            raise RuntimeError(
+                "Kalshi credentials missing — set KALSHI_API_KEY_ID and "
+                "EITHER KALSHI_PRIVATE_KEY_PATH (file path) or "
+                "KALSHI_PRIVATE_KEY_PEM (inline PEM contents) to read "
+                "open positions."
+            )
+        endpoint_path = "/portfolio/positions"
+        signed_path = f"/trade-api/v2{endpoint_path}"
+        positions: list[MarketPosition] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, str] = {
+                "count_filter": "position",
+                "limit": "200",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            # Re-sign per request — the timestamp is part of the signed
+            # message, so a cursor loop that spans more than a few
+            # seconds would fail with a single cached signature.
+            headers = self._sign(method="GET", path=signed_path)
+            r = await self._http.get(
+                f"{self._base}{endpoint_path}",
+                params=params,
+                headers=headers,
+                timeout=20.0,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            for raw in payload.get("market_positions", []):
+                positions.append(MarketPosition.model_validate(raw))
+            cursor = payload.get("cursor") or None
+            if not cursor:
+                break
+        return positions
 
     # ------------------------------------------------------------------
     # Signed, authed writes

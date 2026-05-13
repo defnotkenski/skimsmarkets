@@ -73,6 +73,38 @@ class KalshiEvent(BaseModel):
     markets: list[KalshiMarket] = Field(default_factory=list)
 
 
+class MarketPosition(BaseModel):
+    """One open position on a Kalshi market — used by the exposure cap gate.
+
+    Kalshi returns ONE row per market with `position_fp` signed (positive
+    = YES contracts, negative = NO contracts), so the YES/NO sides are
+    already netted into a single number. No double-counting risk when
+    summing `market_exposure_dollars` across rows.
+
+    `market_exposure_dollars` is the cost basis of the aggregate position
+    in dollars — for a long YES position at price p with count N, this
+    equals N × p (also the worst-case loss). Sent as a FixedPointDollars
+    string (`"22.540000"`); coerced to float here so the trader can
+    multiply by 100 to compare against cent-denominated caps.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    ticker: str
+    position_fp: float | None = None
+    market_exposure_dollars: float | None = None
+
+    @field_validator("position_fp", "market_exposure_dollars", mode="before")
+    @classmethod
+    def _coerce_float(cls, v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+
 class OrderRequest(BaseModel):
     """Wire-format payload for `POST /portfolio/orders`.
 

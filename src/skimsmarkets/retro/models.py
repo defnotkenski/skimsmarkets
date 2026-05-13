@@ -104,10 +104,10 @@ class TradeRow(BaseModel):
     """One `record_type="trade"` JSONL row in `logs/trades/<run_id>.jsonl`.
 
     Written by `skims execute`, one per filtered prediction row —
-    whether the trade was placed, skipped, or dry-run. The audit log
-    is the source of truth for the calendar-day spend cap (the trader
-    globs every `*.jsonl` under `logs/trades/` and sums today's
-    `fill_total_cost_cents`).
+    whether the trade was placed, skipped, or dry-run. The same run's
+    log is also read by `executed_event_ids()` for intra-run idempotency
+    (don't re-place an order whose event already has an executed audit
+    row).
 
     Identity fields (`event_id`, `market_slug`) link back to the
     source `PredictionRow` for retro joins. Diagnostic fields
@@ -148,9 +148,9 @@ class TradeRow(BaseModel):
     fill_avg_price_cents: int | None = None
     # Kalshi fees on the fill (taker + maker). Charged on top of
     # `fill_total_cost_cents` — the account is debited the sum.
-    # The daily-spend cap uses `fill_total_cost_cents` only (matches
-    # the budget knob `bet_size_cents` semantics); fees are recorded
-    # here for transparency and retro analysis.
+    # The exposure-cap accumulator uses `fill_total_cost_cents` only
+    # (matches the budget knob `bet_size_cents` semantics); fees are
+    # recorded here for transparency and retro analysis.
     fill_fees_cents: int = 0
     fill_status: Literal[
         "filled", "partial", "skipped_dry_run", "skipped", "submitted",

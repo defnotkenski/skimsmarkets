@@ -19,12 +19,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from skimsmarkets.execute.filters import filter_rows  # noqa: E402
+from skimsmarkets.execute.trader import sum_exposure_cents  # noqa: E402
 from skimsmarkets.kalshi.matcher import (  # noqa: E402
     extract_match_players,
     find_kalshi_match,
     last_token,
 )
-from skimsmarkets.kalshi.models import KalshiEvent  # noqa: E402
+from skimsmarkets.kalshi.models import KalshiEvent, MarketPosition  # noqa: E402
 from skimsmarkets.retro.models import PredictionRow  # noqa: E402
 
 
@@ -384,6 +385,43 @@ def _t_filter_sport() -> int:
 
 
 # ---------------------------------------------------------------------------
+# sum_exposure_cents — open-exposure gate input
+# ---------------------------------------------------------------------------
+
+
+def _t_sum_exposure_cents() -> int:
+    # Kalshi sends `market_exposure_dollars` as a FixedPointDollars string
+    # (e.g. "22.540000"); the Pydantic validator coerces to float. The
+    # summer multiplies by 100 and rounds — exercise both the string-input
+    # path and the None-skip path.
+    positions = [
+        MarketPosition.model_validate(
+            {"ticker": "A", "position_fp": "5.00", "market_exposure_dollars": "22.540000"},
+        ),
+        MarketPosition.model_validate(
+            {"ticker": "B", "position_fp": "-3.00", "market_exposure_dollars": "0.450000"},
+        ),
+        # Malformed / missing exposure — skipped, not counted as 0.
+        MarketPosition.model_validate(
+            {"ticker": "C", "position_fp": "1.00", "market_exposure_dollars": None},
+        ),
+    ]
+    got = sum_exposure_cents(positions)
+    # 22.54 + 0.45 = 22.99 → 2299 cents
+    assert got == 2299, got
+    # Empty list → 0
+    assert sum_exposure_cents([]) == 0
+    # All-None list → 0
+    all_none = [
+        MarketPosition.model_validate(
+            {"ticker": "X", "market_exposure_dollars": None},
+        ),
+    ]
+    assert sum_exposure_cents(all_none) == 0
+    return 3
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -402,6 +440,7 @@ def main() -> int:
         ("filter_rows defensibility", _t_filter_defensibility),
         ("filter_rows negative_edge", _t_filter_negative_edge),
         ("filter_rows sport", _t_filter_sport),
+        ("sum_exposure_cents", _t_sum_exposure_cents),
     ]
     failures = 0
     for name, fn in groups:

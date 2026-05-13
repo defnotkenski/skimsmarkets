@@ -1,27 +1,23 @@
-"""Trade audit log — write-append + calendar-day spend tally.
+"""Trade audit log — write-append + per-run executed-event lookup.
 
 One file per ranker run at `logs/trades/<run_id>.jsonl`, written
-append-mode (one JSON object per line). The calendar-day spend tally
-globs every file under `logs/trades/` and sums `fill_total_cost_cents`
-for rows whose `audit_timestamp` falls on today's UTC date — survives
-multiple ranker runs in a single day without double-counting.
+append-mode (one JSON object per line). The `audit_timestamp` is set
+when the row is constructed (just before write), so a slow / failing
+order placement that takes 30s still attributes the trade to the time
+it was attempted on.
 
-The `audit_timestamp` is set when the row is constructed (just before
-write), so a slow / failing order placement that takes 30s still
-attributes the trade to the day it was attempted on, not the day the
-ranker JSONL was written.
+The previous calendar-day spend tally was retired on 2026-05-12 in
+favour of reading live open exposure from Kalshi's
+`/portfolio/positions` — see `trader._prefetch_open_exposure`.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
 from pathlib import Path
 
-from pydantic import ValidationError
-
-from skimsmarkets.retro.jsonl import trades_log_path, trades_log_root
+from skimsmarkets.retro.jsonl import trades_log_path
 from skimsmarkets.retro.models import TradeRow
 
 log = logging.getLogger(__name__)
@@ -86,52 +82,3 @@ def executed_event_ids(run_id: str) -> set[str]:
             if isinstance(event_id, str) and event_id:
                 seen.add(event_id)
     return seen
-
-
-def today_spend_cents(*, now: datetime | None = None) -> int:
-    """Sum filled `fill_total_cost_cents` for every trade row stamped today (UTC).
-
-    Iterates every `*.jsonl` in `logs/trades/`. Malformed lines log a
-    warning and are skipped — the same discipline as `iter_predictions`
-    in the retro reader. Skipped / dry-run rows contribute 0 (their
-    `fill_total_cost_cents` defaults to 0).
-
-    `now` is injectable for tests; production calls pass nothing and
-    we anchor on `datetime.now(UTC)`.
-    """
-    anchor = now or datetime.now(UTC)
-    today = anchor.date()
-    root = trades_log_root()
-    if not root.exists():
-        return 0
-    total = 0
-    for path in root.glob("*.jsonl"):
-        with path.open() as f:
-            for line_num, raw in enumerate(f, start=1):
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError as e:
-                    log.warning(
-                        "trades reader: %s line %d malformed (%s)",
-                        path.name, line_num, e,
-                    )
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                if payload.get("record_type") != "trade":
-                    continue
-                try:
-                    row = TradeRow.model_validate(payload)
-                except ValidationError as e:
-                    log.warning(
-                        "trades reader: %s line %d schema mismatch (%s)",
-                        path.name, line_num, e,
-                    )
-                    continue
-                if row.audit_timestamp.astimezone(UTC).date() != today:
-                    continue
-                total += row.fill_total_cost_cents
-    return total

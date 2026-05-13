@@ -26,13 +26,17 @@ from skimsmarkets import config as cfg
 from skimsmarkets.config import Config
 from skimsmarkets.execute.audit import (
     executed_event_ids,
-    today_spend_cents,
     write_trade_row,
 )
 from skimsmarkets.execute.filters import filter_rows
 from skimsmarkets.kalshi.client import KalshiClient, KalshiOrderError
 from skimsmarkets.kalshi.matcher import MatchOutcome, find_kalshi_match
-from skimsmarkets.kalshi.models import KalshiEvent, OrderRequest, OrderResponse
+from skimsmarkets.kalshi.models import (
+    KalshiEvent,
+    MarketPosition,
+    OrderRequest,
+    OrderResponse,
+)
 from skimsmarkets.retro.jsonl import (
     iter_predictions,
     run_path_for_id,
@@ -51,7 +55,7 @@ class ExecuteOptions:
     dry_run: bool
     bet_size_cents: int
     max_position_cents: int
-    max_daily_spend_cents: int
+    max_open_exposure_cents: int
     confidence: list[Literal["low", "medium", "high"]] | None = None
     min_defensibility: float | None = None
     no_negative_edge: bool = False
@@ -102,11 +106,6 @@ async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary
         return summary
 
     audit_path = trades_log_path(opts.run_id)
-    prior_today_spend = today_spend_cents()
-    log.info(
-        "execute: prior today (UTC) spend across logs/trades/ = %d cents "
-        "(cap %d)", prior_today_spend, opts.max_daily_spend_cents,
-    )
     # Intra-run idempotency: any prediction whose event already has an
     # executed audit row in this run's log is skipped — re-running
     # `skims execute --live` against the same run_id should not place
@@ -118,7 +117,7 @@ async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary
             "will skip on dedup",
             len(already_done), opts.run_id,
         )
-    this_run_spend = 0
+    this_run_pending_cents = 0
 
     async with httpx.AsyncClient(timeout=20.0) as http:
         client = KalshiClient(
@@ -127,6 +126,13 @@ async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary
             api_key_id=config.kalshi_api_key_id,
             private_key_path=config.kalshi_private_key_path,
             private_key_pem=config.kalshi_private_key_pem,
+        )
+        open_exposure_cents = await _prefetch_open_exposure(
+            client, opts=opts, config=config,
+        )
+        log.info(
+            "execute: open Kalshi exposure = %d cents (cap %d)",
+            open_exposure_cents, opts.max_open_exposure_cents,
         )
         events = await _prefetch_events(client)
         log.info(
@@ -140,12 +146,12 @@ async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary
                 events=events,
                 client=client,
                 opts=opts,
-                prior_today_spend=prior_today_spend,
-                this_run_spend=this_run_spend,
+                open_exposure_cents=open_exposure_cents,
+                this_run_pending_cents=this_run_pending_cents,
                 already_done=already_done,
             )
             write_trade_row(audit_row, audit_path)
-            this_run_spend += audit_row.fill_total_cost_cents
+            this_run_pending_cents += audit_row.fill_total_cost_cents
             _bump(summary, audit_row)
 
     return summary
@@ -169,12 +175,80 @@ def _validate(opts: ExecuteOptions, config: Config) -> None:
             f"--max-position-cents ({opts.max_position_cents}). Either "
             "lower the bet or raise the position cap."
         )
+    if opts.bet_size_cents > opts.max_open_exposure_cents:
+        raise RuntimeError(
+            f"--bet-size-cents ({opts.bet_size_cents}) exceeds "
+            f"--max-open-exposure-cents ({opts.max_open_exposure_cents}). "
+            "A single trade can't be larger than the entire portfolio "
+            "exposure cap — either lower the bet or raise the cap."
+        )
     if opts.sports:
         invalid = [s for s in opts.sports if s.lower() != "tennis"]
         if invalid:
             raise RuntimeError(
                 f"--sport: only `tennis` is supported in v1, got: {invalid}"
             )
+
+
+async def _prefetch_open_exposure(
+    client: KalshiClient, *, opts: ExecuteOptions, config: Config,
+) -> int:
+    """Sum `market_exposure_dollars` across the account's open positions.
+
+    `--live` requires this number to be accurate or the cap is unsafe —
+    surface any failure as a hard error so the operator notices instead
+    of silently trading without a cap. (`_validate` already guaranteed
+    credentials exist for `--live`, so a missing-cred raise here would
+    only fire on dry-run.)
+
+    `--dry-run` is best-effort. If credentials are missing or the API
+    call fails, log a warning and treat exposure as 0 so dry-runs
+    without Kalshi access still work (preview mode); the gate becomes
+    informational rather than enforcing.
+    """
+    has_credentials = bool(
+        config.kalshi_api_key_id
+        and (config.kalshi_private_key_path or config.kalshi_private_key_pem)
+    )
+    if not has_credentials:
+        log.warning(
+            "execute: dry-run without Kalshi credentials — open-exposure "
+            "gate disabled (treating exposure as 0)",
+        )
+        return 0
+    try:
+        positions = await client.list_positions()
+    except Exception as e:  # noqa: BLE001
+        if opts.dry_run:
+            log.warning(
+                "execute: dry-run open-positions fetch failed (%s); "
+                "treating exposure as 0 for preview", e,
+            )
+            return 0
+        raise
+    total_cents = sum_exposure_cents(positions)
+    log.info(
+        "execute: open positions = %d markets, exposure = %d cents",
+        len(positions), total_cents,
+    )
+    return total_cents
+
+
+def sum_exposure_cents(positions: list[MarketPosition]) -> int:
+    """Sum `market_exposure_dollars` across positions, in cents.
+
+    `market_exposure_dollars=None` rows are skipped rather than counted
+    as 0 — a None means we couldn't parse the field, not that the
+    position is risk-free. Exported (no leading underscore) so the
+    smoke tests can exercise the same arithmetic without spinning up
+    an HTTP client.
+    """
+    total = 0
+    for pos in positions:
+        if pos.market_exposure_dollars is None:
+            continue
+        total += int(round(pos.market_exposure_dollars * 100))
+    return total
 
 
 async def _prefetch_events(client: KalshiClient) -> list[KalshiEvent]:
@@ -214,8 +288,8 @@ async def _process_row(
     events: list[KalshiEvent],
     client: KalshiClient,
     opts: ExecuteOptions,
-    prior_today_spend: int,
-    this_run_spend: int,
+    open_exposure_cents: int,
+    this_run_pending_cents: int,
     already_done: set[str],
 ) -> TradeRow:
     """Run one filtered prediction through match/safety/order → `TradeRow`.
@@ -242,18 +316,24 @@ async def _process_row(
     assert market is not None  # outcome.kind == "matched"
     yes_ask = market.yes_ask_dollars
 
-    # Per-day cap: prior calendar-day spend + this run's accumulated +
-    # this trade's ceiling. We use the ceiling (`bet_size_cents`)
-    # rather than the expected ask so the gate is monotone — a partial
-    # fill that ends up cheaper than expected won't retroactively let
-    # a later trade slip through.
-    projected = prior_today_spend + this_run_spend + opts.bet_size_cents
-    if projected > opts.max_daily_spend_cents:
+    # Portfolio exposure cap: open Kalshi exposure (read once at run
+    # start) + this run's accumulated fills + this trade's ceiling. We
+    # use the per-trade ceiling (`bet_size_cents`) rather than the
+    # expected ask so the gate is monotone — a partial fill that ends
+    # up cheaper than expected won't retroactively let a later trade
+    # slip through. The pre-fetched `open_exposure_cents` is a snapshot;
+    # the `this_run_pending_cents` accumulator covers fills placed since.
+    projected = (
+        open_exposure_cents + this_run_pending_cents + opts.bet_size_cents
+    )
+    if projected > opts.max_open_exposure_cents:
         log.info(
-            "execute: %s would breach daily cap (projected=%d, cap=%d) — skip",
-            market.ticker, projected, opts.max_daily_spend_cents,
+            "execute: %s would breach exposure cap (projected=%d, cap=%d) — skip",
+            market.ticker, projected, opts.max_open_exposure_cents,
         )
-        return _skip_row(base, outcome, reason="cap_exceeded", market=market)
+        return _skip_row(
+            base, outcome, reason="exposure_cap_exceeded", market=market,
+        )
 
     if opts.dry_run:
         return TradeRow(
