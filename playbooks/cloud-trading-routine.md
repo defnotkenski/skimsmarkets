@@ -2,6 +2,8 @@
 
 Use when triggered by a scheduled run (cron / cloud scheduler) to walk the full end-to-end trading flow: exposure pre-flight → slate probe → rank → execute live. This playbook IS the trigger prompt — the scheduler invokes Claude with this file as the instruction set.
 
+**Routine scope: RUN + READ + REPORT only.** Run the commands below verbatim, read their stdout/stderr, report the result. **DO NOT** edit any file in the repo, install or update packages, perform git write operations (`add` / `commit` / `push` / `branch` / `checkout -b` / `reset` / `tag`), or "fix" anything that looks broken. If a step fails, abort and report — the human handles any fixes outside the routine. The trading commands write their own audit logs internally (`logs/runs/*.jsonl`, `logs/trades/*.jsonl`); the routine never writes files directly.
+
 ## Flow
 
 ```
@@ -120,6 +122,10 @@ Only "error" rows warrant alerting the operator. "Clean" aborts are the expected
 
 ## What NOT to do
 
+- **NEVER edit code in this repo.** The routine is an orchestrator — the trade layer was authored deliberately by a human and is checked into git. Even if you see what looks like a bug, a missing import, a TODO, or a "small improvement", do NOT use Edit / Write / NotebookEdit on any file. Abort the run and report instead; the human will fix it outside the routine.
+- **NEVER perform git write operations.** No `git add`, `git commit`, `git push`, `git branch`, `git checkout -b`, `git reset`, `git tag`, `git stash`, etc. Read-only git (`git status`, `git log`, `git diff`) is fine for diagnostics if you need it. Code in this repo is published to GitHub on a human's schedule, not the routine's.
+- **NEVER install or update packages.** No `uv add`, `uv lock`, `pip install`, `pip uninstall`, modifications to `pyproject.toml` or `uv.lock`. If `uv run skims ...` fails because dependencies aren't available, that's a sandbox-provisioning issue — abort and report; don't try to fix it from inside the routine. (Running `uv sync` once to populate the venv against the existing `uv.lock` is OK if needed; that's read-only against the lockfile.)
+- **NEVER "fix" a failing step.** If a command fails, abort with the stderr + relevant log paths and exit. Trying to patch state mid-routine risks corrupting the audit log or leaving Kalshi in an inconsistent state.
 - **Don't retry on Kalshi-side failure.** A request that times out mid-POST leaves order state unknown. The trader's `client_order_id` dedupe handles single-call retries; a blind outer retry uses fresh UUIDs and would risk duplicates.
 - **Don't override `--max-open-exposure-cents` upward to fit a trade.** The cap is the portfolio safety limit; if there's no headroom, the answer is "trade fewer / smaller" or "wait", not "widen the limit".
 - **Don't skip step 1** even though `skims execute --live` re-reads exposure internally. The pre-flight saves the LLM cost of `skims rank` on days when there's no headroom anyway.
