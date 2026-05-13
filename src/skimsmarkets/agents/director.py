@@ -187,13 +187,31 @@ def _render_user_message(
         )
     reports_str = "\n\n".join(report_blocks)
 
+    # Explicit specialist_weights instruction. Anthropic's structured-
+    # output compiler does NOT enforce `minProperties: 1` during
+    # generation (verified against their docs — object cardinality
+    # constraints are post-hoc only), so without this nudge the model
+    # frequently emits `"specialist_weights": {}` on attempt 1 and the
+    # Pydantic retry loop has to do the work. Listing the lens keys
+    # inline preempts the empty-dict failure (and the downstream
+    # trailing-comma grammar bug it sometimes triggers) so attempt 1
+    # lands cleanly. Keys are pulled from the active LensSet so this
+    # stays sport-agnostic — works for any future sport without code.
+    lens_keys = ", ".join(spec.name for spec in lens_set.lenses)
+    specialist_weights_directive = (
+        f"REQUIRED: populate `specialist_weights` with one entry per lens "
+        f"you weighted in the synthesis. Keys must be the exact lens names "
+        f"from the reports above ({lens_keys}). Values are weights in [0, 1] "
+        f"that roughly sum to 1.0. An empty dict will fail validation."
+    )
     return (
         _render_event_context_block(event)
         + "\n\n"
         + sport_hint_block
         + reports_str
         + "\n\nReturn an EventPrediction per the schema. "
-        "Set predicted_winner to the exact yes_sub_title string of the side you expect to win."
+        "Set predicted_winner to the exact yes_sub_title string of the side you expect to win. "
+        + specialist_weights_directive
     )
 
 

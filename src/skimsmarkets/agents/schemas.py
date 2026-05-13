@@ -249,18 +249,16 @@ class EventPrediction(BaseModel):
             "contingency could flip it IS still high confidence."
         ),
     )
-    headline: str = Field(
-        description=(
-            "ONE sentence, max ~20 words, plain English. The single most decisive "
-            "reason this side wins — readable at a glance with no jargon. Example: "
-            "'Lakers win behind a fully-healthy LeBron and a 7-game home win streak.' "
-            "This is what shows up in the at-a-glance leaderboard; the long-form "
-            "synthesis lives in `reasoning`."
-        ),
-    )
-    reasoning: str = Field(
-        description="3-6 sentences explaining the synthesis and how specialists were weighted.",
-    )
+    # Position note: `specialist_weights` is placed BEFORE `headline` /
+    # `reasoning` (which are always-emitted strings) so it's never the
+    # last field in the wire output. The downstream fields
+    # (`disagreements_flagged`, `uw_flow_note`, `retracted_shifts`) all
+    # default to empty/None and the model often omits them — if
+    # `specialist_weights` were last in those cases, an empty `{}` value
+    # tends to trigger a trailing-comma grammar bug in Anthropic's
+    # structured-output compiler (`{},}`). Keeping `headline` and
+    # `reasoning` after it works around that. See director.py for the
+    # complementary prompt-level instruction that names the lens keys.
     specialist_weights: dict[str, float] = Field(
         min_length=1,
         description=(
@@ -272,6 +270,18 @@ class EventPrediction(BaseModel):
             "these weights the slate judge's specialist-weights diffusion "
             "defensibility check (`agents/judge.py`) cannot fire."
         ),
+    )
+    headline: str = Field(
+        description=(
+            "ONE sentence, max ~20 words, plain English. The single most decisive "
+            "reason this side wins — readable at a glance with no jargon. Example: "
+            "'Lakers win behind a fully-healthy LeBron and a 7-game home win streak.' "
+            "This is what shows up in the at-a-glance leaderboard; the long-form "
+            "synthesis lives in `reasoning`."
+        ),
+    )
+    reasoning: str = Field(
+        description="3-6 sentences explaining the synthesis and how specialists were weighted.",
     )
     disagreements_flagged: list[str] = Field(
         default_factory=list,
