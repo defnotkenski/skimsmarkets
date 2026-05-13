@@ -31,6 +31,17 @@ log = logging.getLogger(__name__)
 _GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 _GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
+# Polite, identifiable User-Agent for gamma requests. Polymarket's gamma
+# API is fronted by Cloudflare which sometimes serves 403 to requests
+# carrying httpx's default `python-httpx/X.Y.Z` UA — a generic Python
+# signature that shared-IP cloud sandboxes can get flagged on. Sending
+# an identifiable UA (project name + repo URL for contact) preempts the
+# WAF block in practice and is the standard "be a good citizen" pattern
+# for unauthenticated public APIs.
+_GAMMA_HEADERS = {
+    "User-Agent": "skimsmarkets/1.0 (+https://github.com/defnotkenski/skimsmarkets)",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class GammaMarketSnapshot:
@@ -113,7 +124,9 @@ class GammaTokenResolver:
 
     async def _fetch(self, slug: str) -> GammaMarketSnapshot | None:
         try:
-            resp = await self._client.get(_GAMMA_URL, params={"slug": slug})
+            resp = await self._client.get(
+                _GAMMA_URL, params={"slug": slug}, headers=_GAMMA_HEADERS,
+            )
             resp.raise_for_status()
         except Exception as e:  # noqa: BLE001
             log.warning("gamma-api slug=%s failed: %s", slug, e)
@@ -192,7 +205,9 @@ async def list_gamma_events(
         last_err: Exception | None = None
         for attempt in range(4):
             try:
-                resp = await client.get(_GAMMA_EVENTS_URL, params=params)
+                resp = await client.get(
+                    _GAMMA_EVENTS_URL, params=params, headers=_GAMMA_HEADERS,
+                )
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 if attempt < 3:
@@ -257,7 +272,11 @@ async def fetch_gamma_event(
     it treats a settled US event (skip, continue).
     """
     try:
-        resp = await client.get(_GAMMA_EVENTS_URL, params={"slug": slug})
+        resp = await client.get(
+            _GAMMA_EVENTS_URL,
+            params={"slug": slug},
+            headers=_GAMMA_HEADERS,
+        )
         resp.raise_for_status()
     except Exception as e:  # noqa: BLE001
         log.warning("gamma-api events slug=%s failed: %s", slug, e)
