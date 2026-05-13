@@ -288,7 +288,15 @@ class Config:
         # In that mode the Anthropic / Grok / Gemini key checks are skipped
         # and the placeholder anthropic_api_key is set to an empty string
         # so callers that mistakenly try to reach the LLM later fail loudly.
-        load_dotenv()
+        # `override=True` makes .env authoritative over the inherited
+        # shell environment. Without it, a parent process that exports
+        # any of these vars as empty (Claude Code does this for
+        # `ANTHROPIC_API_KEY` to prevent leaking its OAuth credential
+        # into project shells) silently wins over the populated .env
+        # value, and the missing-var check downstream fires confusingly.
+        # Cloud deploys (no .env file present) are unaffected — there's
+        # nothing to override against.
+        load_dotenv(override=True)
         provider = FETCHER_PROVIDER
         if provider not in FETCHER_PROVIDERS:
             raise RuntimeError(
