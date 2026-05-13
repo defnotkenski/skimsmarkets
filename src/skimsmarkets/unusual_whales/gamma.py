@@ -179,8 +179,45 @@ async def list_gamma_events(
         }
         if tag_slug:
             params["tag_slug"] = tag_slug
+        # Retry transient HTTP errors (403/429/5xx) with exponential
+        # backoff (1s, 2s, 4s). Polymarket gamma is fronted by Cloudflare
+        # and occasionally serves 403 to rapid sequential calls from the
+        # same IP — observed during cloud-routine fires where `skims
+        # fetch` and `skims rank` hit the endpoint within seconds of
+        # each other. Without this loop, a single transient 403 empties
+        # the slate to 0 and silently aborts the routine. Mirrors the
+        # Kalshi client's `list_events` 429 backoff pattern.
+        backoff = 1.0
+        resp: httpx.Response | None = None
+        last_err: Exception | None = None
+        for attempt in range(4):
+            try:
+                resp = await client.get(_GAMMA_EVENTS_URL, params=params)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if attempt < 3:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                break
+            if resp.status_code in (403, 429) or resp.status_code >= 500:
+                if attempt < 3:
+                    log.warning(
+                        "gamma-api events list page=%d got HTTP %d, "
+                        "retrying in %.1fs (attempt %d/4)",
+                        page, resp.status_code, backoff, attempt + 1,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+            break
+        if resp is None:
+            log.warning(
+                "gamma-api events list page=%d failed after retries: %s",
+                page, last_err,
+            )
+            break
         try:
-            resp = await client.get(_GAMMA_EVENTS_URL, params=params)
             resp.raise_for_status()
         except Exception as e:  # noqa: BLE001
             log.warning("gamma-api events list page=%d failed: %s", page, e)
