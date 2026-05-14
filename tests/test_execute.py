@@ -11,6 +11,8 @@ and prints a one-line tally per group.
 
 from __future__ import annotations
 
+import math
+import random
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from skimsmarkets.calibration import apply_temperature  # noqa: E402
 from skimsmarkets.classify import (  # noqa: E402
     BUCKET_AVOID,
     BUCKET_COINFLIP,
@@ -41,6 +44,15 @@ from skimsmarkets.kalshi.matcher import (  # noqa: E402
     last_token,
 )
 from skimsmarkets.kalshi.models import KalshiEvent, MarketPosition  # noqa: E402
+from skimsmarkets.retro.metrics import (  # noqa: E402
+    MIN_FIT_N,
+    brier_score,
+    calibration_curve,
+    compute_metrics,
+    expected_calibration_error,
+    fit_temperature,
+    log_loss,
+)
 from skimsmarkets.retro.models import PredictionRow  # noqa: E402
 
 
@@ -531,6 +543,172 @@ def _t_implied_gate() -> int:
 
 
 # ---------------------------------------------------------------------------
+# retro scoring metrics
+# ---------------------------------------------------------------------------
+
+
+def _t_metrics() -> int:
+    """brier_score / log_loss / ECE / calibration_curve — formulas vs
+    hand computation, empty-input and p∈{0,1} edge cases.
+    """
+    n = 0
+
+    pairs = [(0.8, True), (0.6, False), (0.5, True)]
+    # Brier = mean((p - y)^2), computed independently of the impl.
+    exp_brier = ((0.8 - 1) ** 2 + (0.6 - 0) ** 2 + (0.5 - 1) ** 2) / 3
+    got = brier_score(pairs)
+    assert got is not None and abs(got - exp_brier) < 1e-9, got
+    n += 1
+    # log-loss = mean(-[y log p + (1-y) log(1-p)]).
+    exp_ll = -(math.log(0.8) + math.log(1 - 0.6) + math.log(0.5)) / 3
+    got = log_loss(pairs)
+    assert got is not None and abs(got - exp_ll) < 1e-9, got
+    n += 1
+
+    # Empty input → None for both scoring rules.
+    assert brier_score([]) is None
+    assert log_loss([]) is None
+    n += 2
+
+    # p ∈ {0, 1} must not blow log-loss to -inf (the eps clamp).
+    ll = log_loss([(1.0, False), (0.0, True)])
+    assert ll is not None and math.isfinite(ll), ll
+    n += 1
+
+    # Perfectly-calibrated synthetic set → ECE ≈ 0: 10 rows at p=0.7 with
+    # exactly 7 wins, 10 at p=0.4 with exactly 4 wins.
+    well = (
+        [(0.7, True)] * 7 + [(0.7, False)] * 3
+        + [(0.4, True)] * 4 + [(0.4, False)] * 6
+    )
+    ece_well = expected_calibration_error(well)
+    assert ece_well is not None and ece_well < 0.05, ece_well
+    n += 1
+
+    # Deliberately miscalibrated → large ECE: all p=0.9, only half win.
+    bad = [(0.9, True)] * 5 + [(0.9, False)] * 5
+    ece_bad = expected_calibration_error(bad)
+    assert ece_bad is not None and ece_bad > 0.3, ece_bad
+    n += 1
+
+    # calibration_curve: exactly n_bins bins, coverage sums to len(pairs),
+    # empty bins carry n=0 and None rates.
+    curve = calibration_curve(well, n_bins=10)
+    assert len(curve) == 10, len(curve)
+    assert sum(b.n for b in curve) == len(well)
+    assert all(
+        b.mean_predicted is None and b.observed_freq is None
+        for b in curve
+        if b.n == 0
+    )
+    n += 3
+
+    # ECE with far more bins than data is still finite (empty bins → 0).
+    ece_sparse = expected_calibration_error(pairs, n_bins=50)
+    assert ece_sparse is not None and math.isfinite(ece_sparse)
+    n += 1
+
+    # compute_metrics bundles everything; empty input → n=0, None metrics,
+    # still a full n_bins curve.
+    m = compute_metrics([])
+    assert m.n == 0 and m.brier is None and m.log_loss is None
+    assert m.ece is None and len(m.curve) == 10
+    n += 2
+
+    return n
+
+
+# ---------------------------------------------------------------------------
+# temperature-scaling calibration
+# ---------------------------------------------------------------------------
+
+
+def _t_calibration() -> int:
+    """apply_temperature invariants (identity / 0.5 fixed point / no pick
+    flip), fit_temperature recovery + refusal guards, classify_risk
+    backward compatibility at T=1.0.
+    """
+    n = 0
+
+    # Identity at T=1.0.
+    for p in (0.01, 0.3, 0.5, 0.72, 0.99):
+        assert abs(apply_temperature(p, 1.0) - p) < 1e-12, p
+    n += 1
+
+    # 0.5 is the fixed point for every temperature.
+    for t in (0.25, 0.5, 1.0, 2.5, 5.0):
+        assert abs(apply_temperature(0.5, t) - 0.5) < 1e-12, t
+    n += 1
+
+    # Never crosses 0.5 — the "can't flip the pick" guarantee.
+    for t in (0.25, 0.5, 2.0, 5.0):
+        assert apply_temperature(0.72, t) > 0.5, t
+        assert apply_temperature(0.31, t) < 0.5, t
+    n += 1
+
+    # Finite at p ∈ {0, 1} — the _P_CLAMP guard.
+    for t in (0.25, 1.0, 5.0):
+        assert math.isfinite(apply_temperature(0.0, t)), t
+        assert math.isfinite(apply_temperature(1.0, t)), t
+    n += 1
+
+    # T > 1 pulls toward 0.5 (de-confidence); T < 1 pushes away.
+    assert apply_temperature(0.9, 2.0) < 0.9
+    assert apply_temperature(0.9, 0.5) > 0.9
+    n += 1
+
+    # Round-trip recovery: emit overconfident scores from a known
+    # T_true, draw outcomes from the *true* probabilities, and check
+    # fit_temperature recovers T_true. Composition multiplies
+    # temperatures, so emitting `apply_temperature(p_true, 1/T_true)`
+    # means `apply_temperature(emitted, T_true) == p_true`. Fixed-seed
+    # stdlib RNG — deterministic, no numpy dependency.
+    rng = random.Random(42)
+    t_true = 1.6
+    pairs: list[tuple[float, bool]] = []
+    for _ in range(1000):
+        p_true = rng.uniform(0.5, 0.95)
+        emitted = apply_temperature(p_true, 1.0 / t_true)
+        won = rng.random() < p_true
+        pairs.append((emitted, won))
+    t_fit = fit_temperature(pairs)
+    assert t_fit is not None and abs(t_fit - t_true) < 0.2, t_fit
+    n += 1
+
+    # Refusal guards: too few rows (both classes present, so it's the N
+    # guard specifically), and single-class input.
+    too_few = [(0.7, True), (0.6, False)] * ((MIN_FIT_N - 1) // 2)
+    assert len(too_few) < MIN_FIT_N
+    assert fit_temperature(too_few) is None
+    assert fit_temperature([(0.7, True)] * 200) is None  # all wins
+    assert fit_temperature([(0.6, False)] * 200) is None  # all losses
+    n += 3
+
+    # classify_risk: temperature=1.0 is byte-identical to the no-param
+    # call — proves the new param is backward compatible.
+    base = classify_risk(0.88, 0.90, 0.03, predicted_winner_is_team_a=True)
+    with_t = classify_risk(
+        0.88, 0.90, 0.03, predicted_winner_is_team_a=True, temperature=1.0
+    )
+    assert base == with_t, (base, with_t)
+    n += 1
+
+    # T > 1 shrinks the magnitude term → strictly lower risk_score on a
+    # high-magnitude case.
+    _, score_raw = classify_risk(
+        0.88, 0.90, 0.03, predicted_winner_is_team_a=True, temperature=1.0
+    )
+    _, score_cooled = classify_risk(
+        0.88, 0.90, 0.03, predicted_winner_is_team_a=True, temperature=2.0
+    )
+    assert score_raw is not None and score_cooled is not None
+    assert score_cooled < score_raw, (score_raw, score_cooled)
+    n += 1
+
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -552,6 +730,8 @@ def main() -> int:
         ("sum_exposure_cents", _t_sum_exposure_cents),
         ("classify_risk", _t_classify),
         ("execute implied-prob gate", _t_implied_gate),
+        ("retro scoring metrics", _t_metrics),
+        ("temperature calibration", _t_calibration),
     ]
     failures = 0
     for name, fn in groups:

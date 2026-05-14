@@ -18,12 +18,14 @@ from dataclasses import dataclass, field
 from rich.console import Console
 from rich.table import Table
 
+from skimsmarkets.calibration import apply_temperature
 from skimsmarkets.retro.features import extract_features
 from skimsmarkets.retro.jsonl import (
     iter_predictions,
     list_run_files,
     resolutions_sidecar_path,
 )
+from skimsmarkets.retro.metrics import ScoringMetrics, compute_metrics
 from skimsmarkets.retro.models import EventFeatures, ResolvedOutcome
 
 log = logging.getLogger(__name__)
@@ -85,6 +87,22 @@ class CalibrateReport:
     n_duplicates_dropped: int = 0
     overall_cuts: list[CutTable] = field(default_factory=list)
     per_sport_cuts: dict[str, list[CutTable]] = field(default_factory=dict)
+    # Proper-scoring metrics (Brier / log-loss / ECE / calibration curve)
+    # over the same settled rows the hit-rate cuts use. `overall_metrics`
+    # is None only on a report built before `aggregate` ran (it always
+    # populates it, even to an n=0 scorecard).
+    overall_metrics: ScoringMetrics | None = None
+    per_sport_metrics: dict[str, ScoringMetrics] = field(default_factory=dict)
+    # Before/after-calibration comparison. Populated only when `aggregate`
+    # is called with a `temperature` (the live committed scalar) — `--step
+    # calibrate` passes it; Phase-1-only callers leave these at defaults.
+    # The `*_after` fields mirror the `*_metrics` shape, recomputed on the
+    # raw probabilities pushed through `apply_temperature`.
+    calibration_temperature: float | None = None
+    metrics_after_calibration: ScoringMetrics | None = None
+    per_sport_metrics_after: dict[str, ScoringMetrics] = field(
+        default_factory=dict
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -96,6 +114,25 @@ class CalibrateReport:
             "per_sport_cuts": {
                 sport: [c.to_dict() for c in cuts]
                 for sport, cuts in self.per_sport_cuts.items()
+            },
+            "overall_metrics": (
+                self.overall_metrics.to_dict()
+                if self.overall_metrics is not None
+                else None
+            ),
+            "per_sport_metrics": {
+                sport: m.to_dict()
+                for sport, m in self.per_sport_metrics.items()
+            },
+            "calibration_temperature": self.calibration_temperature,
+            "metrics_after_calibration": (
+                self.metrics_after_calibration.to_dict()
+                if self.metrics_after_calibration is not None
+                else None
+            ),
+            "per_sport_metrics_after": {
+                sport: m.to_dict()
+                for sport, m in self.per_sport_metrics_after.items()
             },
         }
 
@@ -180,12 +217,19 @@ def aggregate(
     feats: list[EventFeatures],
     *,
     n_duplicates_dropped: int = 0,
+    temperature: float | None = None,
 ) -> CalibrateReport:
     """Build the full report from a flat feature list.
 
     `n_duplicates_dropped` is plumbed through from `collect_features`
     (the dedup happens there, not here) so the report can surface
     "we dropped N duplicate predictions" alongside the deduped totals.
+
+    `temperature`, when passed, is the live committed calibration scalar:
+    the report then also carries the "after-calibration" scoring metrics,
+    recomputed by pushing every raw probability through
+    `apply_temperature`. None (the default) skips that pass — Phase-1
+    callers that only want the raw metrics pass nothing.
     """
     report = CalibrateReport(
         n_predictions_total=len(feats),
@@ -194,6 +238,23 @@ def aggregate(
     settled = [f for f in feats if f.settled and f.won is not None]
     report.n_settled = len(settled)
     report.n_correct = sum(1 for f in settled if f.won is True)
+    # Proper-scoring metrics over the same settled rows the cuts use, so
+    # the headline Brier / ECE and the hit-rate tables can't disagree
+    # about which events they're describing.
+    report.overall_metrics = compute_metrics(
+        [(f.predicted_prob, f.won) for f in settled]
+    )
+    # Before/after the live committed temperature, when one was passed.
+    # "After" is recomputed on the fly — every raw probability pushed
+    # through `apply_temperature` — so no persisted feature is needed.
+    if temperature is not None:
+        report.calibration_temperature = temperature
+        report.metrics_after_calibration = compute_metrics(
+            [
+                (apply_temperature(f.predicted_prob, temperature), f.won)
+                for f in settled
+            ]
+        )
 
     def _build_cuts(scope: list[EventFeatures]) -> list[CutTable]:
         return [
@@ -239,6 +300,19 @@ def aggregate(
         if not any(f.settled for f in scope):
             continue
         report.per_sport_cuts[sport] = _build_cuts(scope)
+        sport_settled = [
+            f for f in scope if f.settled and f.won is not None
+        ]
+        report.per_sport_metrics[sport] = compute_metrics(
+            [(f.predicted_prob, f.won) for f in sport_settled]
+        )
+        if temperature is not None:
+            report.per_sport_metrics_after[sport] = compute_metrics(
+                [
+                    (apply_temperature(f.predicted_prob, temperature), f.won)
+                    for f in sport_settled
+                ]
+            )
     return report
 
 
@@ -337,6 +411,109 @@ def _render_cut_table(console: Console, scope: str, cut: CutTable) -> None:
     console.print(table)
 
 
+def _fmt_metric(x: float | None) -> str:
+    """4-decimal metric cell, or the same em-dash the cut tables use for
+    a missing value (no settled events in scope).
+    """
+    return f"{x:.4f}" if x is not None else "—"
+
+
+def _metric_cell(
+    before: float | None, after: float | None, *, has_after: bool
+) -> str:
+    """A metric cell: just the value, or `before → after` when a
+    calibration temperature was applied.
+    """
+    if not has_after:
+        return _fmt_metric(before)
+    return f"{_fmt_metric(before)} → {_fmt_metric(after)}"
+
+
+def _render_metrics_summary(console: Console, report: CalibrateReport) -> None:
+    """One table: Brier / log-loss / ECE for Overall + each sport.
+
+    These are the headline numbers — they say *how miscalibrated* the
+    probabilities are, which hit-rate alone can't. Rendered before the
+    cut tables for that reason. When the report carries an
+    after-calibration pass, each cell shows `before → after`.
+    """
+    has_after = report.metrics_after_calibration is not None
+    title = "Proper scoring metrics"
+    if has_after:
+        title += (
+            f"  (before → after, T={report.calibration_temperature:.4f})"
+        )
+    table = Table(title=title, title_justify="left", show_lines=False)
+    table.add_column("Scope")
+    table.add_column("n", justify="right")
+    table.add_column("Brier", justify="right")
+    table.add_column("Log-loss", justify="right")
+    table.add_column("ECE", justify="right")
+    scopes: list[
+        tuple[str, ScoringMetrics | None, ScoringMetrics | None]
+    ] = [("Overall", report.overall_metrics, report.metrics_after_calibration)]
+    for sport, m in report.per_sport_metrics.items():
+        scopes.append((sport, m, report.per_sport_metrics_after.get(sport)))
+    for scope, before, after in scopes:
+        if before is None:
+            continue
+        table.add_row(
+            scope,
+            str(before.n),
+            _metric_cell(
+                before.brier, after.brier if after else None,
+                has_after=has_after,
+            ),
+            _metric_cell(
+                before.log_loss, after.log_loss if after else None,
+                has_after=has_after,
+            ),
+            _metric_cell(
+                before.ece, after.ece if after else None,
+                has_after=has_after,
+            ),
+        )
+    console.print(table)
+
+
+def _render_curve_table(
+    console: Console, scope: str, metrics: ScoringMetrics
+) -> None:
+    """Reliability diagram for one scope — predicted vs observed per bin.
+
+    Trims the always-empty leading/trailing bins (predictions cluster in
+    [0.5, 1.0] under the contrarian-call discipline, so the low bins
+    never fill) but keeps *interior* empty bins visible — those are real
+    coverage gaps, not noise.
+    """
+    nonempty = [i for i, b in enumerate(metrics.curve) if b.n > 0]
+    if not nonempty:
+        return
+    table = Table(
+        title=f"{scope} — calibration curve",
+        title_justify="left",
+        show_lines=False,
+    )
+    table.add_column("Bin")
+    table.add_column("n", justify="right")
+    table.add_column("Mean pred", justify="right")
+    table.add_column("Observed", justify="right")
+    table.add_column("Gap", justify="right")
+    for b in metrics.curve[nonempty[0] : nonempty[-1] + 1]:
+        if b.n == 0:
+            table.add_row(f"{b.lo:.2f}-{b.hi:.2f}", "0", "—", "—", "—")
+            continue
+        gap = b.mean_predicted - b.observed_freq
+        table.add_row(
+            f"{b.lo:.2f}-{b.hi:.2f}",
+            str(b.n),
+            f"{b.mean_predicted:.1%}",
+            f"{b.observed_freq:.1%}",
+            f"{gap:+.1%}",
+        )
+    console.print(table)
+
+
 def render_report(report: CalibrateReport) -> None:
     console = Console()
     overall_rate = (
@@ -356,6 +533,14 @@ def render_report(report: CalibrateReport) -> None:
         f"{dupe_note}, {report.n_correct} correct ({overall_rate})"
     )
     console.print()
+    _render_metrics_summary(console, report)
+    console.print()
+    if report.overall_metrics is not None:
+        _render_curve_table(console, "Overall", report.overall_metrics)
+        console.print()
+    for sport, m in report.per_sport_metrics.items():
+        _render_curve_table(console, sport, m)
+        console.print()
     for cut in report.overall_cuts:
         _render_cut_table(console, "Overall", cut)
         console.print()

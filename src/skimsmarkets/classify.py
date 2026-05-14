@@ -22,6 +22,8 @@ calibration.
 
 from __future__ import annotations
 
+from skimsmarkets.calibration import apply_temperature
+
 # --- tunables (first-guess; tune against retro backtest data) --------------
 
 # Convergence is asymmetric in the predicted-winner frame. A blind estimate
@@ -91,6 +93,7 @@ def classify_risk(
     gap_to_market_signed: float | None,
     *,
     predicted_winner_is_team_a: bool,
+    temperature: float = 1.0,
 ) -> tuple[str, float | None]:
     """Grade one event into a `(risk_bucket, risk_score)` pair.
 
@@ -99,6 +102,14 @@ def classify_risk(
     team_a-anchored (positive = the blind estimate puts team_a above the
     market's team_a price); `predicted_winner_is_team_a` re-anchors it to the
     winner frame.
+
+    `temperature` is the calibration scalar from
+    `models/tennis_calibration.json` (the pipeline loads it via
+    `calibration.load_temperature`). It is applied to the magnitude term
+    ONLY — `apply_temperature` has 0.5 as its fixed point, so it rescales
+    confidence without ever flipping the pick. Default 1.0 is the identity
+    transform (exact pre-calibration behaviour); the temperature is fit on
+    win/loss outcomes, never on price, so the classifier stays market-blind.
 
     Returns `("Unrated", None)` when the judge produced no
     `defensibility_score` — without it there is no honest composite. When
@@ -110,7 +121,13 @@ def classify_risk(
     if defensibility_score is None:
         return BUCKET_UNRATED, None
 
-    magnitude_term = _clip01(predicted_winner_probability)
+    # Calibrated: `apply_temperature` corrects the director's raw confidence
+    # against historically-resolved outcomes. Magnitude is the only term that
+    # gets calibrated — the only place the probability acts as a confidence
+    # *level* rather than a side indicator. T=1.0 → identity.
+    magnitude_term = _clip01(
+        apply_temperature(predicted_winner_probability, temperature)
+    )
     defensibility_term = _clip01(defensibility_score)
 
     if gap_to_market_signed is None:
@@ -127,7 +144,10 @@ def classify_risk(
         # The market's own probability for the predicted winner. Below 0.5
         # the market and the blind estimate disagree on *who wins* — a
         # directional disagreement, not just a confidence gap — so it takes
-        # a steep extra penalty stacked on top of the gap decay.
+        # a steep extra penalty stacked on top of the gap decay. Uses the
+        # RAW probability, not the temperature-scaled one: this subtraction
+        # recovers what the market thinks (director_raw − gap = market), a
+        # side/sign question temperature's 0.5 fixed point cannot change.
         market_winner_prob = predicted_winner_probability - gap_winner
         convergence_term = _clip01(
             1.0

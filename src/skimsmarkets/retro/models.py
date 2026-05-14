@@ -75,6 +75,13 @@ class PredictionRow(BaseModel):
     # the judge produced no defensibility score (bucket `Unrated`).
     risk_bucket: str | None = None
     risk_score: float | None = None
+    # Calibration audit (see `calibration.py`). `calibration_temperature`
+    # is the scalar applied to the classifier's magnitude term this run;
+    # `calibrated_winner_probability` is what that term actually saw. Both
+    # None on runs predating the calibration layer; temperature is 1.0
+    # (identity) on runs made with no committed artefact.
+    calibration_temperature: float | None = None
+    calibrated_winner_probability: float | None = None
     tennis_stats: TennisStatsContext | None = None
     tennis_simulation: TennisSimulationContext | None = None
     tennis_gbt: TennisGbtContext | None = None

@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from skimsmarkets.retro.calibrate import CalibrateReport, CutTable
+from skimsmarkets.retro.metrics import ScoringMetrics
 from skimsmarkets.retro.models import RetroFindings
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,114 @@ def _md_table(cut: CutTable) -> str:
         rate = f"{b.hit_rate:.1%}" if b.hit_rate is not None else "—"
         rows.append(f"| {b.label} | {b.hits} | {b.total} | {rate} |")
     return "\n".join(rows)
+
+
+def _md_metric(x: float | None) -> str:
+    return f"{x:.4f}" if x is not None else "—"
+
+
+def _md_metric_cell(
+    before: float | None, after: float | None, *, has_after: bool
+) -> str:
+    """A metric cell: just the value, or `before → after` when a
+    calibration temperature was applied.
+    """
+    if not has_after:
+        return _md_metric(before)
+    return f"{_md_metric(before)} → {_md_metric(after)}"
+
+
+def _md_metrics_table(
+    scopes: list[tuple[str, ScoringMetrics, ScoringMetrics | None]],
+    *,
+    has_after: bool,
+) -> str:
+    """Brier / log-loss / ECE summary as a Markdown pipe-table, one row
+    per scope (Overall + each sport). Cells show `before → after` when a
+    calibration temperature was applied.
+    """
+    rows = [
+        "| Scope | n | Brier | Log-loss | ECE |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for scope, before, after in scopes:
+        brier = _md_metric_cell(
+            before.brier, after.brier if after else None, has_after=has_after
+        )
+        ll = _md_metric_cell(
+            before.log_loss,
+            after.log_loss if after else None,
+            has_after=has_after,
+        )
+        ece = _md_metric_cell(
+            before.ece, after.ece if after else None, has_after=has_after
+        )
+        rows.append(f"| {scope} | {before.n} | {brier} | {ll} | {ece} |")
+    return "\n".join(rows)
+
+
+def _md_curve_table(metrics: ScoringMetrics) -> str:
+    """One scope's calibration curve as a Markdown pipe-table. Trims the
+    always-empty leading/trailing bins, keeps interior coverage gaps
+    visible — mirrors the terminal `_render_curve_table`.
+    """
+    nonempty = [i for i, b in enumerate(metrics.curve) if b.n > 0]
+    if not nonempty:
+        return "_No settled events._"
+    rows = [
+        "| Bin | n | Mean pred | Observed | Gap |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for b in metrics.curve[nonempty[0] : nonempty[-1] + 1]:
+        if b.n == 0:
+            rows.append(f"| {b.lo:.2f}-{b.hi:.2f} | 0 | — | — | — |")
+            continue
+        gap = b.mean_predicted - b.observed_freq
+        rows.append(
+            f"| {b.lo:.2f}-{b.hi:.2f} | {b.n} | {b.mean_predicted:.1%} | "
+            f"{b.observed_freq:.1%} | {gap:+.1%} |"
+        )
+    return "\n".join(rows)
+
+
+def _metrics_section(calibrate: CalibrateReport) -> list[str]:
+    """The "## Proper scoring metrics" section: a summary table plus a
+    per-scope calibration curve. When the report carries an
+    after-calibration pass the summary shows `before → after` and the
+    section notes the committed temperature. Empty list when no metrics
+    exist (a report built before `aggregate` ran).
+    """
+    has_after = calibrate.metrics_after_calibration is not None
+    scopes: list[tuple[str, ScoringMetrics, ScoringMetrics | None]] = []
+    if calibrate.overall_metrics is not None:
+        scopes.append((
+            "Overall",
+            calibrate.overall_metrics,
+            calibrate.metrics_after_calibration,
+        ))
+    for sport, m in calibrate.per_sport_metrics.items():
+        scopes.append(
+            (sport, m, calibrate.per_sport_metrics_after.get(sport))
+        )
+    if not scopes:
+        return []
+    lines = ["## Proper scoring metrics", ""]
+    if has_after:
+        lines.append(
+            f"_Before → after the committed calibration temperature "
+            f"T={calibrate.calibration_temperature:.4f}._"
+        )
+        lines.append("")
+    lines.append(_md_metrics_table(scopes, has_after=has_after))
+    lines.append("")
+    # The calibration curve is the raw reliability diagram — always the
+    # "before" metrics, mirroring the terminal renderer.
+    for scope, before, _after in scopes:
+        lines.append(f"### {scope} — calibration curve")
+        lines.append("")
+        lines.append(_md_curve_table(before))
+        lines.append("")
+    return lines
 
 
 def _findings_md(findings: RetroFindings) -> str:
@@ -89,6 +198,7 @@ def write_report(
         f"{calibrate.n_predictions_total} unique markets{dupe_note}, "
         f"{calibrate.n_correct} correct ({overall_rate})",
         "",
+        *_metrics_section(calibrate),
         "## Step 2 — Hit-rate cuts",
         "",
         "### Overall",

@@ -452,13 +452,15 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
     against gamma, compute hit-rate cuts, and run a batched LLM pattern
     call comparing wins vs losses.
 
-    Two steps: `calibrate` (cuts only) or `analyze` (default — cuts +
-    post-match + LLM findings, joined into one `report.md`). Each step
-    auto-refreshes gamma resolution sidecars at the start — no manual
-    resolve step needed. Outputs land in `logs/retro/`. `--run-id`
-    narrows to a single run log; without it every log under
-    `logs/runs/` is processed (resolution sidecars are idempotent so
-    reruns are cheap).
+    Three steps: `calibrate` (cuts + proper scoring metrics, read-only),
+    `fit-calibration` (fit + commit the temperature-scaling artefact),
+    or `analyze` (default — cuts + post-match + LLM findings, joined
+    into one `report.md`). Each step auto-refreshes gamma resolution
+    sidecars at the start — no manual resolve step needed. Outputs land
+    in `logs/retro/` (except `fit-calibration`, which writes
+    `models/tennis_calibration.json`). `--run-id` narrows to a single
+    run log; without it every log under `logs/runs/` is processed
+    (resolution sidecars are idempotent so reruns are cheap).
 
     `--sport` filters the analyze LLM call only — calibrate cuts and
     the implicit resolve step always cover everything in scope.
@@ -467,6 +469,7 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
     from skimsmarkets.retro.orchestrator import (
         run_step_analyze,
         run_step_calibrate,
+        run_step_fit_calibration,
     )
 
     sports_filter: set[str] | None = (
@@ -474,6 +477,9 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
     )
     if args.step == "calibrate":
         await run_step_calibrate(run_id=args.run_id)
+        return 0
+    if args.step == "fit-calibration":
+        await run_step_fit_calibration(run_id=args.run_id)
         return 0
     # default: analyze (full pass — cuts + post-match + LLM + report.md)
     md_path = await run_step_analyze(
@@ -812,16 +818,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_retro.add_argument(
         "--step",
-        choices=("calibrate", "analyze"),
+        choices=("calibrate", "analyze", "fit-calibration"),
         default="analyze",
         help=(
             "Which step to run. `analyze` (default) is the full pass: "
             "renders calibrate hit-rate cuts to the terminal, fetches "
             "post-match stats, runs the LLM pattern call per sport, and "
             "writes a combined `report.md`. `calibrate` is the "
-            "lightweight cuts-only path. Both auto-refresh gamma "
-            "resolutions first (idempotent) so output always reflects "
-            "the latest settlements."
+            "lightweight cuts + scoring-metrics path (read-only). "
+            "`fit-calibration` fits the temperature-scaling scalar on "
+            "resolved outcomes and writes `models/tennis_calibration.json` "
+            "— operator-gated, the only step that writes a model "
+            "artefact. All auto-refresh gamma resolutions first "
+            "(idempotent) so output always reflects the latest "
+            "settlements."
         ),
     )
     p_retro.add_argument(

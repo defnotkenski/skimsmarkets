@@ -12,12 +12,18 @@ The latest of each can always be found with a sort-newest glob.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from anthropic import AsyncAnthropic
 
 from skimsmarkets import config as cfg
+from skimsmarkets.calibration import (
+    CALIBRATION_PATH,
+    apply_temperature,
+    load_temperature,
+    write_calibration,
+)
 from skimsmarkets.retro.analyze import analyze_all_sports
 from skimsmarkets.retro.calibrate import (
     CalibrateReport,
@@ -32,6 +38,12 @@ from skimsmarkets.retro.jsonl import (
     log_root,
     resolutions_sidecar_path,
     run_path_for_id,
+)
+from skimsmarkets.retro.metrics import (
+    MIN_CLASS_N,
+    MIN_FIT_N,
+    compute_metrics,
+    fit_temperature,
 )
 from skimsmarkets.retro.models import (
     EventFeatures,
@@ -143,7 +155,12 @@ def _features_with_post_match(
 async def run_step_calibrate(
     run_id: str | None = None,
 ) -> CalibrateReport:
-    """Step 2 — print hit-rate tables to stdout. Returns the report.
+    """Step 2 — print hit-rate cuts + proper scoring metrics to stdout.
+    Returns the report.
+
+    Renders Brier / log-loss / ECE before and after the live committed
+    calibration temperature (`models/tennis_calibration.json`); with no
+    artefact committed the two are identical.
 
     Auto-runs Step 1 (`run_step_resolve`) first so the calibrate cuts
     always reflect the freshest gamma settlements without the operator
@@ -174,9 +191,92 @@ async def run_step_calibrate(
         if run_id is not None
         else collect_features()
     )
-    report = aggregate(feats, n_duplicates_dropped=duplicates_dropped)
+    # The live committed temperature, so the rendered metrics show
+    # before/after what the current artefact would produce. Absent
+    # artefact → 1.0 → "after" equals "before".
+    temperature = load_temperature("tennis")
+    report = aggregate(
+        feats,
+        n_duplicates_dropped=duplicates_dropped,
+        temperature=temperature,
+    )
     render_report(report)
     return report
+
+
+async def run_step_fit_calibration(run_id: str | None = None) -> None:
+    """Fit + commit the calibration temperature — the operator-gated
+    artefact-writing step behind `skims retro --step fit-calibration`.
+
+    Auto-resolves first (mirrors `run_step_calibrate`), collects every
+    settled tennis `(predicted_prob, won)` pair, fits a single
+    temperature by minimising NLL, and — only on a real fit — writes
+    `models/tennis_calibration.json` with the before/after scorecard.
+
+    Refuses (writes nothing, leaves any existing artefact intact) when
+    there is too little data to trust a one-parameter fit; the operator
+    sees a "refused — <reason>" line. Mirrors `skims gbt train`:
+    operator-run, writes a committed artefact, never auto-triggered.
+
+    The fit only ever sees `(predicted_prob, won)` — win/loss outcomes,
+    never a market price — so calibration stays market-blind.
+    """
+    await run_step_resolve(run_id)
+    feats, _ = (
+        _features_with_post_match(run_id=run_id)
+        if run_id is not None
+        else collect_features()
+    )
+    pairs = [
+        (f.predicted_prob, f.won)
+        for f in feats
+        if f.settled and f.won is not None and f.sport_type == "tennis"
+    ]
+    t = fit_temperature(pairs)
+    if t is None:
+        # Re-derive which guard tripped for an operator-facing message.
+        n_pos = sum(1 for _, y in pairs if y)
+        n_neg = len(pairs) - n_pos
+        if len(pairs) < MIN_FIT_N:
+            reason = (
+                f"only {len(pairs)} settled tennis events, "
+                f"need >= {MIN_FIT_N}"
+            )
+        else:
+            reason = (
+                f"need >= {MIN_CLASS_N} of each outcome class "
+                f"(have {n_pos} wins, {n_neg} losses)"
+            )
+        log.warning("retro fit-calibration: refused — %s", reason)
+        print(f"retro fit-calibration: refused — {reason}")
+        return
+    before = compute_metrics(pairs)
+    after = compute_metrics([(apply_temperature(p, t), y) for p, y in pairs])
+    write_calibration(
+        {
+            "tennis": {
+                "temperature": t,
+                "n": len(pairs),
+                "fit_at_utc": datetime.now(UTC),
+                "brier_before": before.brier,
+                "brier_after": after.brier,
+                "log_loss_before": before.log_loss,
+                "log_loss_after": after.log_loss,
+                "ece_before": before.ece,
+                "ece_after": after.ece,
+            }
+        }
+    )
+    print(
+        f"retro fit-calibration: tennis T={t:.4f} (n={len(pairs)})  "
+        f"Brier {before.brier:.4f} → {after.brier:.4f}  "
+        f"log-loss {before.log_loss:.4f} → {after.log_loss:.4f}  "
+        f"ECE {before.ece:.4f} → {after.ece:.4f}  → {CALIBRATION_PATH}"
+    )
+    log.info(
+        "retro fit-calibration: wrote tennis T=%.4f (n=%d) to %s",
+        t, len(pairs), CALIBRATION_PATH,
+    )
 
 
 async def run_step_analyze(

@@ -29,6 +29,7 @@ from skimsmarkets.agents.schemas import (
 from skimsmarkets.agents.sports._director_shared import PROMPT_VERSION
 from skimsmarkets.agents.sports import resolve_lens_set
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
+from skimsmarkets.calibration import apply_temperature, load_temperature
 from skimsmarkets.classify import classify_risk
 from skimsmarkets.progress import ProgressReporter
 from skimsmarkets.polymarket.enrichment import (
@@ -1080,6 +1081,12 @@ def _persist_run(result: RunResult) -> None:
         _LOG_ROOT.mkdir(parents=True, exist_ok=True)
         path = _LOG_ROOT / f"{result.run_id}.jsonl"
         logged_at = datetime.now(UTC).isoformat()
+        # Calibration temperature, loaded once per run. v1 is tennis-only —
+        # every prediction row is tennis (the lens registry drops other
+        # sports before they reach here), so a single lookup covers the
+        # slate. When a second sport gets a fitted calibration this becomes
+        # a per-row `load_temperature(p.sport_type)`.
+        run_temperature = load_temperature("tennis")
         with path.open("w") as f:
             for p in result.predictions:
                 # Notebooks + reports come from the two-stage agent chain
@@ -1192,6 +1199,7 @@ def _persist_run(result: RunResult) -> None:
                     da.defensibility_score if da is not None else None,
                     gap_to_market,
                     predicted_winner_is_team_a=predicted_winner_is_team_a,
+                    temperature=run_temperature,
                 )
                 result.risk_classifications[p.event_id] = (
                     risk_bucket,
@@ -1346,6 +1354,16 @@ def _persist_run(result: RunResult) -> None:
                     # `classify.py`.
                     "risk_bucket": risk_bucket,
                     "risk_score": risk_score,
+                    # Calibration audit — `calibration_temperature` is the
+                    # scalar applied to the magnitude term this run (1.0 when
+                    # no artefact is committed); `calibrated_winner_probability`
+                    # is what the classifier's magnitude term actually saw.
+                    # Raw `predicted_yes_probability` stays the source of truth
+                    # for re-fitting; these two just record the live decision.
+                    "calibration_temperature": run_temperature,
+                    "calibrated_winner_probability": apply_temperature(
+                        p.predicted_yes_probability, run_temperature
+                    ),
                     "tennis_stats": (
                         ts.model_dump(mode="json") if ts is not None else None
                     ),
