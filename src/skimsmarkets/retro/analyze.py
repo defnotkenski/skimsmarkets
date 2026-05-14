@@ -101,8 +101,9 @@ DISCIPLINE — read carefully:
 Output a `RetroFindings` object with:
 - `recurring_patterns`: 3-7 short bullets, each naming one
   loss-overrepresented feature with its rough magnitude.
-- `lens_underperformance`: dict mapping lens name → recurring failure
-  mode. Empty when no clear lens attribution emerges from the data.
+- `lens_underperformance`: list of `{lens_name, failure_mode}` records,
+  one per lens with a recurring failure mode. Empty list when no
+  clear lens attribution emerges from the data.
 - `prompt_recommendations`: 2-5 concrete edits worth considering.
 """
 

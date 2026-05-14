@@ -894,31 +894,36 @@ def _tennis_imbalance(
     base_score = min(
         1.0, math.log10(ratio) / math.log10(_TENNIS_POINTS_RATIO_CAP)
     )
+    # Favorite is determined by points alone; every downstream tier
+    # signs its adjustment by which side is the points-favorite, so
+    # hoist this read out of the form block to stay independent of
+    # form data availability.
+    a_is_favorite = points_a >= points_b
 
-    # Form-alignment adjustment. Skip silently when either side's form
-    # data is unavailable — base_score is already a defensible signal
-    # and asymmetric form data would be misleading.
+    # Form-alignment adjustment. Skip silently (contribute 0) when
+    # either side's form data is unavailable or below the sample floor
+    # — base_score and the other tiers below still compose; this tier
+    # just doesn't fire. Same graceful-degrade posture as the rest.
+    form_adjustment = 0.0
     a_form = provider.lookup_player_form(identity.tour, identity.player_a)
     b_form = provider.lookup_player_form(identity.tour, identity.player_b)
-    if a_form is None or b_form is None:
-        return base_score
-    a_form_str, _a_best = a_form
-    b_form_str, _b_best = b_form
-    if (
-        len(a_form_str) < _MIN_FORM_SAMPLES
-        or len(b_form_str) < _MIN_FORM_SAMPLES
-    ):
-        return base_score
-    a_wp = a_form_str.count("W") / len(a_form_str)
-    b_wp = b_form_str.count("W") / len(b_form_str)
-    # Sign by which player has more points: alignment is positive when
-    # the higher-points player also has the better form.
-    a_is_favorite = points_a >= points_b
-    if a_is_favorite:
-        high_wp, low_wp = a_wp, b_wp
-    else:
-        high_wp, low_wp = b_wp, a_wp
-    form_adjustment = _FORM_ADJUSTMENT_CAP * (high_wp - low_wp)
+    if a_form is not None and b_form is not None:
+        a_form_str, _a_best = a_form
+        b_form_str, _b_best = b_form
+        if (
+            len(a_form_str) >= _MIN_FORM_SAMPLES
+            and len(b_form_str) >= _MIN_FORM_SAMPLES
+        ):
+            a_wp = a_form_str.count("W") / len(a_form_str)
+            b_wp = b_form_str.count("W") / len(b_form_str)
+            # Sign by which player has more points: alignment is
+            # positive when the higher-points player also has the
+            # better form.
+            if a_is_favorite:
+                high_wp, low_wp = a_wp, b_wp
+            else:
+                high_wp, low_wp = b_wp, a_wp
+            form_adjustment = _FORM_ADJUSTMENT_CAP * (high_wp - low_wp)
 
     # Consistency-alignment adjustment. Stacks on form. Skip silently
     # when either side's match-history cache is empty (warmup didn't

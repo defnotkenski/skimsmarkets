@@ -262,6 +262,12 @@ async def judge_slate(
             model=CLAUDE_MODEL,
             input_tokens=parsed.usage.input_tokens,
             output_tokens=parsed.usage.output_tokens,
+            cache_creation_input_tokens=getattr(
+                parsed.usage, "cache_creation_input_tokens", None
+            ),
+            cache_read_input_tokens=getattr(
+                parsed.usage, "cache_read_input_tokens", None
+            ),
         ))
     log.info(
         "judge scored %d/%d events; tokens in/out=%s/%s",

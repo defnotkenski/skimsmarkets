@@ -6,6 +6,8 @@ import logging
 import sys
 
 import httpx
+from rich.console import Console
+from rich.logging import RichHandler
 
 from skimsmarkets import config as cfg
 from skimsmarkets.backtest.dataset import build_dataset
@@ -13,12 +15,33 @@ from skimsmarkets.pipeline import (
     SlateOptions,
     apply_horizon_filter,
     fetch_slate,
+    filter_unmatched_matchstats_events,
     overlay_matchstats_tipoffs,
     run_pipeline,
 )
+from skimsmarkets.progress import ProgressReporter
 from skimsmarkets.reporting import print_events_table, print_run_summary
 from skimsmarkets.selection import select_top_events
 from skimsmarkets.tennis.provider import build_tennis_provider
+
+# Module-level shared Console for the entire CLI process.
+#
+# Critical: it's the single instance everything writes through —
+# `RichHandler` (logging), `ProgressReporter` (rank progress bars),
+# `ExecuteDisplay` (execute live trades table), and the various
+# `print_*_summary` panels. When a log record fires while Live is
+# active, Rich's internal coordination suspends the live region,
+# prints the log above it, and resumes — but that only works when
+# the logger AND the live display share the SAME `Console` instance.
+# Two separate `Console()` calls (even both targeting stderr) wouldn't
+# coordinate; you'd be back to the same interleaving problem the
+# refresh-rate drop only partially mitigated.
+#
+# `stderr=True` keeps the long-standing convention that pipe users
+# can do `skims rank 2>/dev/null` to silence diagnostics. Rich's Live
+# + Progress render cleanly on stderr — ANSI cursor controls don't
+# care which stream they target.
+_CONSOLE = Console(stderr=True)
 
 
 # ---------------------------------------------------------------------------
@@ -53,19 +76,55 @@ class _NoisySDKMinLevelFilter(logging.Filter):
 
 
 def _setup_logging(verbose: bool) -> None:
+    # `RichHandler` against the shared `_CONSOLE` so log records
+    # cooperate with any active Live region (Progress bars, trades
+    # table). Without this coordination, stdlib's `StreamHandler`
+    # caches `sys.stderr` at config time, before any Live starts —
+    # subsequent log writes bypass Rich entirely and interleave with
+    # the live region's redraws, leaving phantom bar copies in
+    # scrollback.
+    #
+    # Column choices:
+    #   show_time=True   — keeps the timestamp column the user is
+    #                      used to (Rich uses HH:MM:SS by default;
+    #                      override via `log_time_format` if needed).
+    #   show_level=True  — coloured level badge replaces the plain
+    #                      `INFO ` / `WARNING ` prefix.
+    #   show_path=False  — the path column shows the caller's source
+    #                      file, but the logger name (set via the
+    #                      message formatter below) is the more
+    #                      useful identifier for this codebase.
+    #   markup=False     — log message content is not trusted Rich
+    #                      markup; avoid surprises if a log line
+    #                      contains square brackets.
+    #   rich_tracebacks=False — keep stdlib traceback formatting so
+    #                      `-v` runs look like ordinary Python logs.
+    handler = RichHandler(
+        console=_CONSOLE,
+        show_time=True,
+        show_level=True,
+        show_path=False,
+        markup=False,
+        rich_tracebacks=False,
+    )
+    # Fold the logger name into the message so it stays visible —
+    # `RichHandler` has no built-in `show_name` toggle and dropping it
+    # entirely would lose the `skimsmarkets.polymarket.slate` style
+    # identifier that the existing log lines used.
+    handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
+        handlers=[handler],
+        force=True,
     )
     # In normal mode, hide INFO chatter from third-party SDKs (httpx
     # request lines, google_genai's per-call "AFC enabled" notice) so
     # our own pipeline INFO logs stay readable. Verbose (`-v`) shows
-    # everything for debugging.
+    # everything for debugging. Filter attaches to the handler (not
+    # the logger) so records still flow to any other handler that
+    # gets added later (e.g. pytest capture).
     if not verbose:
-        handler_filter = _NoisySDKMinLevelFilter(logging.WARNING)
-        for handler in logging.getLogger().handlers:
-            handler.addFilter(handler_filter)
+        handler.addFilter(_NoisySDKMinLevelFilter(logging.WARNING))
 
 
 # ---------------------------------------------------------------------------
@@ -106,18 +165,25 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
 async def _cmd_rank(args: argparse.Namespace) -> int:
     """Run the full pipeline: build the slate, then rank with specialists +
     director. Persists results to `logs/runs/<run_id>.jsonl`.
+
+    The `ProgressReporter` wraps the run so the user sees live progress
+    on the four pipeline phases (slate / enrich / predict / judge). It
+    routes to stdout via Rich; the existing logging breadcrumbs stay on
+    stderr (see `_setup_logging`) so the two displays don't fight.
     """
     opts = _slate_opts_from_args(args)
-    result = await run_pipeline(
-        leagues=opts.leagues or None,
-        horizon_hours=opts.horizon_hours,
-        max_implied_probability=opts.max_implied_probability,
-        min_open_interest_dollars=opts.min_open_interest_dollars,
-        slugs=opts.slugs or None,
-        sports=opts.sports or None,
-        tennis_stats_disabled=args.no_tennis_stats,
-    )
-    print_run_summary(result)
+    async with ProgressReporter(console=_CONSOLE) as progress:
+        result = await run_pipeline(
+            leagues=opts.leagues or None,
+            horizon_hours=opts.horizon_hours,
+            max_implied_probability=opts.max_implied_probability,
+            min_open_interest_dollars=opts.min_open_interest_dollars,
+            slugs=opts.slugs or None,
+            sports=opts.sports or None,
+            tennis_stats_disabled=args.no_tennis_stats,
+            progress=progress,
+        )
+    print_run_summary(result, console=_CONSOLE)
     return 0
 
 
@@ -149,19 +215,31 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
         build_tennis_provider(config) as tennis_provider,
     ):
         events = await fetch_slate(opts, http=http, gamma_sem=gamma_sem)
-        # Mirror run_pipeline's stage order: overlay MatchStats tipoffs
-        # onto each event, then apply the horizon filter against the
-        # now-precise times. Without this, fetch would print events the
-        # ranker would later drop (or vice versa) — same drift the
-        # `select_top_events` call below already prevents for selection.
-        await overlay_matchstats_tipoffs(events, tennis_provider)
+        # Mirror run_pipeline's stage order: overlay MatchStats tipoffs,
+        # drop tennis events with no fixture match, then apply the
+        # horizon filter against the now-precise times. Fetch is
+        # display-only but needs to mirror rank's pipeline exactly —
+        # otherwise the user would see events here that rank would
+        # later drop (or vice versa).
+        matched_event_ids, total_fixtures = (
+            await overlay_matchstats_tipoffs(events, tennis_provider)
+        )
+        events = filter_unmatched_matchstats_events(
+            events,
+            matched_event_ids=matched_event_ids,
+            total_fixtures_fetched=total_fixtures,
+        )
         events = apply_horizon_filter(events, horizon_hours=opts.horizon_hours)
         events = await select_top_events(
             events,
             max_events=cfg.MAX_SLATE_EVENTS,
             tennis_provider=tennis_provider,
         )
-    print_events_table(events, opts.leagues, horizon_hours=opts.horizon_hours)
+    print_events_table(
+        events, opts.leagues,
+        horizon_hours=opts.horizon_hours,
+        console=_CONSOLE,
+    )
     return 0
 
 
@@ -249,6 +327,10 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
     Audit log: `logs/trades/<run_id>.jsonl`, one row per filtered
     prediction whether placed, skipped, or dry-run.
     """
+    from skimsmarkets.execute.reporting import (
+        ExecuteDisplay,
+        print_execute_summary,
+    )
     from skimsmarkets.execute.trader import ExecuteOptions, run_execute
 
     # Fall-through: an explicit CLI value (truthy list, non-None scalar,
@@ -286,22 +368,16 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         sports=sports,
     )
     config = cfg.Config.from_env(require_llm=False)
-    summary = await run_execute(opts, config=config)
-    print(
-        f"execute: predictions={summary.total_predictions} "
-        f"passed={summary.passed_filters} "
-        f"filled={summary.filled} "
-        f"partial={summary.partial} "
-        f"submitted={summary.submitted} "
-        f"dry_run={summary.skipped_dry_run} "
-        f"skipped={summary.skipped} "
-        f"total_cost_cents={summary.total_filled_cost_cents}"
-    )
-    if summary.skip_reasons:
-        reasons = ", ".join(
-            f"{k}={v}" for k, v in sorted(summary.skip_reasons.items())
+    async with ExecuteDisplay(console=_CONSOLE) as display:
+        summary, open_exposure_cents = await run_execute(
+            opts, config=config, display=display,
         )
-        print(f"skip reasons: {reasons}")
+    print_execute_summary(
+        summary,
+        open_exposure_cents=open_exposure_cents,
+        max_open_exposure_cents=opts.max_open_exposure_cents,
+        console=_CONSOLE,
+    )
     return 0
 
 

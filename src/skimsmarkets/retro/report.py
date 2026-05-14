@@ -52,8 +52,8 @@ def _findings_md(findings: RetroFindings) -> str:
     if findings.lens_underperformance:
         lines.append("**Lens attribution:**")
         lines.append("")
-        for lens, mode in findings.lens_underperformance.items():
-            lines.append(f"- `{lens}` — {mode}")
+        for lu in findings.lens_underperformance:
+            lines.append(f"- `{lu.lens_name}` — {lu.failure_mode}")
         lines.append("")
     if findings.prompt_recommendations:
         lines.append("**Prompt-edit recommendations (operator review):**")

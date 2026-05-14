@@ -335,6 +335,12 @@ async def synthesize_prediction(
             model=CLAUDE_MODEL,
             input_tokens=parsed.usage.input_tokens,
             output_tokens=parsed.usage.output_tokens,
+            cache_creation_input_tokens=getattr(
+                parsed.usage, "cache_creation_input_tokens", None
+            ),
+            cache_read_input_tokens=getattr(
+                parsed.usage, "cache_read_input_tokens", None
+            ),
         ))
     log.debug(
         "director event=%s sport=%s tokens in/out=%s/%s",

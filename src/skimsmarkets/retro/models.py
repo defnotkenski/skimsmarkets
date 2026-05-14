@@ -316,6 +316,36 @@ class RetroPostMatchPair(BaseModel):
     player_b: PerMatchStats | None = None
 
 
+class LensUnderperformance(BaseModel):
+    """One lens's recurring failure mode, attributed by the retro analyzer.
+
+    Pairs the lens name with a one-line description of how it's failing.
+    Carried as a list-of-records on `RetroFindings` rather than a dict
+    (`{lens_name: failure_mode}`) for the same reason `SpecialistWeight`
+    is a list: dict-shaped outputs are less reliable than list-shaped
+    outputs in Anthropic's structured-output mode (the compiler enforces
+    array constraints during generation but not object cardinality).
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    lens_name: str = Field(
+        description=(
+            "Exact lens name from the sport's registered LensSet — e.g. "
+            "for tennis: 'tennis_form_and_surface', "
+            "'tennis_matchup_and_clutch', 'tennis_conditions_and_context'. "
+            "Do not invent lens names."
+        ),
+    )
+    failure_mode: str = Field(
+        description=(
+            "One short sentence describing the recurring failure mode "
+            "for this lens (e.g. 'overweights H2H sample of <3 meetings', "
+            "'misses surface-specific form on clay-court swing')."
+        ),
+    )
+
+
 class RetroFindings(BaseModel):
     """Output of Step 3's batched LLM pattern-finding call (per sport).
 
@@ -338,13 +368,12 @@ class RetroFindings(BaseModel):
             "language. Each entry is one short bullet."
         ),
     )
-    lens_underperformance: dict[str, str] = Field(
-        default_factory=dict,
+    lens_underperformance: list[LensUnderperformance] = Field(
+        default_factory=list,
         description=(
-            "Map of lens_name → recurring failure mode. Lens names must "
-            "match the sport's registered LensSet (e.g. for tennis: "
-            "tennis_form_and_surface, tennis_matchup_and_clutch, "
-            "tennis_conditions_and_context)."
+            "One entry per lens with a recurring failure mode. Empty list "
+            "when no clear lens attribution emerges from the data. Use the "
+            "exact lens names from the sport's registered LensSet."
         ),
     )
     prompt_recommendations: list[str] = Field(

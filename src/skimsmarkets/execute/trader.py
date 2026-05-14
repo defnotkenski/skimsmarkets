@@ -29,6 +29,7 @@ from skimsmarkets.execute.audit import (
     write_trade_row,
 )
 from skimsmarkets.execute.filters import filter_rows
+from skimsmarkets.execute.reporting import ExecuteDisplay
 from skimsmarkets.kalshi.client import KalshiClient, KalshiOrderError
 from skimsmarkets.kalshi.matcher import MatchOutcome, find_kalshi_match
 from skimsmarkets.kalshi.models import (
@@ -77,20 +78,42 @@ class ExecuteSummary:
     total_filled_cost_cents: int = 0
 
 
-async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary:
-    """Main entry point — async, returns a printable summary."""
+async def run_execute(
+    opts: ExecuteOptions,
+    *,
+    config: Config,
+    display: ExecuteDisplay | None = None,
+) -> tuple[ExecuteSummary, int]:
+    """Main entry point — async.
+
+    Returns `(summary, open_exposure_cents_post_run)` so the CLI's
+    final summary panel can surface the post-run exposure utilisation
+    alongside the dollar total. `open_exposure_cents` is the snapshot
+    taken at pre-flight (NOT updated for this-run fills), which keeps
+    the panel's "cap used" line aligned with the same number the
+    exposure-cap gate enforced during the loop.
+
+    When `display` is None (tests, non-CLI callers) all visual hooks
+    no-op and behaviour is unchanged from the pre-Rich version.
+    """
     _validate(opts, config)
 
     run_path = run_path_for_id(opts.run_id)
     if not run_path.exists():
         raise RuntimeError(f"No run log at {run_path}")
 
+    if display is not None:
+        display.start_phase("load")
     rows = list(iter_predictions(run_path))
     summary = ExecuteSummary(total_predictions=len(rows))
+    if display is not None:
+        display.complete_phase("load")
     if not rows:
         log.warning("execute: run %s has no prediction rows", opts.run_id)
-        return summary
+        return summary, 0
 
+    if display is not None:
+        display.start_phase("filter")
     filtered = list(filter_rows(
         rows,
         confidence=opts.confidence,
@@ -102,8 +125,10 @@ async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary
     log.info(
         "execute: %d / %d rows passed filters", len(filtered), len(rows),
     )
+    if display is not None:
+        display.complete_phase("filter")
     if not filtered:
-        return summary
+        return summary, 0
 
     audit_path = trades_log_path(opts.run_id)
     # Intra-run idempotency: any prediction whose event already has an
@@ -127,18 +152,34 @@ async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary
             private_key_path=config.kalshi_private_key_path,
             private_key_pem=config.kalshi_private_key_pem,
         )
+        if display is not None:
+            display.start_phase("exposure")
         open_exposure_cents = await _prefetch_open_exposure(
             client, opts=opts, config=config,
         )
+        if display is not None:
+            display.complete_phase("exposure")
         log.info(
             "execute: open Kalshi exposure = %d cents (cap %d)",
             open_exposure_cents, opts.max_open_exposure_cents,
         )
+
+        if display is not None:
+            display.start_phase("events")
         events = await _prefetch_events(client)
+        if display is not None:
+            display.complete_phase("events")
         log.info(
             "execute: pre-fetched %d Kalshi events across %d series",
             len(events), len(cfg.KALSHI_TENNIS_SERIES_TICKERS),
         )
+
+        # Seed all pending trade rows up front so the user sees the full
+        # pipeline of trades that are coming — each row then updates in
+        # place via `update_trade` as `_process_row` resolves it.
+        if display is not None:
+            for row in filtered:
+                display.add_pending(row)
 
         for row in filtered:
             audit_row = await _process_row(
@@ -153,8 +194,10 @@ async def run_execute(opts: ExecuteOptions, *, config: Config) -> ExecuteSummary
             write_trade_row(audit_row, audit_path)
             this_run_pending_cents += audit_row.fill_total_cost_cents
             _bump(summary, audit_row)
+            if display is not None:
+                display.update_trade(row, audit_row)
 
-    return summary
+    return summary, open_exposure_cents
 
 
 def _validate(opts: ExecuteOptions, config: Config) -> None:

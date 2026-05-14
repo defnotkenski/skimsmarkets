@@ -65,6 +65,12 @@ class TokenUsage(BaseModel):
     omits the metadata; treat None as "unknown, do not aggregate."
     `provider` and `model` ride along so retro grading can A/B token cost
     per provider without joining against the run-level meta record.
+
+    `cache_creation_input_tokens` / `cache_read_input_tokens` are
+    Anthropic-only buckets — the SDK populates them when `cache_control`
+    blocks are on the request. None for non-Anthropic providers (Grok,
+    Gemini). The cost computation in `agents/pricing.py` treats both as
+    0 when None.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -85,7 +91,25 @@ class TokenUsage(BaseModel):
     )
     output_tokens: int | None = Field(
         default=None,
-        description="Completion-side tokens. None when the SDK omitted the metadata.",
+        description=(
+            "Completion-side tokens. Includes extended-thinking tokens for "
+            "Anthropic — billed at the standard output rate. None when the "
+            "SDK omitted the metadata."
+        ),
+    )
+    cache_creation_input_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Anthropic-only: tokens billed at the cache-write premium "
+            "(1.25× input for 5m TTL). None for non-Anthropic providers."
+        ),
+    )
+    cache_read_input_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Anthropic-only: tokens billed at the cache-hit discount "
+            "(0.1× input). None for non-Anthropic providers."
+        ),
     )
 
 
@@ -462,10 +486,12 @@ class DefensibilityAssessment(BaseModel):
     defensibility_flags: list[str] = Field(
         default_factory=list,
         description=(
-            "Up to 3 short slugs naming the load-bearing weaknesses, e.g. "
-            "'thin_reasoning', 'lens_disagreement', 'uw_contra', "
-            "'concentrated_weights', 'unexplained_gap'. Empty when the case "
-            "is clean."
+            "Up to 3 short snake_case slugs naming the load-bearing "
+            "weaknesses. Prefer the JUDGE_SYSTEM vocabulary "
+            "('thin_reasoning', 'lens_disagreement', 'uw_contra', "
+            "'concentrated_weights', 'unexplained_gap', "
+            "'low_confidence_tier', 'live_volatility') and only coin a "
+            "new slug when none fits. Empty when the case is clean."
         ),
     )
 

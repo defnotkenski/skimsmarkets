@@ -104,6 +104,16 @@ _HOST = "tennis-api-atp-wta-itf.p.rapidapi.com"
 _RANKING_PAGE_SIZE = 100
 _RANKING_MAX_PAGES = 5  # 5 × 100 = top 500
 
+# Fixtures pagination. The vendor exposes a `hasNextPage` boolean on
+# every response — we honour it so heavy global-tour days (atp endpoint
+# rolls in main-tour + Challengers + men's ITF M-tier; a busy worldwide
+# Sunday can plausibly push past 500) don't silently drop the overflow.
+# `_FIXTURE_MAX_PAGES` is a safety cap so a stuck `hasNextPage=true`
+# from a vendor bug can't infinite-loop the fetch. 10 × 500 = 5000/day
+# is well past any realistic single-tour single-date volume.
+_FIXTURE_PAGE_SIZE = 500
+_FIXTURE_MAX_PAGES = 10
+
 # Vendor courtId → our surface key. Per probing 2026-04-23:
 #   1 = Hard, 2 = Clay, 3 = I.hard (indoor hard), 5 = Grass.
 # We collapse Hard + I.hard into "hard" so the prompt block stays compact
@@ -442,6 +452,13 @@ class MatchStatTennisProvider:
         self._client: httpx.AsyncClient | None = None
         # Rankings index: tour → normalized-name → (player_id, position, points).
         self._index: dict[str, dict[str, tuple[int, int | None, int | None]]] = {}
+        # Only `atp` and `wta` here — MatchStats rejects `tour=itf`
+        # with a 400 ("Tour type is not valid"). ITF fixtures are
+        # served BY GENDER under the existing tours: men's Challengers
+        # + ITF M-tier come back from `/tennis/v2/atp/fixtures/{date}`
+        # and women's ITF W-tier from `/tennis/v2/wta/fixtures/{date}`.
+        # The overlay handles ITF events by querying both indexes —
+        # see `_matchstat_tours_for_slug` in `pipeline.py`.
         self._index_locks: dict[str, asyncio.Lock] = {
             "atp": asyncio.Lock(),
             "wta": asyncio.Lock(),
@@ -2071,10 +2088,12 @@ class MatchStatTennisProvider:
         failure or when the vendor has no fixtures for that date —
         overlay degrades silently per missing match.
 
-        `pageSize=500` covers the busiest tournament-day combination
-        (M-tier futures days can ship 100+ singles fixtures per tour);
-        the endpoint paginates beyond that but the slate horizon
-        filter upstream caps practical demand well below that ceiling.
+        Paginated via `hasNextPage` — the vendor caps individual
+        responses around `_FIXTURE_PAGE_SIZE` rows, and heavy days
+        (atp endpoint rolls in main-tour + Challengers + ITF M-tier
+        worldwide) can spill past one page. Hard-capped at
+        `_FIXTURE_MAX_PAGES` so a stuck-true `hasNextPage` from a
+        vendor bug can't infinite-loop the fetch.
         """
         # Ensure the index exists for this tour BEFORE seeding —
         # otherwise our setdefault writes would land in an empty dict
@@ -2082,107 +2101,133 @@ class MatchStatTennisProvider:
         await self._ensure_index(tour)
 
         path = f"/tennis/v2/{tour}/fixtures/{date_iso}"
-        payload = await self._get(
-            path,
-            params={
-                "pageSize": 500,
-                "include": "tournament,tournament.court,round",
-            },
-        )
         out: dict[frozenset[str], MatchStatsFixture] = {}
-        if not isinstance(payload, dict):
-            return out
-        items = payload.get("data") or []
-        if not isinstance(items, list):
-            return out
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            p1_obj = item.get("player1") or {}
-            p2_obj = item.get("player2") or {}
-            p1_name = p1_obj.get("name") if isinstance(p1_obj, dict) else None
-            p2_name = p2_obj.get("name") if isinstance(p2_obj, dict) else None
-            key = _surname_pair_key(p1_name, p2_name)
-            if key is None:
-                continue
-            # `date` may be null on early-round matches whose tipoff
-            # tour officials haven't confirmed. Carry None through —
-            # the overlay stage skips dateless rows (gamma's
-            # `gameStartTime` stays). The non-date fields (player IDs,
-            # tournament, surface, round) are still useful and worth
-            # indexing.
-            tipoff: datetime | None = None
-            raw_date = item.get("date")
-            if isinstance(raw_date, str) and raw_date:
-                try:
-                    tipoff = datetime.fromisoformat(
-                        raw_date.replace("Z", "+00:00")
+        for page_no in range(1, _FIXTURE_MAX_PAGES + 1):
+            payload = await self._get(
+                path,
+                params={
+                    "pageSize": _FIXTURE_PAGE_SIZE,
+                    "pageNo": page_no,
+                    "include": "tournament,tournament.court,round",
+                },
+            )
+            if not isinstance(payload, dict):
+                break
+            items = payload.get("data") or []
+            if not isinstance(items, list) or not items:
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                p1_obj = item.get("player1") or {}
+                p2_obj = item.get("player2") or {}
+                p1_name = (
+                    p1_obj.get("name") if isinstance(p1_obj, dict) else None
+                )
+                p2_name = (
+                    p2_obj.get("name") if isinstance(p2_obj, dict) else None
+                )
+                key = _surname_pair_key(p1_name, p2_name)
+                if key is None:
+                    continue
+                # `date` may be null on early-round matches whose tipoff
+                # tour officials haven't confirmed. Carry None through —
+                # the overlay stage skips dateless rows (gamma's
+                # `gameStartTime` stays). The non-date fields (player
+                # IDs, tournament, surface, round) are still useful and
+                # worth indexing.
+                tipoff: datetime | None = None
+                raw_date = item.get("date")
+                if isinstance(raw_date, str) and raw_date:
+                    try:
+                        tipoff = datetime.fromisoformat(
+                            raw_date.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        tipoff = None
+                    # Docs flag fixture dates as "ISO 8601 UTC —
+                    # treat as UTC, no timezone." The Z-suffix path
+                    # above produces an aware UTC datetime, but a
+                    # naive ISO string would not — anchor to UTC so
+                    # downstream tz-aware comparisons (e.g. the
+                    # `apply_horizon_filter` `backstop <= tipoff <=
+                    # horizon_end` check) can't trip on mixed
+                    # naive/aware operands.
+                    if tipoff is not None and tipoff.tzinfo is None:
+                        tipoff = tipoff.replace(tzinfo=UTC)
+                tourn_obj = item.get("tournament") or {}
+                tourn_name = (
+                    tourn_obj.get("name")
+                    if isinstance(tourn_obj, dict) else None
+                )
+                court_obj = (
+                    tourn_obj.get("court")
+                    if isinstance(tourn_obj, dict) else None
+                )
+                # Prefer the courtId path so indoor-hard ("I.hard")
+                # collapses to canonical "hard" via
+                # `_COURT_ID_TO_SURFACE` — matches the vocabulary
+                # `TennisPlayerStats.surface_win_loss` and the tennis
+                # sport hint already use. The
+                # `include=tournament.court` expansion ships the court
+                # as a nested object with `id`/`name`, but flat
+                # `courtId` exists on some payload shapes too — check
+                # both before falling through to raw lowercased name.
+                surface: str | None = None
+                if isinstance(court_obj, dict):
+                    surface = _surface_from_court_id(court_obj.get("id"))
+                if surface is None and isinstance(tourn_obj, dict):
+                    surface = _surface_from_court_id(tourn_obj.get("courtId"))
+                if surface is None and isinstance(court_obj, dict):
+                    court_name = court_obj.get("name")
+                    if isinstance(court_name, str) and court_name.strip():
+                        surface = court_name.strip().lower()
+                round_obj = item.get("round") or {}
+                round_name = (
+                    round_obj.get("name")
+                    if isinstance(round_obj, dict) else None
+                )
+                p1_id = _coerce_int(item.get("player1Id"))
+                p2_id = _coerce_int(item.get("player2Id"))
+                fixture = MatchStatsFixture(
+                    date=tipoff,
+                    player_a_id=p1_id,
+                    player_b_id=p2_id,
+                    player_a_name=p1_name,
+                    player_b_name=p2_name,
+                    tournament_name=tourn_name,
+                    surface=surface,
+                    round_name=round_name,
+                )
+                # First match wins on duplicate keys — the vendor
+                # occasionally ships the same matchup twice within a
+                # tournament when both rounds advance through the
+                # bracket; the first (typically earliest) row is the
+                # right pick.
+                out.setdefault(key, fixture)
+                # Same first-write-wins for the cross-call fixture
+                # cache so the same-matchup-twice case picks the same
+                # fixture both `out` and the cache resolve to. The
+                # cache is keyed by `(tour, surname-pair)` so `fetch()`
+                # can look up the fixture for a matchup without
+                # knowing the date — identity doesn't carry one.
+                self._fixture_cache.setdefault((tour, key), fixture)
+                # Seed the rankings index with fixture-derived IDs so
+                # ITF players outside the top-500 ranking still
+                # resolve. Only fill empty slots — never overwrite
+                # ranked entries (which carry richer position+points
+                # data).
+                tour_index = self._index.setdefault(tour, {})
+                if p1_id is not None and p1_name:
+                    tour_index.setdefault(
+                        _normalize_name(p1_name), (p1_id, None, None)
                     )
-                except ValueError:
-                    tipoff = None
-            tourn_obj = item.get("tournament") or {}
-            tourn_name = (
-                tourn_obj.get("name")
-                if isinstance(tourn_obj, dict) else None
-            )
-            court_obj = (
-                tourn_obj.get("court")
-                if isinstance(tourn_obj, dict) else None
-            )
-            # Prefer the courtId path so indoor-hard ("I.hard") collapses
-            # to canonical "hard" via `_COURT_ID_TO_SURFACE` — matches the
-            # vocabulary `TennisPlayerStats.surface_win_loss` and the
-            # tennis sport hint already use. The `include=tournament.court`
-            # expansion ships the court as a nested object with `id`/`name`,
-            # but flat `courtId` exists on some payload shapes too —
-            # check both before falling through to raw lowercased name.
-            surface: str | None = None
-            if isinstance(court_obj, dict):
-                surface = _surface_from_court_id(court_obj.get("id"))
-            if surface is None and isinstance(tourn_obj, dict):
-                surface = _surface_from_court_id(tourn_obj.get("courtId"))
-            if surface is None and isinstance(court_obj, dict):
-                court_name = court_obj.get("name")
-                if isinstance(court_name, str) and court_name.strip():
-                    surface = court_name.strip().lower()
-            round_obj = item.get("round") or {}
-            round_name = (
-                round_obj.get("name")
-                if isinstance(round_obj, dict) else None
-            )
-            p1_id = _coerce_int(item.get("player1Id"))
-            p2_id = _coerce_int(item.get("player2Id"))
-            fixture = MatchStatsFixture(
-                date=tipoff,
-                player_a_id=p1_id,
-                player_b_id=p2_id,
-                player_a_name=p1_name,
-                player_b_name=p2_name,
-                tournament_name=tourn_name,
-                surface=surface,
-                round_name=round_name,
-            )
-            # First match wins on duplicate keys — the vendor occasionally
-            # ships the same matchup twice within a tournament when both
-            # rounds advance through the bracket; the first (typically
-            # earliest) row is the right pick.
-            out.setdefault(key, fixture)
-            # Same first-write-wins for the cross-call fixture cache so
-            # the same-matchup-twice case picks the same fixture both
-            # `out` and the cache resolve to. The cache is keyed by
-            # `(tour, surname-pair)` so `fetch()` can look up the
-            # fixture for a matchup without knowing the date — identity
-            # doesn't carry one.
-            self._fixture_cache.setdefault((tour, key), fixture)
-            # Seed the rankings index with fixture-derived IDs so ITF
-            # players outside the top-500 ranking still resolve. Only
-            # fill empty slots — never overwrite ranked entries (which
-            # carry richer position+points data).
-            tour_index = self._index.setdefault(tour, {})
-            if p1_id is not None and p1_name:
-                tour_index.setdefault(_normalize_name(p1_name), (p1_id, None, None))
-            if p2_id is not None and p2_name:
-                tour_index.setdefault(_normalize_name(p2_name), (p2_id, None, None))
+                if p2_id is not None and p2_name:
+                    tour_index.setdefault(
+                        _normalize_name(p2_name), (p2_id, None, None)
+                    )
+            if not payload.get("hasNextPage"):
+                break
         return out
 
     # ----- Public entry point -----

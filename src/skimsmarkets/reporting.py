@@ -6,9 +6,11 @@ from datetime import UTC, datetime
 
 from rich import box
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
-from skimsmarkets.agents.schemas import MarketPrediction
+from skimsmarkets.agents.pricing import cost_usd
+from skimsmarkets.agents.schemas import MarketPrediction, TokenUsage
 from skimsmarkets.pipeline import RunResult
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
@@ -68,6 +70,89 @@ def _defensibility_stars(score: float) -> str:
     return "█" * filled + "░" * (5 - filled)
 
 
+def _compact_tokens(n: int) -> str:
+    """Format a token count as 1.2M / 234K / 567 for terminal display.
+
+    Threshold chosen so a typical slate (~6 events × 4 calls × ~10K tokens)
+    renders as ~240K rather than 240,000 — easier to scan when the cost
+    line sits next to a leaderboard.
+    """
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
+
+def _format_phase_timings(
+    stage_timings: dict[str, float], total: float,
+) -> str:
+    """Roll up `result.stage_timings` into the four progress-bar phases
+    for a compact one-line display in the run summary panel.
+
+    The per-stage keys are the same ones used by `_time_stage` in
+    `pipeline.py`. We bucket them by which progress phase they belong
+    to so the user sees `total Xs — slate Ys · enrich Zs · predict
+    Ws · judge Vs` matching the visual phases they just watched fill.
+    Missing stages contribute 0 (e.g. an early-exit run after `select`
+    has no `process_events` time).
+    """
+    slate = sum(
+        stage_timings.get(k, 0.0) for k in (
+            "fetch_slate",
+            "overlay_matchstats_tipoffs",
+            "apply_horizon_filter",
+            "select",
+        )
+    )
+    enrich = sum(
+        stage_timings.get(k, 0.0) for k in (
+            "enrich_uw",
+            "enrich_clob_book",
+            "enrich_clob_history",
+            "enrich_tennis_stats",
+            "enrich_tennis_sim",
+            "enrich_tennis_gbt",
+        )
+    )
+    predict = stage_timings.get("process_events", 0.0)
+    judge = stage_timings.get("judge", 0.0)
+    return (
+        f"total {total:.1f}s — "
+        f"slate {slate:.1f}s · enrich {enrich:.1f}s · "
+        f"predict {predict:.1f}s · judge {judge:.1f}s"
+    )
+
+
+def _summarize_llm_spend(
+    usage: list[TokenUsage],
+) -> tuple[float, int, int, int, int]:
+    """Walk all LLM calls in a run and return:
+    (cost_usd_total, input_total, output_total, cache_read_total,
+    n_unpriced_calls).
+
+    `cost_usd` returns None for unregistered models — those calls
+    contribute 0 to the cost total and are surfaced as `n_unpriced` so
+    the user can tell when the displayed dollar figure is missing
+    non-Anthropic spend (Grok, Gemini) that hasn't been priced yet.
+    """
+    cost_total = 0.0
+    in_total = 0
+    out_total = 0
+    cache_read_total = 0
+    n_unpriced = 0
+    for u in usage:
+        in_total += u.input_tokens or 0
+        out_total += u.output_tokens or 0
+        cache_read_total += u.cache_read_input_tokens or 0
+        c = cost_usd(u)
+        if c is None:
+            n_unpriced += 1
+        else:
+            cost_total += c
+    return cost_total, in_total, out_total, cache_read_total, n_unpriced
+
+
 def _pick_favorite(event: PolymarketEvent) -> PolymarketMarket:
     """Favorite = the side with the highest implied probability.
 
@@ -84,6 +169,8 @@ def print_events_table(
     events: list[PolymarketEvent],
     leagues: list[str],
     horizon_hours: int | None = None,
+    *,
+    console: Console | None = None,
 ) -> None:
     """One row per event: the favorite side. Sorted by Polymarket dollar
     volume so the busiest markets lead the list.
@@ -94,7 +181,12 @@ def print_events_table(
     pairs = [(ev, _pick_favorite(ev)) for ev in events]
     pairs.sort(key=lambda pair: pair[1].volume_dollars or 0.0, reverse=True)
 
-    console = Console()
+    # Accept a shared Console (set up in `cli._CONSOLE`) so the table
+    # routes through the same Live-aware instance the `RichHandler`
+    # uses — preserves log-vs-display ordering when invoked alongside
+    # active progress bars. Falls back to a fresh `Console()` for
+    # standalone callers.
+    console = console or Console()
     horizon_note = f", within {horizon_hours}h" if horizon_hours is not None else ""
     league_note = f" — leagues={','.join(leagues)}" if leagues else ""
     title = (
@@ -166,15 +258,21 @@ def print_events_table(
     console.print(table)
 
 
-def print_run_summary(result: RunResult) -> None:
-    console = Console()
+def print_run_summary(
+    result: RunResult, *, console: Console | None = None,
+) -> None:
+    # Accept a shared Console (set up in `cli._CONSOLE`) so the rule,
+    # leaderboard, and summary panel print through the same Live-aware
+    # instance the `ProgressReporter` used during the run and the
+    # `RichHandler` uses for logging. Falling back to a fresh
+    # `Console()` keeps non-CLI callers (tests, ad-hoc imports)
+    # working without setup.
+    console = console or Console()
     console.rule(f"[bold {_LAVENDER}]Run {result.run_id}[/]", style=_LAVENDER)
-    console.print(
-        f"Fetched events: [{_SKY}]{result.fetched_events}[/]  "
-        f"Considered events: [{_SKY}]{result.considered_events}[/]  "
-        f"Predictions: [{_MINT}]{len(result.predictions)}[/]  "
-        f"Errors: [{_ROSE}]{len(result.errors)}[/]"
-    )
+    # NOTE: the previous plain-text counts line ("Fetched events: 24 …")
+    # was folded into the bottom `Run summary` panel together with the
+    # LLM cost and pipeline timing. Leaderboard now sits directly under
+    # the rule as the visual headline.
 
     if result.predictions:
         # Leaderboard primary sort: judge `defensibility_score` descending
@@ -264,3 +362,65 @@ def print_run_summary(result: RunResult) -> None:
 
     if not result.predictions and not result.errors:
         console.print(f"[{_PEACH}]No predictions generated.[/]")
+
+    # ── Run summary panel ─────────────────────────────────────────
+    # One Rich panel below the leaderboard / errors table consolidating
+    # what used to be three scattered plain-text blocks: the counts
+    # line above the leaderboard, the LLM cost line below it, and the
+    # per-stage timing breakdown that previously only landed in
+    # stderr logs. Order inside the panel mirrors how the user reads
+    # the run: what came in (counts), what it cost (LLM), how long it
+    # took (timing).
+    summary_lines: list[str] = [
+        f"  [{_SKY}]fetched events:[/] {result.fetched_events}    "
+        f"[{_SKY}]considered:[/] {result.considered_events}    "
+        f"[{_MINT}]predictions:[/] {len(result.predictions)}    "
+        f"[{_ROSE}]errors:[/] {len(result.errors)}",
+    ]
+
+    # LLM spend summary. Walks both per-event reasoner/director calls
+    # and the slate-level judge call. Anthropic-only today: Grok/Gemini
+    # fetcher calls land in `n_unpriced` until their rates are
+    # registered in `agents/pricing.py`. Matches the `cost_usd_total`
+    # in the JSONL meta row so terminal and persisted log show the
+    # same number.
+    all_calls = [
+        u for ev_list in result.token_usage.values() for u in ev_list
+    ] + result.slate_token_usage
+    if all_calls:
+        cost_total, in_total, out_total, cache_read_total, n_unpriced = (
+            _summarize_llm_spend(all_calls)
+        )
+        unpriced_note = (
+            f"; {n_unpriced} unpriced "
+            f"{'call' if n_unpriced == 1 else 'calls'}"
+            if n_unpriced
+            else ""
+        )
+        summary_lines.append("")
+        summary_lines.append(
+            f"  [{_CREAM}]LLM cost:[/] "
+            f"[bold {_MINT}]${cost_total:.4f}[/]  "
+            f"[{_DIM}]({_compact_tokens(in_total)} input / "
+            f"{_compact_tokens(out_total)} output / "
+            f"{_compact_tokens(cache_read_total)} cache-read"
+            f"{unpriced_note})[/]"
+        )
+
+    if result.stage_timings:
+        summary_lines.append("")
+        summary_lines.append(
+            f"  [{_SKY}]pipeline timing:[/] [{_DIM}]"
+            f"{_format_phase_timings(result.stage_timings, result.total_seconds)}"
+            f"[/]"
+        )
+
+    console.print(
+        Panel(
+            "\n".join(summary_lines),
+            title=f"[{_CREAM}]Run summary[/]",
+            title_align="left",
+            border_style=_LAVENDER,
+            padding=(0, 0),
+        )
+    )

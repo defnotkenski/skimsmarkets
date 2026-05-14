@@ -201,21 +201,6 @@ def _top_feature_contributions(
     ]
 
 
-def _detect_tour(stats: TennisStatsContext) -> str | None:
-    """Best-effort tour detection from the surface/tournament context.
-
-    The TennisStatsContext doesn't carry an explicit tour tag, but the
-    backfill keys players by (tour, player_id) so we need one. The
-    pragmatic shortcut for the spike: try both tours and pick whichever
-    has the player in `birthdates`. If neither, default to None and
-    the enricher silently degrades.
-    """
-    # We probe by player_a's id since that's the simpler check; the
-    # enricher only needs ONE tour key for both birthdate lookups,
-    # and ATP/WTA singles head-to-heads always pair same-tour players.
-    return None  # Resolved per-player in the predict path.
-
-
 def predict_for_event(event: PolymarketEvent) -> TennisGbtContext | None:
     """Compute the GBT prediction for one tennis event, or None when
     any pre-condition fails. Designed to mirror `simulate_for_event`

@@ -19,6 +19,7 @@ from skimsmarkets.agents.director import synthesize_prediction
 from skimsmarkets.agents.fetchers import FetcherProvider, build_provider
 from skimsmarkets.agents.judge import judge_slate
 from skimsmarkets.agents.reasoners import run_reasoner
+from skimsmarkets.agents.pricing import cost_usd
 from skimsmarkets.agents.schemas import (
     DefensibilityAssessment,
     LensNotebook,
@@ -28,6 +29,7 @@ from skimsmarkets.agents.schemas import (
 from skimsmarkets.agents.sports._director_shared import PROMPT_VERSION
 from skimsmarkets.agents.sports import resolve_lens_set
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
+from skimsmarkets.progress import ProgressReporter
 from skimsmarkets.polymarket.enrichment import (
     enrich_clob_book,
     enrich_price_history,
@@ -260,9 +262,22 @@ async def fetch_slate(
 async def overlay_matchstats_tipoffs(
     events: list[PolymarketEvent],
     provider: TennisStatsProvider,
-) -> None:
+) -> tuple[set[str], int]:
     """Overlay MatchStats per-match scheduled tipoffs onto each market's
     `game_start_time`.
+
+    Returns `(matched_event_ids, total_fixtures_fetched)`:
+      - `matched_event_ids` — the subset of input event IDs whose
+        surname-pair matched a MatchStats fixture row. Used by the
+        downstream `filter_unmatched_matchstats_events` step to drop
+        events without comprehensive data coverage before the
+        lens-chain spend kicks in.
+      - `total_fixtures_fetched` — sum of fixture rows across every
+        (tour, date) combo queried. Zero means the provider returned
+        nothing for any combo (stub provider with no API key, or
+        vendor outage) — the coverage filter treats zero as "can't
+        judge, let everything through" rather than dropping the whole
+        tennis slate.
 
     Why: gamma's `gameStartTime` is best-effort vendor data and can drift
     when tour officials reshuffle the session schedule late. MatchStats's
@@ -299,17 +314,18 @@ async def overlay_matchstats_tipoffs(
     """
     needed: set[tuple[str, str]] = set()
     for ev in events:
-        tour = _tour_from_slug(ev.slug or "")
-        if tour is None:
+        tours = _matchstat_tours_for_slug(ev.slug or "")
+        if not tours:
             continue
         starts = [m.game_start_time for m in ev.markets if m.game_start_time]
         if not starts:
             continue
         date_iso = min(starts).strftime("%Y-%m-%d")
-        needed.add((tour, date_iso))
+        for tour in tours:
+            needed.add((tour, date_iso))
     if not needed:
         log.info("matchstats overlay: no eligible (tour, date) pairs")
-        return
+        return set(), 0
 
     needed_list = sorted(needed)
     indexes = await asyncio.gather(
@@ -322,26 +338,38 @@ async def overlay_matchstats_tipoffs(
         total_fixtures, len(needed_list),
     )
 
+    matched_event_ids: set[str] = set()
     refreshed_tipoff = 0
     matched_events = 0
     for ev in events:
-        tour = _tour_from_slug(ev.slug or "")
-        if tour is None:
+        tours = _matchstat_tours_for_slug(ev.slug or "")
+        if not tours:
             continue
         starts = [m.game_start_time for m in ev.markets if m.game_start_time]
         if not starts:
             continue
         date_iso = min(starts).strftime("%Y-%m-%d")
-        index = by_combo.get((tour, date_iso))
-        if not index:
-            continue
         key = _event_surname_pair(ev)
         if key is None:
             continue
-        fixture = index.get(key)
+        # First-hit wins across the candidate tour indexes. ATP/WTA
+        # slugs have exactly one candidate; ITF slugs have two (atp
+        # then wta) since MatchStats serves ITF M-tier under atp and
+        # ITF W-tier under wta — surname pairs are unique across
+        # genders so there's no risk of a wrong-gender false match.
+        fixture = None
+        for tour in tours:
+            index = by_combo.get((tour, date_iso))
+            if not index:
+                continue
+            f = index.get(key)
+            if f is not None:
+                fixture = f
+                break
         if fixture is None:
             continue
         matched_events += 1
+        matched_event_ids.add(ev.id)
         # Tipoff overlay only fires when MatchStats has a confirmed
         # `date`. Early-round Challenger / ITF matches often ship with
         # `date=None` in the fixtures payload — the bracket exists but
@@ -360,6 +388,65 @@ async def overlay_matchstats_tipoffs(
         "matchstats overlay: matched %d/%d events, refreshed tipoff on %d",
         matched_events, len(events), refreshed_tipoff,
     )
+    return matched_event_ids, total_fixtures
+
+
+def filter_unmatched_matchstats_events(
+    events: list[PolymarketEvent],
+    *,
+    matched_event_ids: set[str],
+    total_fixtures_fetched: int,
+) -> list[PolymarketEvent]:
+    """Drop tennis events whose surname-pair didn't match a MatchStats
+    fixture row.
+
+    Rationale: the tennis lens chain depends on MatchStats coverage
+    for the player-stats context block (form, career percentages),
+    sim inputs (career baseline serve/return), GBT priors (player ID
+    lookups), and h2h. An unmatched event would still produce a
+    prediction — the pipeline degrades gracefully per-event — but on
+    materially thinner evidence, and the resulting confidence /
+    defensibility scores would mislead the leaderboard. The gate
+    keeps the ranker honest by dropping events MatchStats *could
+    have* covered but didn't (surname transliteration variants,
+    last-minute fixture additions, players outside the indexed feed).
+
+    Scope: tennis only — non-tennis slugs (`mlb-`, `nba-`, etc.)
+    never enter the MatchStats overlay and pass through untouched.
+
+    Safety: when `total_fixtures_fetched == 0` the gate is skipped
+    entirely. That covers the stub-provider case (no API key
+    configured → empty fixtures) and vendor outages (MatchStats
+    returns nothing across every combo). Treating "no data" as
+    "can't judge, let everything through" prevents the gate from
+    silently emptying the slate in cases we can't distinguish from
+    genuine coverage failure.
+    """
+    if total_fixtures_fetched == 0:
+        log.info(
+            "matchstats coverage filter: no fixtures fetched, "
+            "skipping gate (treating empty feed as can't-judge)"
+        )
+        return events
+
+    kept: list[PolymarketEvent] = []
+    dropped = 0
+    for ev in events:
+        tours = _matchstat_tours_for_slug(ev.slug or "")
+        if not tours:
+            # Non-tennis events bypass the gate.
+            kept.append(ev)
+            continue
+        if ev.id in matched_event_ids:
+            kept.append(ev)
+        else:
+            dropped += 1
+    log.info(
+        "matchstats coverage filter: kept %d events "
+        "(dropped %d unmatched tennis events)",
+        len(kept), dropped,
+    )
+    return kept
 
 
 def apply_horizon_filter(
@@ -403,12 +490,29 @@ def apply_horizon_filter(
     return kept
 
 
-def _tour_from_slug(slug: str) -> str | None:
+def _matchstat_tours_for_slug(slug: str) -> list[str]:
+    """MatchStats tour values to query for this event's slug.
+
+    Polymarket uses `atp-` / `wta-` / `itf-` slug prefixes. MatchStats
+    serves ATP main + men's Challengers + ITF M-tier futures under
+    `tour=atp`, and WTA main + ITF W-tier futures under `tour=wta`.
+    `tour=itf` is rejected by the API with a 400 ("Tour type is not
+    valid"), so ITF events must be looked up against BOTH atp and wta
+    fixture indexes — gender isn't encoded in the Polymarket slug.
+    Surname pairs are unique across genders on any given date, so the
+    first-hit lookup in `overlay_matchstats_tipoffs` is safe (no risk
+    of pulling a women's fixture for a men's match or vice versa).
+
+    Empty list for slugs we can't route (non-tennis, doubles with a
+    different slug shape) — caller skips those events.
+    """
     if slug.startswith("atp-"):
-        return "atp"
+        return ["atp"]
     if slug.startswith("wta-"):
-        return "wta"
-    return None
+        return ["wta"]
+    if slug.startswith("itf-"):
+        return ["atp", "wta"]
+    return []
 
 
 def _event_surname_pair(ev: PolymarketEvent) -> frozenset[str] | None:
@@ -870,28 +974,49 @@ def _coverage_by_lens(
 
 def _aggregate_tokens(
     usage: list[TokenUsage],
-) -> dict[str, int | None]:
+) -> dict[str, float | int | None]:
     """Sum token usage across an event's LLM calls.
 
-    Returns a dict with `input_total`, `output_total`, and
+    Returns a dict with token totals + a dollar `cost_usd_total` and
     `n_calls`. Treats None tokens as 0 in the sum but reports them
     separately as `n_unknown_calls` so retro can flag SDK regressions
     that drop usage metadata.
+
+    Cost is computed via `agents.pricing.cost_usd` for each call and
+    summed. Calls whose model isn't in `MODEL_RATES` (non-Anthropic
+    providers, or an unregistered Anthropic model) contribute 0 to the
+    total and are counted in `n_unpriced_calls` so retro can see how
+    much of the spend is missing from the cost estimate.
     """
     in_total = 0
     out_total = 0
+    cache_write_total = 0
+    cache_read_total = 0
+    cost_total = 0.0
     n_unknown = 0
+    n_unpriced = 0
     for u in usage:
         if u.input_tokens is None and u.output_tokens is None:
             n_unknown += 1
             continue
         in_total += u.input_tokens or 0
         out_total += u.output_tokens or 0
+        cache_write_total += u.cache_creation_input_tokens or 0
+        cache_read_total += u.cache_read_input_tokens or 0
+        c = cost_usd(u)
+        if c is None:
+            n_unpriced += 1
+        else:
+            cost_total += c
     return {
         "input_total": in_total,
         "output_total": out_total,
+        "cache_creation_input_total": cache_write_total,
+        "cache_read_input_total": cache_read_total,
+        "cost_usd_total": round(cost_total, 6),
         "n_calls": len(usage),
         "n_unknown_calls": n_unknown,
+        "n_unpriced_calls": n_unpriced,
     }
 
 
@@ -1147,7 +1272,8 @@ def _persist_run(result: RunResult) -> None:
                     # what).
                     "token_usage_summary": token_summary,
                     "token_usage_calls": [
-                        u.model_dump(mode="json") for u in event_token_usage
+                        {**u.model_dump(mode="json"), "cost_usd": cost_usd(u)}
+                        for u in event_token_usage
                     ],
                     # Director synthesis fields — `reasoning` is the 3-6
                     # sentence rationale, `specialist_weights` shows how
@@ -1256,7 +1382,8 @@ def _persist_run(result: RunResult) -> None:
                 "lens_timings": result.lens_timings,
                 "token_usage_summary": slate_summary,
                 "judge_token_usage_calls": [
-                    u.model_dump(mode="json") for u in result.slate_token_usage
+                    {**u.model_dump(mode="json"), "cost_usd": cost_usd(u)}
+                    for u in result.slate_token_usage
                 ],
             }
             f.write(json.dumps(meta_payload, separators=(",", ":")) + "\n")
@@ -1418,6 +1545,7 @@ async def run_pipeline(
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
     tennis_stats_disabled: bool = False,
+    progress: ProgressReporter | None = None,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon,
     enrich with CLOB book + price history, then run 4 specialists + director
@@ -1526,11 +1654,15 @@ async def run_pipeline(
             max_implied_probability=max_implied_probability,
             min_open_interest_dollars=min_open_interest_dollars,
         )
+        if progress is not None:
+            progress.start("slate")
         with _time_stage(stage_timings, "fetch_slate"):
             events = await fetch_slate(
                 slate_opts, http=public_http, gamma_sem=gamma_sem
             )
         result.fetched_events = len(events)
+        if progress is not None:
+            progress.complete("slate")
 
         # MatchStats tipoff overlay — refines gamma's `gameStartTime`
         # with per-match precision from `/tennis/v2/{tour}/fixtures/
@@ -1540,7 +1672,22 @@ async def run_pipeline(
         # MatchStats key is configured — horizon filter then operates
         # on the raw gamma tipoff.
         with _time_stage(stage_timings, "overlay_matchstats_tipoffs"):
-            await overlay_matchstats_tipoffs(events, tennis_provider)
+            matched_event_ids, total_fixtures = (
+                await overlay_matchstats_tipoffs(events, tennis_provider)
+            )
+
+        # MatchStats coverage gate — drop tennis events whose
+        # surname-pair didn't find a fixture row. Runs BEFORE the
+        # horizon filter so the smaller event list flows into the
+        # downstream selector warmup + lens chains. Safe under stub
+        # provider / vendor outage: when no fixtures were fetched
+        # at all, the gate skips itself and nothing is dropped.
+        with _time_stage(stage_timings, "filter_unmatched_matchstats"):
+            events = filter_unmatched_matchstats_events(
+                events,
+                matched_event_ids=matched_event_ids,
+                total_fixtures_fetched=total_fixtures,
+            )
 
         # Horizon filter — runs AFTER the overlay so the cut uses the
         # most accurate available tipoff per market.
@@ -1617,6 +1764,8 @@ async def run_pipeline(
         # history all ride the shared `gamma_resolver` cache for
         # slug → token_id lookups — first stage to touch a slug pays
         # the gamma round-trip, subsequent stages hit the cache.
+        if progress is not None:
+            progress.start("enrich")
         with _time_stage(stage_timings, "enrich_uw"):
             await resolve_uw_context(
                 uw,
@@ -1662,6 +1811,8 @@ async def run_pipeline(
         # (fresh checkout, no spike training yet).
         with _time_stage(stage_timings, "enrich_tennis_gbt"):
             enrich_tennis_gbt(events, result.errors)
+        if progress is not None:
+            progress.complete("enrich")
         # Snapshot the per-event tennis context onto the RunResult so
         # `_persist_run` can write it to the JSONL row even though the
         # event itself isn't carried into persistence (only the resulting
@@ -1682,10 +1833,18 @@ async def run_pipeline(
             "fetcher provider=%s model=%s", provider.name, provider.model
         )
         anthropic = AsyncAnthropic(api_key=config.anthropic_api_key)
+        if progress is not None:
+            progress.start("predict", total=len(events))
         try:
             with _time_stage(stage_timings, "process_events"):
-                outcomes = await asyncio.gather(
-                    *(
+                # Schedule each event as a task so we can attach a
+                # done-callback that advances the progress bar the
+                # moment that event's `process_event` resolves. With a
+                # plain `asyncio.gather(*coros)` we'd only see the bar
+                # jump when the slowest event finished — useless for
+                # the most variable phase of the pipeline.
+                tasks = [
+                    asyncio.create_task(
                         process_event(
                             provider,
                             anthropic,
@@ -1698,11 +1857,19 @@ async def run_pipeline(
                             result.lens_timings,
                             result.token_usage,
                         )
-                        for e in events
                     )
-                )
+                    for e in events
+                ]
+                if progress is not None:
+                    for t in tasks:
+                        t.add_done_callback(
+                            lambda _t: progress.advance("predict")
+                        )
+                outcomes = await asyncio.gather(*tasks)
         finally:
             await provider.aclose()
+        if progress is not None:
+            progress.complete("predict")
 
         for outcome in outcomes:
             if outcome is None:
@@ -1723,6 +1890,8 @@ async def run_pipeline(
         # existing `if result.predictions:` guard below would catch that,
         # but skipping the call avoids spending a token on a known no-op).
         if result.predictions:
+            if progress is not None:
+                progress.start("judge")
             try:
                 with _time_stage(stage_timings, "judge"):
                     judgment = await judge_slate(
@@ -1744,6 +1913,9 @@ async def run_pipeline(
                     "predicted_probability sort: %s",
                     e,
                 )
+            finally:
+                if progress is not None:
+                    progress.complete("judge")
 
     # Persist when there's anything to write — predictions OR drops. An
     # all-failed run (every event hit a fetcher/reasoner/director error)

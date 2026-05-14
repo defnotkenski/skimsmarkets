@@ -187,9 +187,15 @@ async def enrich_price_history(
                             ),
                             # Sparkline stays as the YES-side rendering;
                             # the renderer flips it to the NO side via
-                            # `clob.invert_sparkline` when needed.
+                            # `clob.invert_sparkline` when needed. Raw
+                            # history points get value-inverted here so
+                            # downstream readers (retro, gbt features)
+                            # see the NO-side path natively — mirrors
+                            # `PolymarketMarket.inverted_no_side`.
                             "clob_price_path_sparkline": summary.sparkline,
-                            "clob_price_history": summary.raw_points,
+                            "clob_price_history": [
+                                (t, 1.0 - p) for t, p in summary.raw_points
+                            ],
                         }
                     )
                 else:

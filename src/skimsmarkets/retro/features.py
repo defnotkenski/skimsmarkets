@@ -65,10 +65,7 @@ _TENNIS_SHIFT_GRADING: tuple[tuple[str, str, str, str], ...] = (
 _SHIFT_ZERO_TOLERANCE = 0.005
 
 
-def _market_favorite_pick(
-    predicted_prob: float | None,
-    market_implied: float | None,
-) -> bool | None:
+def _market_favorite_pick(market_implied: float | None) -> bool | None:
     """True when the predicted side IS the market favorite.
 
     The prediction row's `polymarket_implied_probability` is the implied
@@ -134,7 +131,6 @@ def extract_features(
         defensibility_score=row.defensibility_score,
         case_bucket=_case_bucket(row.defensibility_score),
         market_favorite_pick=_market_favorite_pick(
-            row.predicted_yes_probability,
             row.polymarket_implied_probability,
         ),
         # Prefer the persisted flag; recompute for old rows that pre-date it.
