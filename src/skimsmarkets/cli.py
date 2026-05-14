@@ -11,6 +11,7 @@ from rich.logging import RichHandler
 
 from skimsmarkets import config as cfg
 from skimsmarkets.backtest.dataset import build_dataset
+from skimsmarkets.banner import print_banner
 from skimsmarkets.pipeline import (
     SlateOptions,
     apply_horizon_filter,
@@ -949,6 +950,12 @@ def main() -> int:
         return 1
 
     _setup_logging(args.verbose)
+
+    # Interactive header. `print_banner` is TTY-gated, so it self-suppresses
+    # when output is piped or captured; `positions` opts out entirely since
+    # its stdout is parsed by scheduled routines.
+    if args.command != "positions":
+        print_banner(_CONSOLE, args.command)
 
     dispatch = {
         "rank": _cmd_rank,
