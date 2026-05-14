@@ -38,37 +38,34 @@ def _trade_shares_and_usdc(t: UWTrade) -> tuple[float | None, float | None]:
 
 def _fmt_trade(t: UWTrade) -> str:
     shares, usdc = _trade_shares_and_usdc(t)
-    if shares and usdc and shares > 0:
-        implied = usdc / shares
-        implied_s = f"implied=${implied:.3f}"
-    else:
-        implied_s = "implied=?"
     when = t.executed_at.isoformat() if t.executed_at else "?"
     # The active side (taker) is what reveals directional pressure: taker=buyer
-    # means someone hit the ask; taker=seller means someone hit the bid.
+    # means someone hit the ask; taker=seller means someone hit the bid. The
+    # per-fill price is deliberately omitted — the director is blind to the
+    # market price; flow direction and size are the signal, not the level.
     side = t.taker_side or "?"
     notional = _fmt_money(usdc, prec=2) if usdc is not None else "?"
     share_s = f"{shares:,.0f}" if shares is not None else "?"
-    return (
-        f"    {when}  taker={side}  shares={share_s}  notional={notional}  {implied_s}"
-    )
+    return f"    {when}  taker={side}  shares={share_s}  notional={notional}"
 
 
 def _fmt_insider(i: UWInsider) -> str:
     addr = i.user_address or "?"
     short = f"{addr[:8]}…{addr[-4:]}" if len(addr) >= 12 else addr
-    price = f"${i.avg_price:.3f}" if i.avg_price is not None else "?"
     inv = _fmt_money(i.total_invested_usd)
-    return f"    {short}  avg_price={price}  invested={inv}"
+    # avg_price omitted — the director is blind to the market price; the
+    # signal here is that a known-insider wallet holds a position and its size.
+    return f"    {short}  invested={inv}"
 
 
 def render_uw_block(ctx: UnusualWhalesContext) -> str:
     """Compact render of Unusual Whales flow signals for LLM prompts.
 
-    YES-side only — the NO-side flow is the mirror (inverted price, same trades)
-    so we don't double-render it. All consumers (currently just the director)
-    reason about the event from the YES lens; all bid/ask/implied fields in the
-    main context block follow the same convention.
+    YES-side only — the NO-side flow is the mirror (same trades) so we don't
+    double-render it. Market-price fields (per-fill implied price, insider
+    avg price, best bid/ask, spread) are deliberately omitted: the director
+    is blind to the market price, so UW reaches it as a pure flow signal —
+    direction, size, and reputation tags only.
     """
     tags = ctx.tag_scores
 
@@ -89,7 +86,7 @@ def render_uw_block(ctx: UnusualWhalesContext) -> str:
     lines: list[str] = []
     # Header explicitly names the team this flow data is about — `outcome_label`
     # is the exact `outcomes[outcome_index]` value from the UW API, so the
-    # director / reader doesn't have to infer side from the bid/ask.
+    # director / reader doesn't have to infer which side the flow is on.
     side = ctx.outcome_label or "YES side"
     header = f"Flow signals (Unusual Whales, side='{side}'"
     if ctx.question:
@@ -116,16 +113,10 @@ def render_uw_block(ctx: UnusualWhalesContext) -> str:
         lines.append(f"  MCI: {' '.join(mci_parts)}")
 
     liq = ctx.liquidity
-    if liq is not None:
-        liq_parts: list[str] = []
-        if liq.best_bid is not None and liq.best_ask is not None:
-            liq_parts.append(f"best_bid/ask=${liq.best_bid:.3f}/${liq.best_ask:.3f}")
-            if liq.spread is not None:
-                liq_parts.append(f"spread={int(round(liq.spread * 10000))}bps")
-        if liq.total_liquidity is not None:
-            liq_parts.append(f"total_liq={_fmt_money(liq.total_liquidity)}")
-        if liq_parts:
-            lines.append(f"  liquidity: {'  '.join(liq_parts)}")
+    if liq is not None and liq.total_liquidity is not None:
+        # Only total resting liquidity is rendered — best_bid/ask and spread
+        # are market-price microstructure and the director is blind to them.
+        lines.append(f"  liquidity: total_liq={_fmt_money(liq.total_liquidity)}")
 
     if ctx.smart_trades:
         lines.append(f"  recent smart-money trades ({len(ctx.smart_trades)}):")

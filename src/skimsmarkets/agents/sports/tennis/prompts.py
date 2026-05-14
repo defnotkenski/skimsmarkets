@@ -242,9 +242,9 @@ you've been given.
 Rules:
 - `team_a_name` and `team_b_name` come from the EVENT CONTEXT (canonical).
   If the notebook echoes them differently, trust the event context.
-- `team_a` is the Polymarket favorite. Positive signed shifts push the
-  synthesized probability TOWARD team_a; negative shifts push it TOWARD
-  team_b. Apply this convention without exception.
+- `team_a` is the reference side named in the event context. Positive signed
+  shifts push the synthesized probability TOWARD team_a; negative shifts push
+  it TOWARD team_b. Apply this convention without exception.
 - Use `notebook.computed_numbers` AS-IS. They were derived deterministically
   by the fetcher's `code_execution`. Do not recompute the math; pick the
   most defensible value and explain the choice in your prose fields.
@@ -499,8 +499,9 @@ Synthesis stacking math — apply EXACTLY this composition:
 If you predict team_a wins, set `predicted_winner = team_a_name` and
 `predicted_winner_probability = team_a_p_final`. If team_a_p_final < 0.5,
 set `predicted_winner = team_b_name` and `predicted_winner_probability =
-1 - team_a_p_final` (the contrarian-call discipline applies — name the
-underdog when the math points there).
+1 - team_a_p_final` (the commit-to-your-read discipline applies — name
+the side the math points to, even if it's the one you'd naively expect
+to lose).
 
 Critical anti-double-counting rules:
 - The surface effect is OWNED by `surface_signed_shift`. Do NOT add an
@@ -516,12 +517,12 @@ Critical anti-double-counting rules:
 
 team_a_p_final IS the verdict. Set `predicted_winner_probability` to it
 (or to `1 - team_a_p_final` for a contrarian call). Do NOT compress
-team_a_p_final toward Polymarket's implied probability as a default — the
-lens shifts already encode every contextual factor the system has, and
-mechanical compression toward market is exactly the asymmetric bias the
-cross-sport preamble warns against. Compression would dampen high-
-conviction reads while leaving low-conviction reads unchanged, producing
-hedged predictions that satisfy nobody.
+team_a_p_final toward 0.5 as a default — the lens shifts already encode
+every contextual factor the system has, and mechanical compression toward
+a neutral prior is exactly the asymmetric bias the cross-sport preamble
+warns against. Compression would dampen high-conviction reads while
+leaving low-conviction reads unchanged, producing hedged predictions that
+satisfy nobody.
 
 The ONLY admissible reason to deviate from team_a_p_final is that, on
 re-reading the lens reports, you can name a specific shift whose
@@ -540,21 +541,20 @@ revision. Do NOT use it as a soft "I down-weighted this lens" signal —
 that belongs in `specialist_weights`.
 
 When you do deviate, it MUST be symmetric in principle: a stack that
-overshoots toward team_a (final > market) and a stack that overshoots
-toward team_b (final < market) get the same treatment. If the
-divergence direction systematically favors the side closer to market,
-you are anchoring rather than reasoning.
+overshoots toward team_a and a stack that overshoots toward team_b get
+the same treatment. If your retractions systematically favor one side,
+you have a directional bias, not a reasoning process.
 
-When the stack lands materially above market with all shifts well-
-supported, COMMIT TO IT — that is the high-conviction read the slate
-judge rewards in `defensibility_score`. Same in reverse: when the stack
-lands materially below market (contrarian), commit and name the
-underdog as `predicted_winner` per the cross-sport contrarian-call
+When the stack lands materially away from the sim/GBT priors with all
+shifts well-supported, COMMIT TO IT — that is the high-conviction read
+the slate judge rewards in `defensibility_score`. Same in reverse: when
+the stack lands on the side you'd naively expect to lose, commit and name
+that side as `predicted_winner` per the cross-sport commit-to-your-read
 discipline.
 
-Material deviations from market (>1000 bps) still require a justification
-sentence in `reasoning` — but "justification" means naming the shifts
-that drive the gap, not apologising for the gap.
+Material deviations from the sim/GBT priors (>10pp) still require a
+justification sentence in `reasoning` — but "justification" means naming
+the shifts that drive the gap, not apologising for the gap.
 
 Matchup-lens override discipline: when `h2h_signed_shift + clutch_signed_shift`
 nets OPPOSITE to your pick (net sign opposite to the predicted side) AND
@@ -568,19 +568,11 @@ matchup/clutch signal, the pick is indefensible at the current
 probability — either pull team_a_p_final at least halfway toward the
 direction the matchup+clutch net points, or drop `confidence` to `low`.
 
-When the pick is ALSO the market underdog (the picked side's implied
-probability < 0.5 — i.e. `polymarket_implied_probability` recorded for
-the predicted side is < 0.5) AND |matchup+clutch net opposed| ≥ 0.05,
-`confidence` MUST be `low`. Going against the market AND against the
-matchup/clutch lens simultaneously is the loss-overrepresented regime
-in retro grading; the system has not earned the right to call medium
-or high confidence on that combination.
-
 Career-baseline Monte Carlo prior (when present): the per-event
 context block may carry a `--- Tennis match simulator ---` block with
-`p(team_a wins)` plus a 95% sampling CI. This is a SECOND deterministic
-prior alongside Polymarket, computed from career serve/return
-percentages alone (no surface, form, H2H, or conditions adjustment).
+`p(team_a wins)` plus a 95% sampling CI. This is a deterministic prior
+computed from career serve/return percentages alone (no surface, form,
+H2H, or conditions adjustment).
 Use it as a sanity check on the synthesized read:
 - The sim represents the LONG-RUN BASELINE — what the matchup would
   look like with neutral context across many career encounters.
@@ -595,28 +587,23 @@ Use it as a sanity check on the synthesized read:
   `surface_signed_shift = +0.06`), not a free-text gesture toward
   the lens generically. At least one cited shift must have magnitude
   ≥ 0.05 — a 10pp deviation cannot be carried by a stack of
-  sub-0.02 shifts. Same discipline as for material market deviation.
-- Sim DISAGREES with market: sim is a long-run prior, market is
-  current sentiment. A gap between them is itself information — the
-  market may be reading a contextual factor the sim ignores by
-  design (form, conditions, withdrawal news), or the market may be
-  thin/inefficient on a low-volume tennis event. Use the lens
-  reports to triangulate which.
+  sub-0.02 shifts. Same shift-citation discipline as the material-
+  deviation rule above.
 - The sim's CI is SAMPLING uncertainty only (10k Monte Carlo trials).
   It does NOT capture model uncertainty (the iid assumption being
   imperfect, career averages not reflecting current form, etc.).
   Don't treat a tight [0.55, 0.59] CI as "the answer is in this
   range" — it's the sampling band on a deliberately-limited model.
 - If no sim block is present, the player-data gate failed. Synthesize
-  from lens reports + market alone — same posture as before this
+  from the lens reports alone — same posture as before this
   enrichment shipped.
 
 Gradient-boosted-tree prior (when present): the per-event context
 block may carry a `--- Tennis GBT prior ---` block with `p(team_a
 wins)`, prior-match counts per side, and a top-N feature contribution
-list. This is a THIRD deterministic prior alongside Polymarket and
-the iid sim, computed from a catboost model trained on point-in-time
-aggregated career rates + surface splits + recent form + age + H2H.
+list. This is a SECOND deterministic prior alongside the iid sim,
+computed from a catboost model trained on point-in-time aggregated
+career rates + surface splits + recent form + age + H2H.
 Use it together with the sim as the deterministic backstop:
 - The GBT and the sim read the same upstream career rates; they
   diverge when surface/form/age interactions matter. A material
@@ -628,8 +615,8 @@ Use it together with the sim as the deterministic backstop:
   `surface_signed_shift = +0.06`), not a free-text gesture toward
   the lens generically. At least one cited shift must have magnitude
   ≥ 0.05 — a 10pp deviation cannot be carried by a stack of
-  sub-0.02 shifts. Same discipline as for material market and sim
-  deviation.
+  sub-0.02 shifts. Same shift-citation discipline as the material-
+  deviation rule above.
 - The GBT's `top_features` list shows what the model leaned on for
   THIS prediction (per-row SHAP, anchor-relative). Read it as a
   sanity check: if the model's top contributor is
@@ -638,7 +625,7 @@ Use it together with the sim as the deterministic backstop:
   emphasises.
 - Cold-start gate (≥ 20 prior matches per side): when one side is a
   qualifier or comeback player below the gate, the GBT block is
-  absent. Synthesize from market + sim + lenses alone, same posture
+  absent. Synthesize from the sim + lenses alone, same posture
   as the sim's own gate failing.
 - The GBT model_version stamps which artefact produced the number.
   Retro grading uses it to detect retraining boundaries; you can

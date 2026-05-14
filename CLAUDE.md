@@ -4,14 +4,15 @@ Orientation for future sessions. Read the code for specifics.
 
 ## What this is
 
-A confidence-ranked list of today's Polymarket sports markets (tennis
+A risk-graded list of today's Polymarket sports markets (tennis
 in v1), **plus an opt-in Kalshi trader (`skims execute`) that consumes
 the ranker's JSONL**. The two halves are deliberately separated:
 
 - **Ranker** (`skims rank` and everything under `pipeline.py`,
   `agents/`, lens providers) is **not** an edge finder. No buy/pass
-  gates, no edge thresholds, no position sizes. The LLM ranks by
-  predicted probability; trade decisions don't live here.
+  gates, no edge thresholds, no position sizes. The LLMs produce a
+  market-blind probability estimate; deterministic post-processing then
+  grades the slate into risk buckets. Trade decisions don't live here.
 - **Executor** (`skims execute` under `src/skimsmarkets/execute/`,
   Kalshi adapter under `src/skimsmarkets/kalshi/`) is the opt-in,
   deterministic trade layer. Reads `logs/runs/<run_id>.jsonl`,
@@ -46,7 +47,7 @@ gamma /events  →  CLOB book + price-history enrichment
                →  per-sport lens chains (provider fetcher → Claude reasoner, parallel)
                →  Claude director per event (synthesises lens reports)
                →  Claude judge over the slate (defensibility score)
-               →  deterministic post-processing (rendering, ranking, JSONL persistence)
+               →  deterministic post-processing (risk classification, ranking, JSONL persistence)
 ```
 
 LLMs only in the agent layer; everything else is deterministic.
@@ -78,10 +79,15 @@ opt-in via `skims execute`).
 - **Sport-keyed lens registry is strict.** Events with no registered
   sport drop at `lens_dispatch` BEFORE enrichment fan-out. Adding a
   sport: build `agents/sports/<sport>/`, register in `SPORT_LENS_SETS`.
-- **Polymarket bid/ask is a PRIOR, not a ceiling.** The director can
-  name the market underdog as winner when synthesis genuinely supports
-  it. Don't soften "pull back toward the market" language back into
-  the prompt.
+- **The LLM stages are blind to the market price.** Fetchers, reasoners,
+  director, and judge never see Polymarket bid/ask, implied probability,
+  or price history — only research evidence and deterministic non-market
+  priors (sim, GBT). This produces a genuinely independent estimate; the
+  agreement between it and the market price (`gap_to_market_signed`,
+  computed in post-processing) is one of three inputs to the deterministic
+  risk classifier. Never pipe price, implied probability, or a sparkline
+  into any agent prompt — `render_context`, `_render_event_context_block`,
+  `_render_event_block`, or `render_uw_block`.
 - **Tennis NO-clone inversion is one-sided in CLOB enrichment.**
   `PolymarketEvent.from_gamma` synthesises one inverted NO clone per
   binary head-to-head via `PolymarketMarket.inverted_no_side`. The

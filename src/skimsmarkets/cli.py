@@ -321,8 +321,9 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
     Reads `logs/runs/<run_id>.jsonl`, applies the deterministic filter
     set (`--confidence`, `--min-defensibility`, `--no-negative-edge`,
     `--sport tennis`), matches each survivor to a Kalshi market by
-    player-surname pair, and (if `--live`) places one market-buy order
-    capped at `--bet-size-cents`. Defaults to `--dry-run`.
+    player-surname pair, re-checks the live Kalshi line against
+    `--max-prob`, and (if `--live`) places one market-buy order capped
+    at `--bet-size-cents`. Defaults to `--dry-run`.
 
     Audit log: `logs/trades/<run_id>.jsonl`, one row per filtered
     prediction whether placed, skipped, or dry-run.
@@ -355,6 +356,13 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         list(args.sport) if args.sport
         else (list(cfg.KALSHI_DEFAULT_SPORTS) or None)
     )
+    # Re-check the live Kalshi line against the same implied-probability
+    # ceiling the rank-time slate filter used; falls through to the shared
+    # `MAX_IMPLIED_PROBABILITY` config constant when `--max-prob` is omitted.
+    max_implied_probability = (
+        args.max_prob if args.max_prob is not None
+        else cfg.MAX_IMPLIED_PROBABILITY
+    )
 
     opts = ExecuteOptions(
         run_id=args.run_id,
@@ -366,6 +374,7 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         min_defensibility=min_defensibility,
         no_negative_edge=no_negative_edge,
         sports=sports,
+        max_implied_probability=max_implied_probability,
     )
     config = cfg.Config.from_env(require_llm=False)
     async with ExecuteDisplay(console=_CONSOLE) as display:
@@ -743,6 +752,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "Restrict to one or more sport types. v1 only supports "
             "`tennis` — other sports raise at startup. Falls through "
             "to `KALSHI_DEFAULT_SPORTS` in config.py when omitted."
+        ),
+    )
+    p_execute.add_argument(
+        "--max-prob",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "Skip a matched trade when the current Kalshi YES ask is at "
+            "or above this implied-probability ceiling. Re-checks the "
+            "live line at execute time, since it can drift past the "
+            "threshold between rank and execute. Falls through to "
+            f"`MAX_IMPLIED_PROBABILITY` ({cfg.MAX_IMPLIED_PROBABILITY}) "
+            "in config.py when omitted."
         ),
     )
     p_execute.add_argument(

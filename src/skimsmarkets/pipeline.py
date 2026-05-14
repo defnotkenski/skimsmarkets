@@ -29,6 +29,7 @@ from skimsmarkets.agents.schemas import (
 from skimsmarkets.agents.sports._director_shared import PROMPT_VERSION
 from skimsmarkets.agents.sports import resolve_lens_set
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
+from skimsmarkets.classify import classify_risk
 from skimsmarkets.progress import ProgressReporter
 from skimsmarkets.polymarket.enrichment import (
     enrich_clob_book,
@@ -130,6 +131,15 @@ class RunResult:
     # legacy predicted-probability sort). Same persistence posture as
     # `notebooks` / `reports` — best-effort, never aborts a run.
     defensibility_assessments: dict[str, DefensibilityAssessment] = field(
+        default_factory=dict
+    )
+    # Deterministic risk classification keyed event_id → (risk_bucket,
+    # risk_score). Populated by `_persist_run` as it builds each JSONL row
+    # — that's where the team_a-anchored gap to the market is computed, the
+    # third classifier input. `reporting.py` reads this to group the
+    # leaderboard by bucket without recomputing the gap. `risk_score` is
+    # None (bucket `Unrated`) when the judge produced no defensibility score.
+    risk_classifications: dict[str, tuple[str, float | None]] = field(
         default_factory=dict
     )
     # Per-stage wall-clock timings (seconds), populated by `run_pipeline`
@@ -1146,15 +1156,20 @@ def _persist_run(result: RunResult) -> None:
                 # needs flipping when the predicted winner is team_b
                 # (polymarket_implied_probability is in the picked-
                 # winner frame; sim/GBT are already team_a-anchored).
+                ta_name = next(
+                    (getattr(r, "team_a_name", None)
+                     for r in reports_typed.values()
+                     if getattr(r, "team_a_name", None)),
+                    None,
+                )
+                predicted_winner_is_team_a = bool(
+                    ta_name
+                    and ta_name.strip().lower()
+                    == p.predicted_winner.strip().lower()
+                )
                 if (team_a_p_final is not None
                         and p.polymarket_implied_probability is not None):
-                    ta_name = next(
-                        (getattr(r, "team_a_name", None)
-                         for r in reports_typed.values()
-                         if getattr(r, "team_a_name", None)),
-                        None,
-                    )
-                    if ta_name and ta_name.strip().lower() == p.predicted_winner.strip().lower():
+                    if predicted_winner_is_team_a:
                         market_team_a = p.polymarket_implied_probability
                     elif ta_name:
                         market_team_a = 1.0 - p.polymarket_implied_probability
@@ -1166,6 +1181,22 @@ def _persist_run(result: RunResult) -> None:
                     )
                 else:
                     gap_to_market = None
+                # Deterministic risk classifier — combines magnitude
+                # (predicted probability), defensibility (judge), and
+                # convergence (gap to the market the LLMs never saw) into
+                # one of four full-spectrum buckets. Stored on `result` so
+                # `reporting.py` groups the leaderboard without recomputing
+                # the gap; also written to the JSONL row below.
+                risk_bucket, risk_score = classify_risk(
+                    p.predicted_yes_probability,
+                    da.defensibility_score if da is not None else None,
+                    gap_to_market,
+                    predicted_winner_is_team_a=predicted_winner_is_team_a,
+                )
+                result.risk_classifications[p.event_id] = (
+                    risk_bucket,
+                    risk_score,
+                )
                 sim_p = (
                     tsim.p_team_a_wins if tsim is not None else None
                 )
@@ -1306,6 +1337,15 @@ def _persist_run(result: RunResult) -> None:
                     "defensibility_flags": (
                         da.defensibility_flags if da is not None else []
                     ),
+                    # Deterministic risk classifier output — `risk_bucket` is
+                    # the full-spectrum grade (Lock / Lean / Coin-flip /
+                    # Avoid, or Unrated when the judge produced no score);
+                    # `risk_score` is the continuous [0,1] composite it was
+                    # cut from. Combines predicted probability, defensibility,
+                    # and convergence to the (LLM-blind) market price — see
+                    # `classify.py`.
+                    "risk_bucket": risk_bucket,
+                    "risk_score": risk_score,
                     "tennis_stats": (
                         ts.model_dump(mode="json") if ts is not None else None
                     ),

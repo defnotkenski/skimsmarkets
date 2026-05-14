@@ -489,8 +489,8 @@ class DefensibilityAssessment(BaseModel):
             "Up to 3 short snake_case slugs naming the load-bearing "
             "weaknesses. Prefer the JUDGE_SYSTEM vocabulary "
             "('thin_reasoning', 'lens_disagreement', 'uw_contra', "
-            "'concentrated_weights', 'unexplained_gap', "
-            "'low_confidence_tier', 'live_volatility') and only coin a "
+            "'concentrated_weights', 'low_confidence_tier', "
+            "'live_volatility') and only coin a "
             "new slug when none fits. Empty when the case is clean."
         ),
     )

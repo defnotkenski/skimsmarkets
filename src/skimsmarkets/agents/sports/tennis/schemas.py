@@ -8,9 +8,9 @@ spelled out in `agents/sports/tennis/prompts.py:DIRECTOR_SYSTEM_TENNIS_TAIL`
 so reasoners and the director use the shifts without double-counting.
 
 Signed-shift sign convention: positive values push the synthesized
-probability TOWARD `team_a` (the Polymarket favorite); negative values
-push it toward `team_b`. The reasoners are told this explicitly in their
-system prompts.
+probability TOWARD `team_a` (the reference side named in the event
+context); negative values push it toward `team_b`. The reasoners are
+told this explicitly in their system prompts.
 """
 
 from __future__ import annotations

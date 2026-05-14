@@ -11,6 +11,14 @@ from rich.table import Table
 
 from skimsmarkets.agents.pricing import cost_usd
 from skimsmarkets.agents.schemas import MarketPrediction, TokenUsage
+from skimsmarkets.classify import (
+    BUCKET_AVOID,
+    BUCKET_COINFLIP,
+    BUCKET_LEAN,
+    BUCKET_LOCK,
+    BUCKET_UNRATED,
+    bucket_rank,
+)
 from skimsmarkets.pipeline import RunResult
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
 
@@ -43,6 +51,16 @@ def _rel_time(ts: datetime | None) -> str:
 
 def _confidence_style(c: str) -> str:
     return {"high": _MINT, "medium": _PEACH, "low": _ROSE}.get(c, "")
+
+
+def _risk_style(bucket: str) -> str:
+    return {
+        BUCKET_LOCK: f"bold {_MINT}",
+        BUCKET_LEAN: _MINT,
+        BUCKET_COINFLIP: _PEACH,
+        BUCKET_AVOID: _ROSE,
+        BUCKET_UNRATED: _DIM,
+    }.get(bucket, "")
 
 
 def _defensibility_stars(score: float) -> str:
@@ -275,23 +293,31 @@ def print_run_summary(
     # the rule as the visual headline.
 
     if result.predictions:
-        # Leaderboard primary sort: judge `defensibility_score` descending
-        # (higher = stronger case). Tiebreak: predicted probability
-        # descending. Un-scored events (judge failed or didn't cover them)
-        # sort to the bottom via the -1.0 sentinel — outside the [0,1]
-        # valid range so they always lose to real scores. When the entire
-        # judge call failed, every event hits the sentinel and the tuple
-        # sort collapses to predicted-probability order, which is the
-        # legacy behavior we're falling back to.
-        def _sort_key(p: MarketPrediction) -> tuple[float, float]:
+        # Leaderboard primary sort: risk bucket (Lock → Lean → Coin-flip →
+        # Avoid → Unrated). Within a bucket, judge `defensibility_score`
+        # descending, then predicted probability descending. Events with no
+        # risk classification (e.g. a directly-constructed RunResult in a
+        # test) fall back to the Unrated bucket; events with no judge score
+        # use the -1.0 defensibility sentinel so they lose every tiebreak.
+        # When the whole judge call failed, every event is Unrated and the
+        # sort collapses to predicted-probability order — the legacy
+        # fallback behavior.
+        def _sort_key(p: MarketPrediction) -> tuple[int, float, float]:
+            rc = result.risk_classifications.get(p.event_id)
+            bucket = rc[0] if rc is not None else BUCKET_UNRATED
             da = result.defensibility_assessments.get(p.event_id)
             score = da.defensibility_score if da is not None else -1.0
-            return (score, p.predicted_yes_probability)
+            # Negate the rank so the best bucket (Lock, rank 0) sorts first
+            # under reverse=True.
+            return (-bucket_rank(bucket), score, p.predicted_yes_probability)
 
         ranked = sorted(result.predictions, key=_sort_key, reverse=True)
+        any_classified = bool(result.risk_classifications)
         any_judged = bool(result.defensibility_assessments)
         title_text = (
-            "Defensibility leaderboard (most defensible case first)"
+            "Risk-graded slate (Lock → Avoid)"
+            if any_classified
+            else "Defensibility leaderboard (most defensible case first)"
             if any_judged
             else "Confidence leaderboard (highest predicted probability first)"
         )
@@ -308,6 +334,7 @@ def print_run_summary(
         leaderboard.add_column(
             "Winner", style=f"bold {_LAVENDER}", overflow="fold", min_width=14
         )
+        leaderboard.add_column("Risk", justify="center")
         leaderboard.add_column("Case", justify="center")
         leaderboard.add_column("Pred", justify="right")
         leaderboard.add_column("Poly impl", justify="right")
@@ -327,10 +354,14 @@ def print_run_summary(
             case_cell = (
                 _defensibility_stars(da.defensibility_score) if da is not None else "—"
             )
+            rc = result.risk_classifications.get(p.event_id)
+            risk_bucket = rc[0] if rc is not None else BUCKET_UNRATED
+            risk_cell = f"[{_risk_style(risk_bucket)}]{risk_bucket}[/]"
             leaderboard.add_row(
                 str(rank),
                 event_display,
                 p.predicted_winner,
+                risk_cell,
                 case_cell,
                 f"{p.predicted_yes_probability:.3f}",
                 poly_impl_str,

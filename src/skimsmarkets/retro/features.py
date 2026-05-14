@@ -151,6 +151,8 @@ def extract_features(
         gap_to_market_signed=row.gap_to_market_signed,
         gap_to_sim_signed=row.gap_to_sim_signed,
         gap_to_gbt_signed=row.gap_to_gbt_signed,
+        risk_bucket=row.risk_bucket,
+        risk_score=row.risk_score,
     )
 
     # Tennis per-shift directional grading. Walk the six known shift

@@ -4,26 +4,28 @@ Runs ONCE per pipeline run, after all per-event directors finish. Reads
 each event's `MarketPrediction` and emits a `SlateDefensibilityJudgment`
 with one `DefensibilityAssessment` per event, scoring **case
 defensibility** (not edge / not EV — see CLAUDE.md "confidence ranker,
-not edge finder"). The judge's `defensibility_score` replaces
-`predicted_yes_probability` as the leaderboard's primary sort key.
+not edge finder"). The judge's `defensibility_score` is one of the three
+inputs to the deterministic risk classifier (`classify.py`) that grades
+the slate; it also breaks ties within a risk bucket on the leaderboard.
 
 Naming intentionally measures the *absence* of risk (defensibility) so
 "higher = better" matches the leaderboard's descending-sort direction
 without inversion confusion.
 
 Inputs are reasoning-only — the judge sees the director's *synthesis*
-(`reasoning`, `confidence`, `disagreements_flagged`, `uw_flow_note`,
-`specialist_weights`) plus the predicted/implied probability gap, but NOT
-the upstream raw notebooks/specialist reports or market microstructure
-(spread, book depth). That keeps the judge's job narrow: "is the case
-the director made internally coherent and well-supported," not "is this a
-good bet."
+(`reasoning`, `confidence`, `predicted_yes_probability`,
+`disagreements_flagged`, `uw_flow_note`, `specialist_weights`), but NOT
+the upstream raw notebooks/specialist reports and NOT the market price.
+The judge is blind to the market like every other LLM stage; it scores
+internal soundness only — "is the case the director made internally
+coherent and well-supported," not "is this a good bet."
 
 Failure posture: a judge call failure is recorded as one slate-level
 `ErrorRecord` and the pipeline continues with
-`result.defensibility_assessments` empty — the leaderboard falls back to
-predicted-probability sort. Mirrors the silent-degrade enrichment-stage
-posture documented in CLAUDE.md.
+`result.defensibility_assessments` empty — every event then classifies
+as `Unrated` (no defensibility input) and the leaderboard falls back to
+predicted-probability ordering. Mirrors the silent-degrade
+enrichment-stage posture documented in CLAUDE.md.
 """
 
 from __future__ import annotations
@@ -50,10 +52,11 @@ from skimsmarkets.agents.schemas import MarketPrediction, SlateDefensibilityJudg
 JUDGE_SYSTEM = """
 You are the slate judge for a sports prediction-market research team. Earlier
 in the pipeline, a director produced an EventPrediction for each of N events
-on today's slate by synthesizing a sport-specific set of specialists against
-direct Polymarket microstructure (bid/ask, depth, sparkline, recency scalars)
-and, when available, on-chain flow signals from Unusual Whales. You receive
-ALL of those director outputs in one batch and emit a per-event
+on today's slate by synthesizing a sport-specific set of specialists' research
+and deterministic non-market priors (a career-baseline simulation and a GBT
+model), plus on-chain flow signals from Unusual Whales when available. The
+director did NOT see the betting market's price, and neither do you. You
+receive ALL of those director outputs in one batch and emit a per-event
 DefensibilityAssessment that re-ranks the slate by **case defensibility** —
 how robust each prediction is to its inputs being wrong.
 
@@ -65,8 +68,8 @@ strong is the director's case." The user picks what to act on; your job is
 to make that picking easier.
 
 Hard rules:
-- Do NOT emit buy/pass language, edge in bps, fair-vs-implied gap as edge,
-  Kelly fractions, position sizes, or trade recommendations.
+- Do NOT emit buy/pass language, edge in bps, Kelly fractions, position
+  sizes, or trade recommendations.
 - Do NOT re-derive or argue with the director's `predicted_winner` or
   `predicted_yes_probability`. Take both at face value. Your job is to
   judge how DEFENSIBLE the case is, not whether you'd have made a different
@@ -108,14 +111,6 @@ Rubric — judge each event against these signals (in roughly this priority):
    is fragile; penalize. Diffuse weights — no lens above ~1.4× equal
    share — mean removing any one input wouldn't flip the call; boost.
 
-5. Probability/implied gap discipline. Compare `predicted_yes_probability`
-   against `polymarket_implied_probability`. A small gap (<5pp) is the
-   easy case — modest defensibility load. A large gap (>15pp) demands the
-   reasoning explicitly justify why the market is wrong; if it does so
-   convincingly, the gap is fine; if the reasoning glosses over the gap,
-   penalize. Reminder: this is NOT an edge measurement. You are judging
-   "is the gap defensibly explained" — not "is there money to be made."
-
 Output, per event in the input batch:
 - `event_id` — copy verbatim from the event you're scoring.
 - `defensibility_score` — float in [0,1], higher = stronger case.
@@ -132,7 +127,6 @@ Output, per event in the input batch:
     * `lens_disagreement`     — disagreements_flagged is non-empty
     * `uw_contra`             — uw_flow_note explicitly diverges from predicted_winner
     * `concentrated_weights`  — one specialist_weight > 0.6
-    * `unexplained_gap`       — large predicted/implied gap not addressed in reasoning
     * `low_confidence_tier`   — director self-reported confidence='low' (a single common contingency flips the pick) AND reasoning doesn't name a clear contingency-survival case
     * `live_volatility`       — reasoning mentions LIVE/in-play state with rapidly-changing context
 
@@ -162,23 +156,12 @@ def _render_event_block(p: MarketPrediction) -> str:
     """Compact, scannable block per event for the judge's user message.
 
     Reasoning-only inputs (per design): the director's synthesis, the
-    confidence tier, and the predicted/implied probability gap. The raw
-    upstream evidence (notebooks, specialist reports) and market
-    microstructure are intentionally omitted — the judge's job is to score
-    the *case*, not to second-guess the director's evidence.
+    predicted probability, and the confidence tier. The raw upstream
+    evidence (notebooks, specialist reports) and the market price are
+    intentionally omitted — the judge scores the *case* on internal
+    soundness alone, blind to the market like every other LLM stage.
     """
     title = p.event_title or p.event_id
-    implied = (
-        f"{p.polymarket_implied_probability:.3f}"
-        if p.polymarket_implied_probability is not None
-        else "unknown"
-    )
-    gap_pp = (
-        (p.predicted_yes_probability - p.polymarket_implied_probability) * 100.0
-        if p.polymarket_implied_probability is not None
-        else None
-    )
-    gap_str = f"{gap_pp:+.1f}pp" if gap_pp is not None else "n/a (no implied)"
     weights_str = ", ".join(
         f"{k}={v:.2f}" for k, v in sorted(p.specialist_weights.items())
     )
@@ -191,8 +174,6 @@ def _render_event_block(p: MarketPrediction) -> str:
         f"event_title: {title}\n"
         f"predicted_winner: {p.predicted_winner}\n"
         f"predicted_yes_probability: {p.predicted_yes_probability:.3f}\n"
-        f"polymarket_implied_probability: {implied}\n"
-        f"predicted_minus_implied: {gap_str}\n"
         f"confidence_tier: {p.confidence}\n"
         f"specialist_weights: {weights_str}\n"
         f"disagreements_flagged: {disagreements}\n"

@@ -18,8 +18,23 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from skimsmarkets.classify import (  # noqa: E402
+    BUCKET_AVOID,
+    BUCKET_COINFLIP,
+    BUCKET_LOCK,
+    BUCKET_ORDER,
+    BUCKET_UNRATED,
+    THRESHOLD_COINFLIP,
+    THRESHOLD_LEAN,
+    THRESHOLD_LOCK,
+    bucket_rank,
+    classify_risk,
+)
 from skimsmarkets.execute.filters import filter_rows  # noqa: E402
-from skimsmarkets.execute.trader import sum_exposure_cents  # noqa: E402
+from skimsmarkets.execute.trader import (  # noqa: E402
+    _implied_at_or_above_max,
+    sum_exposure_cents,
+)
 from skimsmarkets.kalshi.matcher import (  # noqa: E402
     extract_match_players,
     find_kalshi_match,
@@ -422,6 +437,100 @@ def _t_sum_exposure_cents() -> int:
 
 
 # ---------------------------------------------------------------------------
+# classify_risk
+# ---------------------------------------------------------------------------
+
+
+def _t_classify() -> int:
+    """classify_risk — bucket boundaries, asymmetric convergence, anchor flip."""
+    n = 0
+
+    # Clear Lock — lopsided, well-defended, blind estimate agrees with market.
+    bucket, score = classify_risk(0.88, 0.90, 0.03, predicted_winner_is_team_a=True)
+    assert bucket == BUCKET_LOCK, (bucket, score)
+    assert score is not None and score >= THRESHOLD_LOCK, score
+    n += 2
+
+    # Coin-flip — middling magnitude + defensibility; the blind estimate and
+    # the market agree on the winner with only a small same-side gap.
+    bucket, score = classify_risk(0.55, 0.45, 0.05, predicted_winner_is_team_a=True)
+    assert bucket == BUCKET_COINFLIP, (bucket, score)
+    assert score is not None and THRESHOLD_COINFLIP <= score < THRESHOLD_LEAN, score
+    n += 2
+
+    # Directional disagreement — the market prices the predicted winner below
+    # 0.5 (blind 0.61 vs market 0.41), so it favors the *other* side. The
+    # disagreement penalty crushes convergence; what magnitude + defensibility
+    # alone would have made a Lean drops to Coin-flip.
+    bucket, score = classify_risk(0.61, 0.75, 0.20, predicted_winner_is_team_a=True)
+    assert bucket == BUCKET_COINFLIP, (bucket, score)
+    n += 1
+
+    # Avoid — blind 0.56 vs market 0.30: the gap penalty *and* the
+    # directional-disagreement penalty together crush convergence to 0, and
+    # thin defensibility does the rest.
+    bucket, score = classify_risk(0.56, 0.30, 0.26, predicted_winner_is_team_a=True)
+    assert bucket == BUCKET_AVOID, (bucket, score)
+    assert score is not None and score < THRESHOLD_COINFLIP, score
+    n += 2
+
+    # Unrated — the judge produced no defensibility score.
+    bucket, score = classify_risk(0.80, None, 0.05, predicted_winner_is_team_a=True)
+    assert bucket == BUCKET_UNRATED and score is None, (bucket, score)
+    n += 1
+
+    # No market implied → convergence term dropped, weights renormalize to
+    # 0.5 magnitude / 0.5 defensibility.
+    bucket, score = classify_risk(0.82, 0.72, None, predicted_winner_is_team_a=True)
+    assert score is not None and abs(score - (0.5 * 0.82 + 0.5 * 0.72)) < 1e-9, score
+    assert bucket == BUCKET_LOCK, (bucket, score)
+    n += 2
+
+    # team_b winner — gap_to_market_signed is team_a-anchored, so the anchor
+    # flip turns a -0.05 team_a gap into a +0.05 winner-frame gap (blind
+    # estimate is *more* bullish on team_b than the market).
+    bucket, score = classify_risk(0.70, 0.80, -0.05, predicted_winner_is_team_a=False)
+    assert bucket == BUCKET_LOCK, (bucket, score)
+    # The same raw gap read as a team_a winner means the blind estimate is
+    # *less* bullish than the market → steeper penalty → strictly lower score.
+    _, score_team_a = classify_risk(0.70, 0.80, -0.05, predicted_winner_is_team_a=True)
+    assert score is not None and score_team_a is not None and score_team_a < score
+    n += 2
+
+    # bucket_rank ordering — Lock best (0), Unrated worst, unknown sorts last.
+    assert bucket_rank(BUCKET_LOCK) == 0
+    assert bucket_rank(BUCKET_AVOID) == 3
+    assert bucket_rank(BUCKET_UNRATED) == len(BUCKET_ORDER) - 1
+    assert bucket_rank("not-a-bucket") == len(BUCKET_ORDER)
+    n += 4
+
+    return n
+
+
+# ---------------------------------------------------------------------------
+# execute implied-probability gate
+# ---------------------------------------------------------------------------
+
+
+def _t_implied_gate() -> int:
+    """_implied_at_or_above_max — the execute-time live Kalshi-price gate."""
+    n = 0
+    # No ceiling configured → gate inactive, every ask passes.
+    assert _implied_at_or_above_max(0.95, None) is False
+    n += 1
+    # Live ask above the ceiling → gate fires (the trade is skipped).
+    assert _implied_at_or_above_max(0.72, 0.60) is True
+    n += 1
+    # Live ask below the ceiling → gate passes, the trade proceeds.
+    assert _implied_at_or_above_max(0.55, 0.60) is False
+    n += 1
+    # Exactly at the ceiling → fires, matching the rank slate's `>=`.
+    assert _implied_at_or_above_max(0.60, 0.60) is True
+    n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -441,6 +550,8 @@ def main() -> int:
         ("filter_rows negative_edge", _t_filter_negative_edge),
         ("filter_rows sport", _t_filter_sport),
         ("sum_exposure_cents", _t_sum_exposure_cents),
+        ("classify_risk", _t_classify),
+        ("execute implied-prob gate", _t_implied_gate),
     ]
     failures = 0
     for name, fn in groups:

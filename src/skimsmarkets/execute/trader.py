@@ -61,6 +61,12 @@ class ExecuteOptions:
     min_defensibility: float | None = None
     no_negative_edge: bool = False
     sports: list[str] | None = None
+    # Skip a matched trade when the *current* Kalshi YES ask is at or above
+    # this implied-probability ceiling. The rank-time slate filter only saw
+    # the Polymarket price; by execute time the Kalshi line can have drifted
+    # past the threshold. None = gate inactive (the CLI resolves it to
+    # `cfg.MAX_IMPLIED_PROBABILITY`, the same constant the rank slate uses).
+    max_implied_probability: float | None = None
 
 
 @dataclass
@@ -325,6 +331,22 @@ async def _prefetch_events(client: KalshiClient) -> list[KalshiEvent]:
     return events
 
 
+def _implied_at_or_above_max(
+    yes_ask: float, max_implied_probability: float | None,
+) -> bool:
+    """True when the live Kalshi YES ask hits the implied-probability ceiling.
+
+    Mirrors the rank-time slate filter (`polymarket/slate.py`), which drops a
+    market whose favorite mid sits *at or above* `max_implied_probability` —
+    so the execute-time gate uses the same `>=` comparison. A `None` ceiling
+    means the gate is inactive and every ask passes.
+    """
+    return (
+        max_implied_probability is not None
+        and yes_ask >= max_implied_probability
+    )
+
+
 async def _process_row(
     *,
     row: PredictionRow,
@@ -358,6 +380,20 @@ async def _process_row(
     market = outcome.market
     assert market is not None  # outcome.kind == "matched"
     yes_ask = market.yes_ask_dollars
+
+    # Current-price gate: the rank-time slate filter only saw Polymarket's
+    # implied probability. By the time we execute, the Kalshi YES ask can
+    # have drifted to or past the configured ceiling — re-check the live
+    # line and skip rather than buy in above threshold. `find_kalshi_match`
+    # guarantees `yes_ask` is a real float for a matched outcome.
+    if _implied_at_or_above_max(yes_ask, opts.max_implied_probability):
+        log.info(
+            "execute: %s current ask %.3f at/above max implied %.3f — skip",
+            market.ticker, yes_ask, opts.max_implied_probability,
+        )
+        return _skip_row(
+            base, outcome, reason="implied_at_or_above_max", market=market,
+        )
 
     # Portfolio exposure cap: open Kalshi exposure (read once at run
     # start) + this run's accumulated fills + this trade's ceiling. We

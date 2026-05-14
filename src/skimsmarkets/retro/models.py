@@ -70,6 +70,11 @@ class PredictionRow(BaseModel):
     defensibility_score: float | None = None
     defensibility_rationale: str | None = None
     defensibility_flags: list[str] = Field(default_factory=list)
+    # Deterministic risk classifier output (see `classify.py`). None on
+    # older runs predating the classifier; `risk_score` is also None when
+    # the judge produced no defensibility score (bucket `Unrated`).
+    risk_bucket: str | None = None
+    risk_score: float | None = None
     tennis_stats: TennisStatsContext | None = None
     tennis_simulation: TennisSimulationContext | None = None
     tennis_gbt: TennisGbtContext | None = None
@@ -223,6 +228,13 @@ class EventFeatures(BaseModel):
             "None when defensibility_score wasn't logged (judge failure)."
         ),
     )
+    # Deterministic risk classifier output (see `classify.py`) — distinct
+    # from `case_bucket`: this is the composite of magnitude + defensibility
+    # + market convergence, not the defensibility-only bar. None on runs
+    # predating the classifier; `risk_score` is also None when the bucket
+    # is `Unrated` (no judge score).
+    risk_bucket: str | None = None
+    risk_score: float | None = None
     # Step 2's anti-anchoring cut. True when predicted_winner sits on
     # the side gamma's market priced as the favorite (≥0.5 implied).
     market_favorite_pick: bool | None = None

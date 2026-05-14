@@ -21,9 +21,10 @@ sport-specific Pydantic report. The director composes:
     + physical_signed_shift + stakes_signed_shift
     → clip to [0, 1]
 
-…anchored against Polymarket's implied probability via the cross-sport
-director discipline. The stacking math lives in `DIRECTOR_SYSTEM_TENNIS_TAIL`
-explicitly so the reasoners' shifts don't get double-counted.
+…then committed to as the verdict — the director is blind to the market
+price, so there is no market anchoring. The stacking math lives in
+`DIRECTOR_SYSTEM_TENNIS_TAIL` explicitly so the reasoners' shifts don't
+get double-counted.
 """
 
 from skimsmarkets.agents.sports.tennis.lens_set import TENNIS_LENS_SET

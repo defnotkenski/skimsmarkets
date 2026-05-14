@@ -57,82 +57,27 @@ def _render_event_context_block(event: PolymarketEvent) -> str:
     if event.context_description:
         lines.append(f"Pre-match context: {event.context_description}")
     for m in event.markets:
-        implied = m.yes_implied_probability
-        bid = f"${m.yes_bid_dollars:.3f}" if m.yes_bid_dollars is not None else "?"
-        ask = f"${m.yes_ask_dollars:.3f}" if m.yes_ask_dollars is not None else "?"
-        implied_str = f"{implied:.3f}" if implied is not None else "unknown"
         side_tag = " [NO side, inverted]" if m.is_no_side else ""
-        # Mirror the specialist extras builder so the director sees the same
-        # micro-structure signals. These are deterministic enrichments
-        # (not LLM opinions) so the director should weigh them directly.
-        # Order: state (only when not OPEN) → top-of-book size → full-book
-        # $ → session range → 1d move → CLOB liquidity → competitive →
-        # record. State and intraday range come from `markets.book`;
-        # `liq`/`1d`/`comp` from the gamma piggyback; `record` from
-        # events.list team payload.
+        # The director is blind to the market price — no bid/ask, implied,
+        # book shape, or price history. Only non-directional signals reach
+        # it here: market state, resting liquidity, and the team record.
+        # See CLAUDE.md's market-blindness invariant.
         extras: list[str] = []
         if m.market_state and m.market_state != "MARKET_STATE_OPEN":
             extras.append(f"state={m.market_state.removeprefix('MARKET_STATE_')}")
-        if m.yes_bid_size_top is not None or m.yes_ask_size_top is not None:
-            bs = (
-                f"{m.yes_bid_size_top:.0f}"
-                if m.yes_bid_size_top is not None
-                else "?"
-            )
-            asz = (
-                f"{m.yes_ask_size_top:.0f}"
-                if m.yes_ask_size_top is not None
-                else "?"
-            )
-            extras.append(f"size={bs}/{asz}")
-        if (
-            m.yes_bid_book_dollars is not None
-            or m.yes_ask_book_dollars is not None
-        ):
-            bb = (
-                f"${m.yes_bid_book_dollars:,.0f}"
-                if m.yes_bid_book_dollars is not None
-                else "$?"
-            )
-            ab = (
-                f"${m.yes_ask_book_dollars:,.0f}"
-                if m.yes_ask_book_dollars is not None
-                else "$?"
-            )
-            extras.append(f"book={bb}/{ab}")
-        if (
-            m.high_px_dollars is not None
-            and m.low_px_dollars is not None
-        ):
-            extras.append(
-                f"range={m.high_px_dollars - m.low_px_dollars:.3f}"
-            )
         if m.gamma_liquidity_dollars is not None:
             extras.append(f"liq=${m.gamma_liquidity_dollars:,.0f}")
-        if m.gamma_one_day_price_change is not None:
-            extras.append(f"1d={m.gamma_one_day_price_change:+.3f}")
-        if m.gamma_competitive is not None:
-            extras.append(f"comp={m.gamma_competitive:.2f}")
         if m.team_record:
             extras.append(f"record={m.team_record}")
-        # CLOB price-history extras (sparkline + recency scalars). `30m=`
-        # is omitted from the director context to keep the per-market line
-        # tight; specialists get it for the closer-in look.
-        if m.clob_price_path_sparkline:
-            extras.append(f"path={m.clob_price_path_sparkline}")
-        if m.clob_price_change_4h is not None:
-            extras.append(f"4h={m.clob_price_change_4h:+.3f}")
-        if m.clob_price_change_1h is not None:
-            extras.append(f"1h={m.clob_price_change_1h:+.3f}")
         extras_str = f" {' '.join(extras)}" if extras else ""
         lines.append(
-            f"  - slug={m.slug}{side_tag} yes='{m.yes_sub_title or '(no label)'}' "
-            f"bid/ask={bid}/{ask} implied={implied_str}{extras_str}"
+            f"  - slug={m.slug}{side_tag} yes='{m.yes_sub_title or '(no label)'}'"
+            f"{extras_str}"
         )
     # Unusual Whales flow signals reach the director as raw background data —
-    # alongside bid/ask — rather than through any specialist's opinion. The
-    # block is only appended when UW had coverage for this event's slug; its
-    # absence is normal (most non-NBA/NFL/big-soccer events won't match).
+    # a standalone smart-money flow read, not mediated through any specialist's
+    # opinion. The block is only appended when UW had coverage for this event's
+    # slug; its absence is normal (most non-NBA/NFL/big-soccer events won't match).
     if event.uw_context is not None:
         lines.append("")
         lines.append(render_uw_block(event.uw_context))
@@ -149,7 +94,7 @@ def _render_event_context_block(event: PolymarketEvent) -> str:
     # GBT third prior, also director-only — same posture as the sim.
     # Trained on point-in-time aggregated career rates + surface splits
     # + recent form + age + H2H. Director uses it as a finite-window
-    # historical prior alongside the market and the iid sim.
+    # historical prior alongside the iid sim.
     if event.tennis_gbt is not None:
         lines.append("")
         lines.append(render_tennis_gbt_block(event.tennis_gbt))
