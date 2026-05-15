@@ -288,6 +288,17 @@ async def _cmd_gbt(args: argparse.Namespace) -> int:
         print(f"wrote {matches_path}")
         print(f"wrote {profiles_path}")
         return 0
+    if args.gbt_command == "rankings":
+        from skimsmarkets.tennis.gbt_rankings_backfill import (
+            run_rankings_backfill_cli,
+        )
+        rankings_path = await run_rankings_backfill_cli(
+            tours=list(args.tour) or ["atp", "wta"],
+            top_n=args.top,
+            start_year=args.start_year,
+        )
+        print(f"wrote {rankings_path}")
+        return 0
     if args.gbt_command == "train":
         from skimsmarkets.tennis.gbt_train import run_train_cli
         metrics = run_train_cli(
@@ -953,7 +964,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     gbt_sub = p_gbt.add_subparsers(
-        dest="gbt_command", metavar="{backfill,train}"
+        dest="gbt_command", metavar="{backfill,rankings,train}"
     )
 
     p_backfill = gbt_sub.add_parser(
@@ -980,6 +991,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Past-matches page size (vendor cap is generous; default: 100).",
     )
     p_backfill.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+
+    p_rankings = gbt_sub.add_parser(
+        "rankings",
+        help=(
+            "Hit MatchStat ranking/singles with the RankingDate filter for "
+            "every Monday in the configured window and write "
+            "`data/tennis_gbt/rankings_history.parquet`. One-time backfill; "
+            "~30 min at top=500 across 2009→today × 2 tours."
+        ),
+    )
+    p_rankings.add_argument(
+        "--tour", action="append", default=[], metavar="TOUR",
+        help="Tour to backfill (atp/wta). Repeatable. Default: both.",
+    )
+    p_rankings.add_argument(
+        "--top", type=int, default=500,
+        help="Top-N players per snapshot (default: 500).",
+    )
+    p_rankings.add_argument(
+        "--start-year", type=int, default=None,
+        help=(
+            "Start year for the snapshot walk (default: 2008, which "
+            "covers the earliest match-data date in raw_matches.parquet)."
+        ),
+    )
+    p_rankings.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
 

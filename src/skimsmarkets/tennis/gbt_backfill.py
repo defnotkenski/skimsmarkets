@@ -98,7 +98,25 @@ async def _get_json(
                 await asyncio.sleep(wait)
                 continue
             r.raise_for_status()
-            return r.json()
+            body = r.json()
+            # Body-level throttle: vendor sometimes returns HTTP 200 OK
+            # but the response carries an embedded throttler error
+            # instead of the data payload. Without this check the call
+            # returns "success" but with no `data` key, silently
+            # dropping rows on the caller side.
+            if (
+                isinstance(body, dict)
+                and body.get("error") is True
+                and body.get("statusCode") == 429
+            ):
+                wait = _RETRY_BASE_S * (attempt + 1)
+                log.warning(
+                    "body-level 429 from %s (msg=%r) — sleeping %.1fs",
+                    path, body.get("message"), wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+            return body
         except httpx.HTTPError as e:
             last_exc = e
             await asyncio.sleep(_RETRY_BASE_S * (attempt + 1))

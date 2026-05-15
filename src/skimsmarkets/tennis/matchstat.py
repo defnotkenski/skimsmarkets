@@ -662,7 +662,32 @@ class MatchStatTennisProvider:
             try:
                 resp = await self._client.get(url, params=params)
                 resp.raise_for_status()
-                return resp.json()
+                body = resp.json()
+                # Vendor body-level throttle: HTTP 200 OK but the
+                # response carries `{"error": true, "statusCode": 429,
+                # "message": "ThrottlerException"}` instead of the data
+                # payload. Without this check the caller treats it as
+                # "no rows found" and silently degrades. Retry with the
+                # same backoff posture as a real HTTP 429.
+                if (
+                    isinstance(body, dict)
+                    and body.get("error") is True
+                    and body.get("statusCode") == 429
+                ):
+                    if attempt + 1 < _RETRY_ATTEMPTS:
+                        backoff = _RETRY_BASE_S * (2 ** attempt)
+                        wait = backoff * random.uniform(0.5, 1.5)
+                        log.debug(
+                            "matchstat %s: body-level 429 sleeping %.1fs (attempt %d/%d)",
+                            path, wait, attempt + 1, _RETRY_ATTEMPTS,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    log.warning(
+                        "matchstat %s: body-level 429 exhausted retries", path
+                    )
+                    return None
+                return body
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
                 if status == 404:

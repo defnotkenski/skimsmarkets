@@ -114,6 +114,36 @@ def _safe_div(num: float, den: float) -> float | None:
 
 
 @dataclass
+class _H2HRecord:
+    """Per-opponent head-to-head record with clutch sub-counts.
+
+    Kept un-decayed (raw integer counts) deliberately — H2H samples
+    are small (often <5) and recency-decay would dilute them below the
+    point where the rate is informative. The career-aggregate clutch
+    counters on `PlayerHistory` are recency-weighted; the per-opponent
+    cross-product here is not.
+
+    Sub-counts mirror the career-aggregate clutch fields so a future
+    algorithmic-lens scoring rule can compare "this player's career
+    decider rate" vs "this player's decider rate specifically against
+    THIS opponent" — the matchup-conditioned clutch signal that
+    `/h2h/stats/{a}/{b}` exposes at live time, derivable here from the
+    raw match parquet without per-pair API calls.
+    """
+
+    wins: int = 0
+    losses: int = 0
+    decider_won: int = 0
+    decider_played: int = 0
+    tiebreak_won: int = 0
+    tiebreak_played: int = 0
+    comeback_won: int = 0
+    comeback_set1_lost: int = 0
+    close_match_won: int = 0
+    close_match_played: int = 0
+
+
+@dataclass
 class _SurfaceAggregate:
     """Per-surface running counts for one player. Identical schema to
     the all-surfaces aggregate but scoped to a single court type.
@@ -212,10 +242,12 @@ class PlayerHistory:
     # the requested surface matters).
     by_surface: dict[str | None, _SurfaceAggregate] = field(default_factory=dict)
 
-    # H2H by opponent. (wins, total) pairs keyed by opponent
-    # MatchStat id. Sparse — most pairings have no priors at slate
-    # time.
-    h2h: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # H2H by opponent. `_H2HRecord` per opponent MatchStat id with
+    # win/loss totals plus matchup-conditioned clutch sub-counts
+    # (decider, tiebreak, comeback, close-match). Sparse — most
+    # pairings have no priors at slate time. Un-decayed: H2H samples
+    # are small and recency-weighting them would over-dilute.
+    h2h: dict[int, _H2HRecord] = field(default_factory=dict)
 
     # Recent-form ring buffer (newest at the right). bool wins.
     recent: deque[bool] = field(default_factory=lambda: deque(maxlen=RECENT_FORM_WINDOW))
@@ -368,20 +400,34 @@ class PlayerHistory:
         bucket.won_first_serve_d += n(my_won_first_serve_of)
 
         # H2H bookkeeping. Direction = "my wins / total meetings"; the
-        # snapshot derives the anchor's H2H rate vs the opponent.
-        prior_w, prior_t = self.h2h.get(opponent_id, (0, 0))
-        self.h2h[opponent_id] = (prior_w + (1 if won else 0), prior_t + 1)
+        # snapshot derives the anchor's H2H rate vs the opponent. The
+        # per-opponent record also carries decider/tiebreak/comeback/
+        # close-match sub-counts so backtesting can read matchup-
+        # conditioned clutch without per-pair API calls.
+        record = self.h2h.get(opponent_id)
+        if record is None:
+            record = _H2HRecord()
+            self.h2h[opponent_id] = record
+        if won:
+            record.wins += 1
+        else:
+            record.losses += 1
 
         # Clutch counters — only when the score parsed cleanly.
         # `score_details` is match-winner-relative; rotate onto subject
-        # using `won`. Recency-weighted on the same schedule as the rate
-        # counters (decay applied via `_decay_to` above).
+        # using `won`. Career-aggregate counters are recency-weighted
+        # via `_decay_to` above; the per-opponent `_H2HRecord` is left
+        # un-decayed (small samples; recency-weighting would dilute).
+        subject_won_set_one: bool | None = None
         if score_details is not None:
             if score_details.went_to_decider:
                 self.decider_played += 1.0
+                record.decider_played += 1
                 if won:
                     self.decider_won += 1.0
+                    record.decider_won += 1
             self.tiebreak_played += score_details.n_tiebreaks_played
+            record.tiebreak_played += score_details.n_tiebreaks_played
             subject_tbs_won = (
                 score_details.winner_tiebreaks_won
                 if won
@@ -389,10 +435,13 @@ class PlayerHistory:
                 - score_details.winner_tiebreaks_won
             )
             self.tiebreak_won += subject_tbs_won
+            record.tiebreak_won += subject_tbs_won
             if score_details.is_close_match:
                 self.close_match_played += 1.0
+                record.close_match_played += 1
                 if won:
                     self.close_match_won += 1.0
+                    record.close_match_won += 1
             subject_won_set_one = (
                 score_details.winner_won_set_one
                 if won
@@ -400,8 +449,10 @@ class PlayerHistory:
             )
             if not subject_won_set_one:
                 self.comeback_set1_lost += 1.0
+                record.comeback_set1_lost += 1
                 if won:
                     self.comeback_won += 1.0
+                    record.comeback_won += 1
 
         # Recent / counts.
         self.recent.append(won)
@@ -494,10 +545,65 @@ class PlayerHistory:
         """Return `(my_winrate_vs_opp, n_priors)`. None winrate when no
         priors — caller materialises as NaN for catboost.
         """
-        wins, total = self.h2h.get(opponent_id, (0, 0))
+        record = self.h2h.get(opponent_id)
+        if record is None:
+            return None, 0
+        total = record.wins + record.losses
         if total == 0:
             return None, 0
-        return wins / total, total
+        return record.wins / total, total
+
+    def h2h_decider_winrate(
+        self, opponent_id: int
+    ) -> tuple[float | None, int]:
+        """Matchup-conditioned decider-set winrate. Returns
+        `(winrate, n_deciders)`; None winrate when no deciders played
+        vs this opponent. Mirrors what `/h2h/stats/{a}/{b}` returns
+        live, derivable from the raw match parquet here.
+        """
+        record = self.h2h.get(opponent_id)
+        if record is None or record.decider_played == 0:
+            return None, 0
+        return record.decider_won / record.decider_played, record.decider_played
+
+    def h2h_tiebreak_winrate(
+        self, opponent_id: int
+    ) -> tuple[float | None, int]:
+        """Matchup-conditioned tiebreak winrate. Returns `(winrate, n)`;
+        None winrate when no tiebreaks played vs this opponent.
+        """
+        record = self.h2h.get(opponent_id)
+        if record is None or record.tiebreak_played == 0:
+            return None, 0
+        return record.tiebreak_won / record.tiebreak_played, record.tiebreak_played
+
+    def h2h_comeback_winrate(
+        self, opponent_id: int
+    ) -> tuple[float | None, int]:
+        """Matchup-conditioned comeback rate — match wins given subject
+        lost set 1, divided by total set-1 losses vs this opponent.
+        """
+        record = self.h2h.get(opponent_id)
+        if record is None or record.comeback_set1_lost == 0:
+            return None, 0
+        return (
+            record.comeback_won / record.comeback_set1_lost,
+            record.comeback_set1_lost,
+        )
+
+    def h2h_close_match_winrate(
+        self, opponent_id: int
+    ) -> tuple[float | None, int]:
+        """Matchup-conditioned close-match winrate. Close = final-set
+        margin ≤ 2 OR final set was a tiebreak. Returns `(winrate, n)`.
+        """
+        record = self.h2h.get(opponent_id)
+        if record is None or record.close_match_played == 0:
+            return None, 0
+        return (
+            record.close_match_won / record.close_match_played,
+            record.close_match_played,
+        )
 
 
 @dataclass
