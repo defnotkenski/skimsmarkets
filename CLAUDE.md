@@ -62,6 +62,7 @@ opt-in via `skims execute`).
 | --- | --- |
 | `src/skimsmarkets/pipeline.py` | Orchestrator, JSONL persistence |
 | `src/skimsmarkets/cli.py` | `skims` entry point (rank / fetch / backtest / retro / gbt / execute) |
+| `src/skimsmarkets/menu/` | `skims menu` interactive launcher — arrow-key prompts assemble argv, dispatched through the existing parser |
 | `src/skimsmarkets/agents/` | LLM layer (director, reasoners, judge, fetcher providers) |
 | `src/skimsmarkets/agents/sports/<sport>/` | Per-sport lens registration |
 | `src/skimsmarkets/polymarket/` | Slate + CLOB enrichment: `slate.py` (gamma `/events` listing), `enrichment.py` (CLOB book + history), `models.py` (`PolymarketEvent`, `PolymarketMarket`, `from_gamma`) |

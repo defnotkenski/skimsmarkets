@@ -205,6 +205,10 @@ def print_events_table(
     # active progress bars. Falls back to a fresh `Console()` for
     # standalone callers.
     console = console or Console()
+    # Breathing room between the preceding pipeline log lines and the
+    # table title — without it the title sits flush against the last
+    # `INFO ...` line.
+    console.print()
     horizon_note = f", within {horizon_hours}h" if horizon_hours is not None else ""
     league_note = f" — leagues={','.join(leagues)}" if leagues else ""
     title = (
@@ -286,6 +290,9 @@ def print_run_summary(
     # `Console()` keeps non-CLI callers (tests, ad-hoc imports)
     # working without setup.
     console = console or Console()
+    # Breathing room between the preceding pipeline log lines and the
+    # rule that opens the summary.
+    console.print()
     console.rule(f"[bold {_LAVENDER}]Run {result.run_id}[/]", style=_LAVENDER)
     # NOTE: the previous plain-text counts line ("Fetched events: 24 …")
     # was folded into the bottom `Run summary` panel together with the

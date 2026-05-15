@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from collections.abc import Awaitable, Callable
 
 import httpx
 from rich.console import Console
@@ -24,6 +25,8 @@ from skimsmarkets.progress import ProgressReporter
 from skimsmarkets.reporting import print_events_table, print_run_summary
 from skimsmarkets.selection import select_top_events
 from skimsmarkets.tennis.provider import build_tennis_provider
+
+log = logging.getLogger(__name__)
 
 # Module-level shared Console for the entire CLI process.
 #
@@ -317,14 +320,16 @@ async def _cmd_gbt(args: argparse.Namespace) -> int:
 
 
 async def _cmd_execute(args: argparse.Namespace) -> int:
-    """Place Kalshi market-buy orders against `--run-id`'s ranked predictions.
+    """Place Kalshi market-buy orders against a ranked run's predictions.
 
-    Reads `logs/runs/<run_id>.jsonl`, applies the deterministic filter
-    set (`--confidence`, `--min-defensibility`, `--no-negative-edge`,
-    `--sport tennis`), matches each survivor to a Kalshi market by
-    player-surname pair, re-checks the live Kalshi line against
-    `--max-prob`, and (if `--live`) places one market-buy order capped
-    at `--bet-size-cents`. Defaults to `--dry-run`.
+    Reads `logs/runs/<run_id>.jsonl` — `--run-id` selects the run, or
+    defaults to the most recent log under `logs/runs/` when omitted.
+    Applies the deterministic filter set (`--confidence`,
+    `--min-defensibility`, `--no-negative-edge`, `--sport tennis`),
+    matches each survivor to a Kalshi market by player-surname pair,
+    re-checks the live Kalshi line against `--max-prob`, and (if
+    `--live`) places one market-buy order capped at `--bet-size-cents`.
+    Defaults to `--dry-run`.
 
     Audit log: `logs/trades/<run_id>.jsonl`, one row per filtered
     prediction whether placed, skipped, or dry-run.
@@ -334,6 +339,26 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         print_execute_summary,
     )
     from skimsmarkets.execute.trader import ExecuteOptions, run_execute
+    from skimsmarkets.retro.jsonl import list_run_files
+
+    # Resolve --run-id. An explicit value always wins; when omitted,
+    # fall back to the most recent run log under logs/runs/ (mtime
+    # descending, resolution sidecars excluded — `list_run_files`
+    # handles both). `skims execute` straight after `skims rank` is the
+    # common path, so defaulting to "latest" saves copying the id by hand.
+    run_id = args.run_id
+    if run_id is None:
+        run_files = list_run_files()
+        if not run_files:
+            print(
+                "ERROR: skims execute needs a run log under logs/runs/, "
+                "but none were found. Run `skims rank` first, or pass "
+                "--run-id explicitly.",
+                file=sys.stderr,
+            )
+            return 1
+        run_id = run_files[0].stem
+        log.info("execute: no --run-id given — using latest run %s", run_id)
 
     # Fall-through: an explicit CLI value (truthy list, non-None scalar,
     # explicit boolean) wins; otherwise consult the config constants.
@@ -366,7 +391,7 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
     )
 
     opts = ExecuteOptions(
-        run_id=args.run_id,
+        run_id=run_id,
         dry_run=not args.live,
         bet_size_cents=args.bet_size_cents,
         max_position_cents=args.max_position_cents,
@@ -490,6 +515,36 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_menu(args: argparse.Namespace) -> int:
+    """Interactive arrow-key launcher (Splash look) for the other
+    subcommands. Prints the banner, shows the command picker, walks the
+    chosen command's common-flag flow, then dispatches the assembled
+    argv through the same parser the manual CLI uses — see
+    `skimsmarkets.menu` for the argv-not-Namespace invariant. Loops
+    until quit. TTY-only: bails with a hint when stdout isn't a
+    terminal, so scripted / scheduled callers can't trip into it.
+    """
+    from skimsmarkets.menu.app import run_menu
+
+    return await run_menu(
+        console=_CONSOLE, parser=_build_parser(), dispatch=_DISPATCH,
+    )
+
+
+# Command name → handler. Module-level so `_cmd_menu` can dispatch
+# through the same table `main()` uses without re-deriving it.
+_DISPATCH: dict[str, Callable[[argparse.Namespace], Awaitable[int]]] = {
+    "rank": _cmd_rank,
+    "fetch": _cmd_fetch,
+    "backtest": _cmd_backtest,
+    "retro": _cmd_retro,
+    "gbt": _cmd_gbt,
+    "execute": _cmd_execute,
+    "positions": _cmd_positions,
+    "menu": _cmd_menu,
+}
+
+
 # ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
@@ -501,6 +556,7 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
 # `main()` and the subparser registration stay in sync.
 _SUBCOMMANDS = (
     "rank", "fetch", "backtest", "retro", "gbt", "execute", "positions",
+    "menu",
 )
 
 
@@ -607,7 +663,7 @@ def _build_parser() -> argparse.ArgumentParser:
     slate = _build_slate_parser()
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{rank,fetch,backtest,retro,gbt,execute,positions}",
+        metavar="{rank,fetch,backtest,retro,gbt,execute,positions,menu}",
     )
 
     p_rank = sub.add_parser(
@@ -650,9 +706,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_execute.add_argument(
         "--run-id",
-        required=True,
+        default=None,
         metavar="RUN_ID",
-        help="Run log under logs/runs/ to consume (e.g. `8f55201f`).",
+        help=(
+            "Run log under logs/runs/ to consume (e.g. `8f55201f`). "
+            "When omitted, the most recently written run log is used."
+        ),
     )
     p_execute.add_argument(
         "--live",
@@ -928,6 +987,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
 
+    # `skims menu` — interactive arrow-key launcher. No flags of its
+    # own; the menu collects each subcommand's flags interactively.
+    p_menu = sub.add_parser(
+        "menu",
+        help="Interactive arrow-key launcher for the other subcommands.",
+    )
+    p_menu.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+
     return parser
 
 
@@ -952,21 +1021,13 @@ def main() -> int:
     _setup_logging(args.verbose)
 
     # Interactive header. `print_banner` is TTY-gated, so it self-suppresses
-    # when output is piped or captured; `positions` opts out entirely since
-    # its stdout is parsed by scheduled routines.
-    if args.command != "positions":
+    # when output is piped or captured; `positions` opts out (its stdout is
+    # parsed by scheduled routines) and `menu` opts out because it reprints
+    # the banner itself on every loop iteration.
+    if args.command not in ("positions", "menu"):
         print_banner(_CONSOLE, args.command)
 
-    dispatch = {
-        "rank": _cmd_rank,
-        "fetch": _cmd_fetch,
-        "backtest": _cmd_backtest,
-        "retro": _cmd_retro,
-        "gbt": _cmd_gbt,
-        "execute": _cmd_execute,
-        "positions": _cmd_positions,
-    }
-    return asyncio.run(dispatch[args.command](args))
+    return asyncio.run(_DISPATCH[args.command](args))
 
 
 if __name__ == "__main__":

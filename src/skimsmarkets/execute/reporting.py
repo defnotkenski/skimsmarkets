@@ -361,4 +361,7 @@ def print_execute_summary(
         border_style=_LAVENDER,
         padding=(0, 0),
     )
+    # Breathing room between any trailing log lines from the live
+    # display teardown and the summary panel.
+    console.print()
     console.print(panel)
