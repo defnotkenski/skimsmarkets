@@ -48,12 +48,17 @@ def build_lens_prompts_for_set(
     don't collide with default lens names), so providers maintain a
     flat `_TOOLS_BY_LENS` dict keyed by full lens name and accumulate
     entries as new sports ship.
+
+    Algorithmic-mode specs (`compute` set, `fetcher_system_builder=None`)
+    are skipped — the orchestrator never calls a fetcher on them, so no
+    cached prompt is needed.
     """
     return {
         spec.name: spec.fetcher_system_builder(
             tools_by_lens[spec.name], notebook_tail
         )
         for spec in lens_set.lenses
+        if spec.fetcher_system_builder is not None
     }
 
 

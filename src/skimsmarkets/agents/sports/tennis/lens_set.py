@@ -35,6 +35,7 @@ from CLAUDE.md.
 
 from __future__ import annotations
 
+from skimsmarkets import config as cfg
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
 from skimsmarkets.agents.sports.tennis.prompts import (
     DIRECTOR_SYSTEM_TENNIS_TAIL,
@@ -55,6 +56,10 @@ from skimsmarkets.tennis import (
     render_tennis_fatigue_block,
     render_tennis_form_block,
     render_tennis_matchup_block,
+)
+from skimsmarkets.tennis.algo_lens import (
+    compute_form_surface_report,
+    compute_matchup_clutch_report,
 )
 
 
@@ -329,27 +334,51 @@ Tennis conditions-and-context calibration:
 """.strip()
 
 
+# Form + matchup specs are picked at import time based on
+# `ALGORITHMIC_LENSES_ENABLED`. Conditions stays LLM-only —
+# physical/stakes inputs are web-search-dominated (current injuries,
+# weather, narrative) and aren't matchstats consumers.
+if cfg.ALGORITHMIC_LENSES_ENABLED:
+    _form_spec = LensSpec(
+        name="tennis_form_and_surface",
+        fetcher_system_builder=None,
+        reasoner_system=None,
+        report_schema=TennisFormSurfaceReport,
+        compute=compute_form_surface_report,
+    )
+    _matchup_spec = LensSpec(
+        name="tennis_matchup_and_clutch",
+        fetcher_system_builder=None,
+        reasoner_system=None,
+        report_schema=TennisMatchupClutchReport,
+        compute=compute_matchup_clutch_report,
+    )
+else:
+    _form_spec = LensSpec(
+        name="tennis_form_and_surface",
+        fetcher_system_builder=tennis_form_and_surface_notebook_system,
+        reasoner_system=TENNIS_FORM_AND_SURFACE_REASONER_SYSTEM,
+        report_schema=TennisFormSurfaceReport,
+        render_extras=_render_tennis_form_extras,
+        fetcher_sport_hint=_FETCHER_HINT_FORM_AND_SURFACE,
+        reasoner_sport_hint=_REASONER_HINT_FORM_AND_SURFACE,
+    )
+    _matchup_spec = LensSpec(
+        name="tennis_matchup_and_clutch",
+        fetcher_system_builder=tennis_matchup_and_clutch_notebook_system,
+        reasoner_system=TENNIS_MATCHUP_AND_CLUTCH_REASONER_SYSTEM,
+        report_schema=TennisMatchupClutchReport,
+        render_extras=_render_tennis_matchup_extras,
+        fetcher_sport_hint=_FETCHER_HINT_MATCHUP_AND_CLUTCH,
+        reasoner_sport_hint=_REASONER_HINT_MATCHUP_AND_CLUTCH,
+    )
+
+
 TENNIS_LENS_SET = LensSet(
     sport="tennis",
     lenses=(
-        LensSpec(
-            name="tennis_form_and_surface",
-            fetcher_system_builder=tennis_form_and_surface_notebook_system,
-            reasoner_system=TENNIS_FORM_AND_SURFACE_REASONER_SYSTEM,
-            report_schema=TennisFormSurfaceReport,
-            render_extras=_render_tennis_form_extras,
-            fetcher_sport_hint=_FETCHER_HINT_FORM_AND_SURFACE,
-            reasoner_sport_hint=_REASONER_HINT_FORM_AND_SURFACE,
-        ),
-        LensSpec(
-            name="tennis_matchup_and_clutch",
-            fetcher_system_builder=tennis_matchup_and_clutch_notebook_system,
-            reasoner_system=TENNIS_MATCHUP_AND_CLUTCH_REASONER_SYSTEM,
-            report_schema=TennisMatchupClutchReport,
-            render_extras=_render_tennis_matchup_extras,
-            fetcher_sport_hint=_FETCHER_HINT_MATCHUP_AND_CLUTCH,
-            reasoner_sport_hint=_REASONER_HINT_MATCHUP_AND_CLUTCH,
-        ),
+        _form_spec,
+        _matchup_spec,
         LensSpec(
             name="tennis_conditions_and_context",
             fetcher_system_builder=tennis_conditions_and_context_notebook_system,

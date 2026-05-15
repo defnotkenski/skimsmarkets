@@ -178,7 +178,7 @@ class _LensOutcome:
     lens: str
     notebook: LensNotebook | None = None
     report: BaseModel | None = None
-    error_stage: str | None = None  # "fetcher" or "reasoner"
+    error_stage: str | None = None  # "fetcher", "reasoner", or "algo"
     error: BaseException | None = None
 
 
@@ -909,6 +909,33 @@ async def _run_lenses(
 
     async def _one(spec: LensSpec) -> _LensOutcome:
         lens = spec.name
+        if spec.compute is not None:
+            # Algorithmic path — no fetcher, no reasoner, no LLM. Synthesize
+            # a placeholder LensNotebook so persistence + retro keep their
+            # uniform per-lens shape.
+            try:
+                with _time_stage(per_event_timings, f"algo:{lens}"):
+                    report = spec.compute(event)
+            except Exception as e:  # noqa: BLE001
+                return _LensOutcome(lens=lens, error_stage="algo", error=e)
+            if report is None:
+                return _LensOutcome(
+                    lens=lens,
+                    error_stage="algo",
+                    error=RuntimeError(f"algorithmic lens {lens!r} returned None"),
+                )
+            notebook = LensNotebook(
+                lens=lens,
+                team_a_name=getattr(report, "team_a_name", "(unknown)"),
+                team_b_name=getattr(report, "team_b_name", "(unknown)"),
+                research_notes=(
+                    f"Algorithmic lens {lens!r} — deterministic compute, no fetcher/reasoner."
+                ),
+                citations=[],
+                computed_numbers=[],
+                coverage="thin",
+            )
+            return _LensOutcome(lens=lens, notebook=notebook, report=report)
         try:
             async with fetcher_sem:
                 with _time_stage(per_event_timings, f"fetcher:{lens}"):

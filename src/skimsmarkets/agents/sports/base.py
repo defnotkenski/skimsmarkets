@@ -54,15 +54,36 @@ class LensSpec:
     Frozen because the lens-set registry is built once at import time and
     re-instantiating per event would defeat the prompt-cache discipline
     (every cached prompt must be a stable Python object across calls).
+
+    A spec is either LLM-mode (fetcher_system_builder + reasoner_system
+    set) or algorithmic-mode (`compute` set). Validated in __post_init__.
+    Algorithmic specs skip the Stage A/B chain entirely — the orchestrator
+    calls `compute(event)` and synthesizes a placeholder LensNotebook so
+    the JSONL persistence shape stays uniform across both lens kinds.
     """
 
     name: str
-    fetcher_system_builder: Callable[[str, str], str]
-    reasoner_system: str
+    fetcher_system_builder: Callable[[str, str], str] | None
+    reasoner_system: str | None
     report_schema: type[BaseModel]
     render_extras: Callable[[PolymarketEvent], str | None] | None = None
     fetcher_sport_hint: str | None = None
     reasoner_sport_hint: str | None = None
+    compute: Callable[[PolymarketEvent], BaseModel | None] | None = None
+
+    def __post_init__(self) -> None:
+        if self.compute is not None:
+            if self.fetcher_system_builder is not None or self.reasoner_system is not None:
+                raise ValueError(
+                    f"LensSpec {self.name!r}: algorithmic specs (compute set) "
+                    f"must leave fetcher_system_builder + reasoner_system as None."
+                )
+        else:
+            if self.fetcher_system_builder is None or self.reasoner_system is None:
+                raise ValueError(
+                    f"LensSpec {self.name!r}: LLM specs need both "
+                    f"fetcher_system_builder and reasoner_system."
+                )
 
     def render_fetcher_hint(self) -> str | None:
         """Format the fetcher sport hint for appending to the user message,

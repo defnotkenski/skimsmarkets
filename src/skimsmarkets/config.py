@@ -117,6 +117,17 @@ FETCHER_PROVIDERS: tuple[str, ...] = ("grok", "gemini")
 FETCHER_PROVIDER = "grok"
 
 
+# Opt-in switch for the algorithmic tennis lenses. When True, the two
+# pure-stats lenses (`tennis_form_and_surface`, `tennis_matchup_and_clutch`)
+# run deterministic compute over the structured matchstats payload
+# instead of the LLM fetcher+reasoner pair. `tennis_conditions_and_context`
+# stays LLM-only — it's web-search-dominated, not a matchstats consumer.
+# Default False until the real scoring lands; the placeholder emits
+# neutral signal (baseline 0.5, zero shifts) so flipping this on without
+# the real algo in place wrecks the slate's rankings — flip deliberately.
+ALGORITHMIC_LENSES_ENABLED: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Kalshi execute module — venue config + safety defaults
 # ---------------------------------------------------------------------------
