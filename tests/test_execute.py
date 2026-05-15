@@ -69,6 +69,8 @@ def _row(
     defensibility_score: float | None = 0.8,
     negative_edge: bool | None = False,
     sport_type: str | None = "tennis",
+    risk_bucket: str | None = "Lock",
+    polymarket_implied_probability: float | None = 0.60,
 ) -> PredictionRow:
     """Minimal PredictionRow for matcher / filter tests."""
     return PredictionRow.model_validate({
@@ -84,6 +86,8 @@ def _row(
         "defensibility_score": defensibility_score,
         "negative_edge": negative_edge,
         "sport_type": sport_type,
+        "risk_bucket": risk_bucket,
+        "polymarket_implied_probability": polymarket_implied_probability,
     })
 
 
@@ -411,6 +415,52 @@ def _t_filter_sport() -> int:
     return 2
 
 
+def _t_filter_risk_bucket() -> int:
+    rows = [
+        _row(predicted_winner="A", risk_bucket="Lock"),
+        _row(predicted_winner="B", risk_bucket="Lean"),
+        _row(predicted_winner="C", risk_bucket="Coin-flip"),
+        _row(predicted_winner="D", risk_bucket="Avoid"),
+        _row(predicted_winner="E", risk_bucket=None),  # classifier failure
+    ]
+    # Default policy: Lock + Lean only.
+    got = list(filter_rows(rows, risk_buckets=["Lock", "Lean"]))
+    assert [r.predicted_winner for r in got] == ["A", "B"], got
+    # Strictest: Lock only.
+    got = list(filter_rows(rows, risk_buckets=["Lock"]))
+    assert [r.predicted_winner for r in got] == ["A"], got
+    # None bucket ALWAYS fails the gate when filter is active.
+    got = list(filter_rows(rows, risk_buckets=["Lock", "Lean", "Coin-flip", "Avoid"]))
+    assert [r.predicted_winner for r in got] == ["A", "B", "C", "D"], got
+    # No filter → every row passes (None bucket included).
+    got = list(filter_rows(rows, risk_buckets=None))
+    assert len(got) == 5, got
+    return 4
+
+
+def _t_filter_market_implied() -> int:
+    rows = [
+        _row(predicted_winner="A", polymarket_implied_probability=0.65),  # agree
+        _row(predicted_winner="B", polymarket_implied_probability=0.50),  # exactly threshold
+        _row(predicted_winner="C", polymarket_implied_probability=0.41),  # directional disagree
+        _row(predicted_winner="D", polymarket_implied_probability=None),  # missing
+    ]
+    # Default 0.50: keeps strict agreement (>=0.50), drops directional disagree
+    # and missing.
+    got = list(filter_rows(rows, min_market_implied_prob=0.50))
+    assert [r.predicted_winner for r in got] == ["A", "B"], got
+    # Stricter 0.55: drops the boundary-pass row too.
+    got = list(filter_rows(rows, min_market_implied_prob=0.55))
+    assert [r.predicted_winner for r in got] == ["A"], got
+    # None implied prob ALWAYS fails the gate when filter is active.
+    got = list(filter_rows(rows, min_market_implied_prob=0.0))
+    assert [r.predicted_winner for r in got] == ["A", "B", "C"], got
+    # No filter → every row passes (None implied included).
+    got = list(filter_rows(rows, min_market_implied_prob=None))
+    assert len(got) == 4, got
+    return 4
+
+
 # ---------------------------------------------------------------------------
 # sum_exposure_cents — open-exposure gate input
 # ---------------------------------------------------------------------------
@@ -727,6 +777,8 @@ def main() -> int:
         ("filter_rows defensibility", _t_filter_defensibility),
         ("filter_rows negative_edge", _t_filter_negative_edge),
         ("filter_rows sport", _t_filter_sport),
+        ("filter_rows risk_bucket", _t_filter_risk_bucket),
+        ("filter_rows market_implied", _t_filter_market_implied),
         ("sum_exposure_cents", _t_sum_exposure_cents),
         ("classify_risk", _t_classify),
         ("execute implied-prob gate", _t_implied_gate),

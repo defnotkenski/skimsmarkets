@@ -889,6 +889,19 @@ class PolymarketEvent(BaseModel):
             return None
         if slug.endswith(_GAMMA_VARIANT_EVENT_SUFFIXES):
             return None
+        # Doubles markets ship as `<tour>-doubles-<lastA>-<lastB>-<date>`.
+        # MatchStats's `/tennis/v2/{tour}/fixtures/{date}` index is
+        # singles-only, so the surname-pair overlay can never match a
+        # doubles entry — the YES sub_title is shaped "Bolelli Vavassori"
+        # (two players, glommed) and `_surname_token` returns a single
+        # mashed key (`bolellivavassori`) that has no counterpart in the
+        # vendor feed. Tennis stats / sim / GBT priors are also singles-
+        # shaped, so even a hypothetical doubles match would land in the
+        # pipeline with no usable evidence. Drop at slate level to keep
+        # the matched-count denominator and the per-miss debug log
+        # focused on the events we can actually predict.
+        if "-doubles-" in slug:
+            return None
         # Settled events: drop the whole event so completed matches don't
         # show up in the slate. bid/ask presence isn't a sufficient proxy —
         # gamma keeps stale prices on the book for a window after match end.

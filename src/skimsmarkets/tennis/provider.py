@@ -541,7 +541,7 @@ class TennisStatsProvider(Protocol):
 
         Surnames are normalised via
         `tennis/matchstat.py:_normalize_name` last-token so the index
-        matches the surname pair `pipeline._event_surname_pair` reads
+        matches the surname pair `pipeline._event_surname_pair_candidates` reads
         off the gamma event slug.
 
         `date_iso` is `YYYY-MM-DD`. Empty dict on any failure or when

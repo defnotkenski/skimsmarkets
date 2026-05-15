@@ -229,7 +229,7 @@ def _surname_token(name: str | None) -> str | None:
     further stripped to alnum-only.
 
     Canonical surname form for the fixtures-overlay index. Same
-    transform `pipeline._event_surname_pair` reads off the slug
+    transform `pipeline._event_surname_pair_candidates` reads off the slug
     (lowercased, diacritic-stripped, alnum-only), so the surname pair
     extracted from the gamma slug matches the keys built off the
     MatchStats fixture rows. Returns None for empty / null input or
@@ -260,6 +260,70 @@ def _surname_pair_key(
     if a is None or b is None or a == b:
         return None
     return frozenset({a, b})
+
+
+def _surname_candidates(name: str | None) -> list[str]:
+    """Plausible surname tokens for `name`, ordered last → penultimate.
+
+    Returns:
+      - `[]` for empty / null / unparseable input.
+      - `[last]` for 1-2 token names — the standard case where the last
+        token is the surname.
+      - `[last, penultimate]` for 3+ token names — Hispanic / Iberian
+        double-surname convention puts the paternal surname second-to-
+        last and the maternal surname last (e.g. "Maria Camila Osorio
+        Serrano" → paternal=Osorio, maternal=Serrano). Polymarket
+        frequently abbreviates such names to just the paternal portion
+        ("Camila Osorio"), so the index must cover both forms or the
+        cross-source lookup misses entirely.
+
+    Tokens are stripped to alnum to match `_surname_token`'s canonical
+    form. Duplicates filtered.
+    """
+    if not name:
+        return []
+    norm = _normalize_name(name)
+    if not norm:
+        return []
+    tokens = norm.split()
+    if not tokens:
+        return []
+    out: list[str] = []
+    last = "".join(c for c in tokens[-1] if c.isalnum())
+    if last:
+        out.append(last)
+    if len(tokens) >= 3:
+        pen = "".join(c for c in tokens[-2] if c.isalnum())
+        if pen and pen not in out:
+            out.append(pen)
+    return out
+
+
+def _surname_pair_candidates(
+    name_a: str | None, name_b: str | None
+) -> list[frozenset[str]]:
+    """All plausible `frozenset({surname_a, surname_b})` keys for a
+    matchup. Cross-product of `_surname_candidates` on each side,
+    deduped and minus the `a == b` collide cases.
+
+    Returns an empty list when either side has no candidates or every
+    candidate pair collides.
+    """
+    a_list = _surname_candidates(name_a)
+    b_list = _surname_candidates(name_b)
+    if not a_list or not b_list:
+        return []
+    seen: set[frozenset[str]] = set()
+    out: list[frozenset[str]] = []
+    for a in a_list:
+        for b in b_list:
+            if a == b:
+                continue
+            key = frozenset({a, b})
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
 
 
 def _coerce_int(v: Any) -> int | None:
@@ -696,6 +760,56 @@ class MatchStatTennisProvider:
     ) -> tuple[int, int | None, int | None] | None:
         idx = self._index.get(tour, {})
         return idx.get(_normalize_name(name))
+
+    def _backfill_ids_from_fixture(
+        self,
+        identity: "TennisMatchIdentity",
+        a_hit: tuple[int, int | None, int | None] | None,
+        b_hit: tuple[int, int | None, int | None] | None,
+    ) -> tuple[
+        tuple[int, int | None, int | None] | None,
+        tuple[int, int | None, int | None] | None,
+    ]:
+        """Fill missing `_resolve` hits from the matched fixture's IDs.
+
+        The slate-overlay step caches `MatchStatsFixture` rows keyed by
+        surname-pair. When the rankings-index lookup misses a player
+        (first-name transliteration variants — "Yulia" vs "Yuliia",
+        "Maria" vs "Mariia", "Anhelina" vs "Angelina"), the fixture
+        usually still has the authoritative `player_a_id` /
+        `player_b_id` from MatchStats's own payload. Use them so the
+        downstream per-player stats endpoints (ID-keyed) can run.
+
+        Rank position + points stay None when filled from a fixture —
+        the fixture row doesn't carry them. Callers that only need IDs
+        (profile / recent-matches / surface / H2H endpoints) get the
+        full benefit; rank-based selection scoring still degrades to
+        "no rank signal" for these players, which is what we want
+        when the rankings index didn't have them.
+        """
+        fixture: MatchStatsFixture | None = None
+        for pair_key in _surname_pair_candidates(
+            identity.player_a, identity.player_b,
+        ):
+            f = self._fixture_cache.get((identity.tour, pair_key))
+            if f is not None:
+                fixture = f
+                break
+        if fixture is None:
+            return a_hit, b_hit
+        # Map fixture sides to identity sides by surname — the cache
+        # key doesn't preserve A/B orientation across the two sources.
+        ident_a_candidates = set(_surname_candidates(identity.player_a))
+        fix_a_candidates = set(_surname_candidates(fixture.player_a_name))
+        if ident_a_candidates & fix_a_candidates:
+            ident_a_id, ident_b_id = fixture.player_a_id, fixture.player_b_id
+        else:
+            ident_a_id, ident_b_id = fixture.player_b_id, fixture.player_a_id
+        if a_hit is None and ident_a_id is not None:
+            a_hit = (ident_a_id, None, None)
+        if b_hit is None and ident_b_id is not None:
+            b_hit = (ident_b_id, None, None)
+        return a_hit, b_hit
 
     # ----- Selection-stage helpers (called pre-cap, no HTTP per event) -----
 
@@ -2127,8 +2241,8 @@ class MatchStatTennisProvider:
                 p2_name = (
                     p2_obj.get("name") if isinstance(p2_obj, dict) else None
                 )
-                key = _surname_pair_key(p1_name, p2_name)
-                if key is None:
+                pair_keys = _surname_pair_candidates(p1_name, p2_name)
+                if not pair_keys:
                     continue
                 # `date` may be null on early-round matches whose tipoff
                 # tour officials haven't confirmed. Carry None through —
@@ -2203,15 +2317,23 @@ class MatchStatTennisProvider:
                 # occasionally ships the same matchup twice within a
                 # tournament when both rounds advance through the
                 # bracket; the first (typically earliest) row is the
-                # right pick.
-                out.setdefault(key, fixture)
-                # Same first-write-wins for the cross-call fixture
-                # cache so the same-matchup-twice case picks the same
-                # fixture both `out` and the cache resolve to. The
-                # cache is keyed by `(tour, surname-pair)` so `fetch()`
-                # can look up the fixture for a matchup without
-                # knowing the date — identity doesn't carry one.
-                self._fixture_cache.setdefault((tour, key), fixture)
+                # right pick. Indexed under EVERY plausible surname-pair
+                # key (cross-product of `_surname_candidates` per side)
+                # so Polymarket lookups land regardless of which form
+                # the cross-source name takes — e.g. Polymarket's
+                # "Camila Osorio" finds the fixture indexed under
+                # MatchStats's "Maria Camila Osorio Serrano".
+                for pair_key in pair_keys:
+                    out.setdefault(pair_key, fixture)
+                    # Same first-write-wins for the cross-call fixture
+                    # cache so the same-matchup-twice case picks the same
+                    # fixture both `out` and the cache resolve to. The
+                    # cache is keyed by `(tour, surname-pair)` so `fetch()`
+                    # can look up the fixture for a matchup without
+                    # knowing the date — identity doesn't carry one.
+                    self._fixture_cache.setdefault(
+                        (tour, pair_key), fixture
+                    )
                 # Seed the rankings index with fixture-derived IDs so
                 # ITF players outside the top-500 ranking still
                 # resolve. Only fill empty slots — never overwrite
@@ -2238,6 +2360,17 @@ class MatchStatTennisProvider:
         await self._ensure_index(identity.tour)
         a_hit = self._resolve(identity.tour, identity.player_a)
         b_hit = self._resolve(identity.tour, identity.player_b)
+        # Transliteration-tolerance fallback. The rankings index is keyed
+        # on the FULL normalized name, so first-name spelling variants
+        # break it ("Yulia" vs "Yuliia", "Maria" vs "Mariia"). The matched
+        # fixture from the slate-overlay step carries authoritative
+        # `player_a_id` / `player_b_id` from MatchStats's own payload —
+        # use those when name→index resolution misses, since the surname
+        # pair already proved this fixture is THIS matchup.
+        if a_hit is None or b_hit is None:
+            a_hit, b_hit = self._backfill_ids_from_fixture(
+                identity, a_hit, b_hit,
+            )
         if a_hit is None and b_hit is None:
             log.debug(
                 "matchstat: neither player resolved (%s vs %s, tour=%s)",

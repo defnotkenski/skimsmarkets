@@ -61,6 +61,8 @@ class ExecuteOptions:
     min_defensibility: float | None = None
     no_negative_edge: bool = False
     sports: list[str] | None = None
+    risk_buckets: list[str] | None = None
+    min_market_implied_prob: float | None = None
     # Skip a matched trade when the *current* Kalshi YES ask is at or above
     # this implied-probability ceiling. The rank-time slate filter only saw
     # the Polymarket price; by execute time the Kalshi line can have drifted
@@ -126,6 +128,8 @@ async def run_execute(
         min_defensibility=opts.min_defensibility,
         no_negative_edge=opts.no_negative_edge,
         sports=opts.sports,
+        risk_buckets=opts.risk_buckets,
+        min_market_implied_prob=opts.min_market_implied_prob,
     ))
     summary.passed_filters = len(filtered)
     log.info(

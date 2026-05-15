@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -49,7 +50,7 @@ from skimsmarkets.tennis import (
 )
 from skimsmarkets.tennis.gbt import predict_for_event as gbt_predict_for_event
 from skimsmarkets.tennis.identity import tennis_match_identity
-from skimsmarkets.tennis.matchstat import _surname_token
+from skimsmarkets.tennis.matchstat import _surname_candidates, _surname_token
 from skimsmarkets.tennis.provider import (
     TennisStatsProvider,
     build_tennis_provider,
@@ -314,7 +315,7 @@ async def overlay_matchstats_tipoffs(
     Pre-condition: `events` are `PolymarketEvent` instances whose
     `slug` carries the tennis canonical shape — `{tour}-{last_a}-{last_b}
     -{yyyy-mm-dd}` (or `{tour}-{tournament}-{last_a}-{last_b}-{yyyy-mm-dd}`
-    with extra tokens between tour and surnames). `_event_surname_pair`
+    with extra tokens between tour and surnames). `_event_surname_pair_candidates`
     reads the last two pre-date tokens, so either shape works.
     Post-condition: each market's `game_start_time` reflects the most
     accurate available source, NEVER less accurate than before.
@@ -352,32 +353,58 @@ async def overlay_matchstats_tipoffs(
     matched_event_ids: set[str] = set()
     refreshed_tipoff = 0
     matched_events = 0
+    # Per-reason miss tally + per-event debug lines. Enabled via `-v`,
+    # this surfaces *why* each unmatched event missed (no_tipoff /
+    # no_pair / not_in_index) so we can target the dominant cause
+    # instead of guessing.
+    miss_counts: Counter[str] = Counter()
     for ev in events:
         tours = _matchstat_tours_for_slug(ev.slug or "")
         if not tours:
+            miss_counts["non_tennis"] += 1
             continue
         starts = [m.game_start_time for m in ev.markets if m.game_start_time]
         if not starts:
+            miss_counts["no_tipoff"] += 1
+            log.debug("matchstats miss: slug=%s reason=no_tipoff", ev.slug)
             continue
         date_iso = min(starts).strftime("%Y-%m-%d")
-        key = _event_surname_pair(ev)
-        if key is None:
+        pair_keys = _event_surname_pair_candidates(ev)
+        if not pair_keys:
+            miss_counts["no_pair"] += 1
+            log.debug(
+                "matchstats miss: slug=%s reason=no_pair detail=%s",
+                ev.slug, _classify_pair_failure(ev),
+            )
             continue
         # First-hit wins across the candidate tour indexes. ATP/WTA
         # slugs have exactly one candidate; ITF slugs have two (atp
         # then wta) since MatchStats serves ITF M-tier under atp and
         # ITF W-tier under wta — surname pairs are unique across
         # genders so there's no risk of a wrong-gender false match.
+        # For each tour we also try every candidate pair key so
+        # Hispanic / Iberian double-surname names match regardless of
+        # which side abbreviated (paternal-only vs full paternal+maternal).
         fixture = None
         for tour in tours:
             index = by_combo.get((tour, date_iso))
             if not index:
                 continue
-            f = index.get(key)
-            if f is not None:
-                fixture = f
+            for pair_key in pair_keys:
+                f = index.get(pair_key)
+                if f is not None:
+                    fixture = f
+                    break
+            if fixture is not None:
                 break
         if fixture is None:
+            miss_counts["not_in_index"] += 1
+            log.debug(
+                "matchstats miss: slug=%s reason=not_in_index "
+                "tours=%s date=%s pairs_tried=%s",
+                ev.slug, tours, date_iso,
+                [sorted(p) for p in pair_keys],
+            )
             continue
         matched_events += 1
         matched_event_ids.add(ev.id)
@@ -399,6 +426,11 @@ async def overlay_matchstats_tipoffs(
         "matchstats overlay: matched %d/%d events, refreshed tipoff on %d",
         matched_events, len(events), refreshed_tipoff,
     )
+    if miss_counts:
+        breakdown = ", ".join(
+            f"{k}={v}" for k, v in sorted(miss_counts.items())
+        )
+        log.info("matchstats overlay: miss breakdown — %s", breakdown)
     return matched_event_ids, total_fixtures
 
 
@@ -526,32 +558,80 @@ def _matchstat_tours_for_slug(slug: str) -> list[str]:
     return []
 
 
-def _event_surname_pair(ev: PolymarketEvent) -> frozenset[str] | None:
-    """Pull both surnames from the event's YES/NO market labels into a
-    `frozenset` keyed the same way `tennis/matchstat.py:_surname_pair_key`
-    indexes fixture rows.
+def _event_surname_pair_candidates(
+    ev: PolymarketEvent,
+) -> list[frozenset[str]]:
+    """All plausible `frozenset({surname_a, surname_b})` lookup keys for
+    this event's YES/NO market labels.
 
     Reads the FULL player name from `yes_sub_title` on each side rather
-    than parsing the slug. Polymarket truncates surnames to ~7 chars in
-    the slug (`atp-virtane-perrica-2026-05-13` for Virtanen vs Perricard),
-    which would miss the MatchStats index keyed on full surnames.
-    `_surname_token` applies the same canonicalisation MatchStats uses
-    (lowercase, diacritic-strip, alnum-only last token), so the surname
-    pair built here lines up directly with the fixture row keys.
+    than parsing the slug — Polymarket truncates surnames to ~7 chars
+    in the slug (`atp-virtane-perrica-2026-05-13` for Virtanen vs
+    Perricard), which would miss the MatchStats index keyed on full
+    surnames. `_surname_candidates` returns the last token plus, for
+    3+ token names, the penultimate — covering Hispanic / Iberian
+    double-surname abbreviation (Polymarket "Camila Osorio" vs
+    MatchStats "Maria Camila Osorio Serrano"). The cross-product
+    deduped pairs are what the overlay tries against the fixture index.
 
-    Returns None if either side lacks a `yes_sub_title`, either surname
-    extracts to empty, or both surnames collide (same surname both sides
-    — would key as a singleton frozenset which the index doesn't carry).
+    Returns an empty list when either side lacks a `yes_sub_title`,
+    either side's candidate list is empty, or every cross-product
+    pair collides on the same surname.
     """
-    yes_market = next((m for m in ev.markets if not m.is_no_side and m.yes_sub_title), None)
-    no_market = next((m for m in ev.markets if m.is_no_side and m.yes_sub_title), None)
+    yes_market = next(
+        (m for m in ev.markets if not m.is_no_side and m.yes_sub_title),
+        None,
+    )
+    no_market = next(
+        (m for m in ev.markets if m.is_no_side and m.yes_sub_title),
+        None,
+    )
     if yes_market is None or no_market is None:
-        return None
-    a = _surname_token(yes_market.yes_sub_title)
-    b = _surname_token(no_market.yes_sub_title)
-    if not a or not b or a == b:
-        return None
-    return frozenset({a, b})
+        return []
+    candidates_a = _surname_candidates(yes_market.yes_sub_title)
+    candidates_b = _surname_candidates(no_market.yes_sub_title)
+    if not candidates_a or not candidates_b:
+        return []
+    seen: set[frozenset[str]] = set()
+    out: list[frozenset[str]] = []
+    for a in candidates_a:
+        for b in candidates_b:
+            if a == b:
+                continue
+            key = frozenset({a, b})
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    return out
+
+
+def _classify_pair_failure(ev: PolymarketEvent) -> str:
+    """Diagnostic for why `_event_surname_pair_candidates` returned an
+    empty list — used only by the overlay's per-miss debug log.
+    Mirrors the checks inside the candidates function so we can name
+    the specific sub-cause instead of an opaque empty list.
+    """
+    yes_market = next(
+        (m for m in ev.markets if not m.is_no_side and m.yes_sub_title),
+        None,
+    )
+    no_market = next(
+        (m for m in ev.markets if m.is_no_side and m.yes_sub_title),
+        None,
+    )
+    if yes_market is None and no_market is None:
+        return "no_subtitle_both"
+    if yes_market is None:
+        return "no_subtitle_yes"
+    if no_market is None:
+        return "no_subtitle_no"
+    candidates_a = _surname_candidates(yes_market.yes_sub_title)
+    candidates_b = _surname_candidates(no_market.yes_sub_title)
+    if not candidates_a or not candidates_b:
+        return f"surname_empty(yes={candidates_a!r}, no={candidates_b!r})"
+    return (
+        f"surname_collide(yes={candidates_a!r}, no={candidates_b!r})"
+    )
 
 
 async def resolve_uw_context(

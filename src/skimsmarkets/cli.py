@@ -149,7 +149,7 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
     return SlateOptions(
         leagues=args.league,
         slugs=args.slug,
-        sports=args.sport,
+        sports=args.sport if args.sport else list(cfg.DEFAULT_SPORTS),
         horizon_hours=(
             args.horizon if args.horizon is not None else cfg.DEFAULT_HORIZON_HOURS
         ),
@@ -325,8 +325,8 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
     Reads `logs/runs/<run_id>.jsonl` — `--run-id` selects the run, or
     defaults to the most recent log under `logs/runs/` when omitted.
     Applies the deterministic filter set (`--confidence`,
-    `--min-defensibility`, `--no-negative-edge`, `--sport tennis`),
-    matches each survivor to a Kalshi market by player-surname pair,
+    `--min-defensibility`, `--no-negative-edge`, `--sport tennis`,
+    `--risk-bucket`, `--min-market-implied`), matches each survivor to a Kalshi market by player-surname pair,
     re-checks the live Kalshi line against `--max-prob`, and (if
     `--live`) places one market-buy order capped at `--bet-size-cents`.
     Defaults to `--dry-run`.
@@ -382,6 +382,14 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         list(args.sport) if args.sport
         else (list(cfg.KALSHI_DEFAULT_SPORTS) or None)
     )
+    risk_buckets = (
+        list(args.risk_bucket) if args.risk_bucket
+        else (list(cfg.KALSHI_DEFAULT_RISK_BUCKETS) or None)
+    )
+    min_market_implied_prob = (
+        args.min_market_implied if args.min_market_implied is not None
+        else cfg.KALSHI_DEFAULT_MIN_MARKET_IMPLIED_PROB
+    )
     # Re-check the live Kalshi line against the same implied-probability
     # ceiling the rank-time slate filter used; falls through to the shared
     # `MAX_IMPLIED_PROBABILITY` config constant when `--max-prob` is omitted.
@@ -400,6 +408,8 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         min_defensibility=min_defensibility,
         no_negative_edge=no_negative_edge,
         sports=sports,
+        risk_buckets=risk_buckets,
+        min_market_implied_prob=min_market_implied_prob,
         max_implied_probability=max_implied_probability,
     )
     config = cfg.Config.from_env(require_llm=False)
@@ -499,7 +509,8 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
     )
 
     sports_filter: set[str] | None = (
-        set(args.sport) if args.sport else None
+        set(args.sport) if args.sport
+        else (set(cfg.DEFAULT_SPORTS) or None)
     )
     if args.step == "calibrate":
         await run_step_calibrate(run_id=args.run_id)
@@ -515,24 +526,6 @@ async def _cmd_retro(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _cmd_menu(args: argparse.Namespace) -> int:
-    """Interactive arrow-key launcher (Splash look) for the other
-    subcommands. Prints the banner, shows the command picker, walks the
-    chosen command's common-flag flow, then dispatches the assembled
-    argv through the same parser the manual CLI uses — see
-    `skimsmarkets.menu` for the argv-not-Namespace invariant. Loops
-    until quit. TTY-only: bails with a hint when stdout isn't a
-    terminal, so scripted / scheduled callers can't trip into it.
-    """
-    from skimsmarkets.menu.app import run_menu
-
-    return await run_menu(
-        console=_CONSOLE, parser=_build_parser(), dispatch=_DISPATCH,
-    )
-
-
-# Command name → handler. Module-level so `_cmd_menu` can dispatch
-# through the same table `main()` uses without re-deriving it.
 _DISPATCH: dict[str, Callable[[argparse.Namespace], Awaitable[int]]] = {
     "rank": _cmd_rank,
     "fetch": _cmd_fetch,
@@ -541,7 +534,6 @@ _DISPATCH: dict[str, Callable[[argparse.Namespace], Awaitable[int]]] = {
     "gbt": _cmd_gbt,
     "execute": _cmd_execute,
     "positions": _cmd_positions,
-    "menu": _cmd_menu,
 }
 
 
@@ -556,7 +548,6 @@ _DISPATCH: dict[str, Callable[[argparse.Namespace], Awaitable[int]]] = {
 # `main()` and the subparser registration stay in sync.
 _SUBCOMMANDS = (
     "rank", "fetch", "backtest", "retro", "gbt", "execute", "positions",
-    "menu",
 )
 
 
@@ -602,7 +593,9 @@ def _build_slate_parser() -> argparse.ArgumentParser:
             "is a client-side slug-prefix filter applied after the listing "
             "call. Combine the two to narrow further: e.g. "
             "`--sport tennis --league atp` keeps only ATP-prefixed slugs "
-            "from the tennis listing. Empty = umbrella tag_slug=sports."
+            "from the tennis listing. Falls through to `DEFAULT_SPORTS` "
+            "in config.py when omitted; empty config tuple = umbrella "
+            "tag_slug=sports."
         ),
     )
     p.add_argument(
@@ -663,7 +656,7 @@ def _build_parser() -> argparse.ArgumentParser:
     slate = _build_slate_parser()
     sub = parser.add_subparsers(
         dest="command",
-        metavar="{rank,fetch,backtest,retro,gbt,execute,positions,menu}",
+        metavar="{rank,fetch,backtest,retro,gbt,execute,positions}",
     )
 
     p_rank = sub.add_parser(
@@ -821,6 +814,35 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_execute.add_argument(
+        "--risk-bucket",
+        action="append",
+        choices=("Lock", "Lean", "Coin-flip", "Avoid"),
+        default=None,
+        metavar="BUCKET",
+        help=(
+            "Keep only predictions in these risk buckets (from the "
+            "deterministic classifier — see `classify.py`). Repeatable. "
+            "Rows without a bucket (classifier failure / Unrated) fail "
+            "this gate. Falls through to `KALSHI_DEFAULT_RISK_BUCKETS` "
+            "in config.py when omitted; default keeps Lock + Lean."
+        ),
+    )
+    p_execute.add_argument(
+        "--min-market-implied",
+        type=float,
+        default=None,
+        metavar="P",
+        help=(
+            "Drop predictions where the Polymarket implied probability "
+            "for the predicted winner is below this cutoff. Default "
+            "0.50 enforces directional agreement — market and model "
+            "must pick the same favorite. Rows with missing implied "
+            "probability also fail. Falls through to "
+            "`KALSHI_DEFAULT_MIN_MARKET_IMPLIED_PROB` in config.py "
+            "when omitted; pass a value to override per-invocation."
+        ),
+    )
+    p_execute.add_argument(
         "--max-prob",
         type=float,
         default=None,
@@ -912,7 +934,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Filter the analyze LLM call to one or more sport types "
             "(e.g. `--sport tennis`). Repeatable. Calibrate cuts and "
             "the implicit resolve step are NOT filtered — they always "
-            "cover everything in scope."
+            "cover everything in scope. Falls through to `DEFAULT_SPORTS` "
+            "in config.py when omitted."
         ),
     )
     p_retro.add_argument(
@@ -987,16 +1010,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
 
-    # `skims menu` — interactive arrow-key launcher. No flags of its
-    # own; the menu collects each subcommand's flags interactively.
-    p_menu = sub.add_parser(
-        "menu",
-        help="Interactive arrow-key launcher for the other subcommands.",
-    )
-    p_menu.add_argument(
-        "-v", "--verbose", action="store_true", help="Enable debug logging."
-    )
-
     return parser
 
 
@@ -1021,10 +1034,9 @@ def main() -> int:
     _setup_logging(args.verbose)
 
     # Interactive header. `print_banner` is TTY-gated, so it self-suppresses
-    # when output is piped or captured; `positions` opts out (its stdout is
-    # parsed by scheduled routines) and `menu` opts out because it reprints
-    # the banner itself on every loop iteration.
-    if args.command not in ("positions", "menu"):
+    # when output is piped or captured; `positions` opts out because its
+    # stdout is parsed by scheduled routines.
+    if args.command != "positions":
         print_banner(_CONSOLE, args.command)
 
     return asyncio.run(_DISPATCH[args.command](args))

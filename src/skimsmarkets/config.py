@@ -13,6 +13,15 @@ from dotenv import load_dotenv
 # fixtures whose endDate is stale).
 DEFAULT_HORIZON_HOURS = 8
 
+# Slate-level sport allowlist. Values are gamma `tag_slug` strings
+# ('tennis', 'soccer', 'nba', 'mma', 'ufc', 'mlb', 'wnba', 'ice-hockey').
+# Applied by `_build_slate_options` (rank / fetch) and `_cmd_retro`
+# (retro analyze step) when the CLI `--sport` flag is omitted. CLI flags
+# always win — pass `--sport soccer` once to override for a single run.
+# Empty tuple = no default, falls back to gamma's umbrella `tag_slug=sports`
+# (the pre-default behavior).
+DEFAULT_SPORTS: tuple[str, ...] = ("tennis",)
+
 # Symmetric "look behind now" window on the slate-level horizon filter.
 # Markets whose earliest `game_start_time` sits within
 # `[now - HORIZON_BACKSTOP_HOURS, now + horizon_hours]` survive the
@@ -225,6 +234,21 @@ KALSHI_DEFAULT_NO_NEGATIVE_EDGE: bool = True
 # layer; leave empty to let all rows through the sport gate (the matcher
 # will still skip non-tennis rows as `no_kalshi_match`).
 KALSHI_DEFAULT_SPORTS: tuple[str, ...] = ()
+
+# Risk-bucket allowlist. Values come from `classify.py`: "Lock", "Lean",
+# "Coin-flip", "Avoid". Default excludes Coin-flip / Avoid / Unrated so
+# execute only acts on the top two buckets; rows without a bucket
+# (classifier failure) always fail this gate when it's active.
+KALSHI_DEFAULT_RISK_BUCKETS: tuple[str, ...] = ("Lock", "Lean")
+
+# Minimum market implied probability for the predicted winner — the
+# market's own probability on the side the model picked. Default 0.50
+# means "market and model must agree on who wins"; anything below would
+# be a directional disagreement (model picks A, market favors B). Set
+# higher (e.g. 0.55) to also screen out same-side picks where the market
+# is barely above coin-flip; set to None to disable. Rows with missing
+# implied probability always fail this gate when it's active.
+KALSHI_DEFAULT_MIN_MARKET_IMPLIED_PROB: float | None = 0.50
 
 
 @dataclass(frozen=True)

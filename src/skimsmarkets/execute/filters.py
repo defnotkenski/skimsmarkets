@@ -22,6 +22,8 @@ def filter_rows(
     min_defensibility: float | None = None,
     no_negative_edge: bool = False,
     sports: list[str] | None = None,
+    risk_buckets: list[str] | None = None,
+    min_market_implied_prob: float | None = None,
 ) -> Iterator[PredictionRow]:
     """Yield rows that pass every active filter.
 
@@ -37,12 +39,24 @@ def filter_rows(
       `is None`. None means we couldn't compute the flag (market
       implied missing) — treat as unsafe.
     - `sports`: keep rows whose `sport_type` is in the set.
+    - `risk_buckets`: keep rows whose `risk_bucket` is in the set.
+      Rows with `risk_bucket=None` (Unrated / classifier failure) →
+      DROP when the filter is active; same safety stance as
+      `min_defensibility`.
+    - `min_market_implied_prob`: drop rows whose
+      `polymarket_implied_probability` (market's prob for the
+      predicted winner) is below the cutoff. Default 0.50 catches
+      directional disagreement — market and model picking opposite
+      sides. None implied prob → DROP, same safety stance.
     """
     conf_set: frozenset[str] | None = (
         frozenset(confidence) if confidence else None
     )
     sport_set: frozenset[str] | None = (
         frozenset(s.lower() for s in sports) if sports else None
+    )
+    bucket_set: frozenset[str] | None = (
+        frozenset(risk_buckets) if risk_buckets else None
     )
     for row in rows:
         if conf_set is not None and row.confidence not in conf_set:
@@ -60,5 +74,14 @@ def filter_rows(
         if sport_set is not None:
             sport = (row.sport_type or "").lower()
             if sport not in sport_set:
+                continue
+        if bucket_set is not None:
+            if row.risk_bucket is None or row.risk_bucket not in bucket_set:
+                continue
+        if min_market_implied_prob is not None:
+            if (
+                row.polymarket_implied_probability is None
+                or row.polymarket_implied_probability < min_market_implied_prob
+            ):
                 continue
         yield row
