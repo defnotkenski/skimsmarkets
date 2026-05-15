@@ -299,6 +299,24 @@ async def _cmd_gbt(args: argparse.Namespace) -> int:
         )
         print(f"wrote {rankings_path}")
         return 0
+    if args.gbt_command == "algo-backtest":
+        from skimsmarkets.tennis.algo_backtest import (
+            METRICS_PATH,
+            run_backtest_cli,
+        )
+        result = run_backtest_cli(algo_version=args.algo_version or "v6")
+        print(f"wrote {METRICS_PATH}")
+        h = result.holdout
+        print(
+            f"holdout n={h.n}  brier={h.brier:.4f}  log_loss={h.log_loss:.4f}  "
+            f"acc={h.accuracy:.4f}"
+        )
+        print("targets: GBT brier=0.2206  sim brier=0.2256")
+        print(
+            f"delta_vs_sim={h.brier - 0.2256:+.4f}  "
+            f"delta_vs_gbt={h.brier - 0.2206:+.4f}"
+        )
+        return 0
     if args.gbt_command == "train":
         from skimsmarkets.tennis.gbt_train import run_train_cli
         metrics = run_train_cli(
@@ -964,7 +982,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     gbt_sub = p_gbt.add_subparsers(
-        dest="gbt_command", metavar="{backfill,rankings,train}"
+        dest="gbt_command", metavar="{backfill,rankings,train,algo-backtest}"
     )
 
     p_backfill = gbt_sub.add_parser(
@@ -1019,6 +1037,24 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_rankings.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+
+    p_algo_backtest = gbt_sub.add_parser(
+        "algo-backtest",
+        help=(
+            "Walk-forward backtest of the algorithmic form-and-surface lens "
+            "against `raw_matches.parquet` + `rankings_history.parquet`. "
+            "Writes `models/tennis_algo_form_surface.metrics.json`. Same "
+            "train/holdout split as `skims gbt train` (2024-12-31 cutoff) "
+            "so the algo's scorecard lines up directly against the GBT's."
+        ),
+    )
+    p_algo_backtest.add_argument(
+        "--algo-version", type=str, default=None,
+        help="Tag string written into the metrics sidecar (default: 'v6').",
+    )
+    p_algo_backtest.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging."
     )
 

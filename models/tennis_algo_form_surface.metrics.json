@@ -1,0 +1,330 @@
+{
+  "algo_version": "v6_v3_shifts_plus_best_of_plus_sample_scaling",
+  "train_cutoff": "2024-12-31",
+  "train_n": 61099,
+  "holdout_n": 17484,
+  "n_dropped_cold_start": 49406,
+  "n_dropped_other": 0,
+  "fitted_temperature": 1.5011492863748002,
+  "train": {
+    "n": 61099,
+    "brier": 0.23756257859059285,
+    "log_loss": 0.670015294746114,
+    "accuracy": 0.6009590991669258,
+    "base_rate_anchor_wins": 0.46961488731403134,
+    "per_surface": {
+      "hard": {
+        "n": 33157,
+        "brier": 0.23766168150092495
+      },
+      "grass": {
+        "n": 4393,
+        "brier": 0.23965218983290315
+      },
+      "clay": {
+        "n": 23283,
+        "brier": 0.2368575791791806
+      },
+      "carpet": {
+        "n": 266,
+        "brier": 0.2524080068257803
+      }
+    },
+    "per_tour": {
+      "wta": {
+        "n": 29892,
+        "brier": 0.2386560160479085
+      },
+      "atp": {
+        "n": 31207,
+        "brier": 0.2365152163810219
+      }
+    },
+    "reliability_deciles": [
+      {
+        "bin_low": 0.0,
+        "bin_high": 0.1,
+        "n": 532,
+        "mean_predicted": 0.06213827005886648,
+        "mean_observed": 0.19548872180451127
+      },
+      {
+        "bin_low": 0.1,
+        "bin_high": 0.2,
+        "n": 2980,
+        "mean_predicted": 0.16109237398398804,
+        "mean_observed": 0.2859060402684564
+      },
+      {
+        "bin_low": 0.2,
+        "bin_high": 0.3,
+        "n": 8053,
+        "mean_predicted": 0.25546808838572116,
+        "mean_observed": 0.33627219669688313
+      },
+      {
+        "bin_low": 0.3,
+        "bin_high": 0.4,
+        "n": 13418,
+        "mean_predicted": 0.35301489991616286,
+        "mean_observed": 0.39663139066925024
+      },
+      {
+        "bin_low": 0.4,
+        "bin_high": 0.5,
+        "n": 15248,
+        "mean_predicted": 0.4489209327646113,
+        "mean_observed": 0.46674973767051414
+      },
+      {
+        "bin_low": 0.5,
+        "bin_high": 0.6,
+        "n": 11705,
+        "mean_predicted": 0.5452618319183995,
+        "mean_observed": 0.5512174284493806
+      },
+      {
+        "bin_low": 0.6,
+        "bin_high": 0.7,
+        "n": 5987,
+        "mean_predicted": 0.6423297375044456,
+        "mean_observed": 0.6377150492734257
+      },
+      {
+        "bin_low": 0.7,
+        "bin_high": 0.8,
+        "n": 2382,
+        "mean_predicted": 0.7408320533311166,
+        "mean_observed": 0.709487825356843
+      },
+      {
+        "bin_low": 0.8,
+        "bin_high": 0.9,
+        "n": 698,
+        "mean_predicted": 0.8356400789945396,
+        "mean_observed": 0.7936962750716332
+      },
+      {
+        "bin_low": 0.9,
+        "bin_high": 1.0,
+        "n": 96,
+        "mean_predicted": 0.926463518157357,
+        "mean_observed": 0.7916666666666666
+      }
+    ]
+  },
+  "holdout": {
+    "n": 17484,
+    "brier": 0.2251242705291604,
+    "log_loss": 0.6425629111628558,
+    "accuracy": 0.6328643331045527,
+    "base_rate_anchor_wins": 0.4631663234957676,
+    "per_surface": {
+      "hard": {
+        "n": 9628,
+        "brier": 0.2272401008146507
+      },
+      "clay": {
+        "n": 6765,
+        "brier": 0.22055907840679245
+      },
+      "carpet": {
+        "n": 38,
+        "brier": 0.20435584795321637
+      },
+      "grass": {
+        "n": 1053,
+        "brier": 0.2358569493297342
+      }
+    },
+    "per_tour": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.2272159128383584
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.22241792357910656
+      }
+    },
+    "reliability_deciles": [
+      {
+        "bin_low": 0.0,
+        "bin_high": 0.1,
+        "n": 229,
+        "mean_predicted": 0.06085077032173604,
+        "mean_observed": 0.14847161572052403
+      },
+      {
+        "bin_low": 0.1,
+        "bin_high": 0.2,
+        "n": 927,
+        "mean_predicted": 0.15751307784276405,
+        "mean_observed": 0.23408845738942827
+      },
+      {
+        "bin_low": 0.2,
+        "bin_high": 0.3,
+        "n": 1893,
+        "mean_predicted": 0.25443642399521316,
+        "mean_observed": 0.2636027469624934
+      },
+      {
+        "bin_low": 0.3,
+        "bin_high": 0.4,
+        "n": 3174,
+        "mean_predicted": 0.3529618772309853,
+        "mean_observed": 0.34908632640201637
+      },
+      {
+        "bin_low": 0.4,
+        "bin_high": 0.5,
+        "n": 4194,
+        "mean_predicted": 0.4503820187617846,
+        "mean_observed": 0.4451597520267048
+      },
+      {
+        "bin_low": 0.5,
+        "bin_high": 0.6,
+        "n": 3545,
+        "mean_predicted": 0.5461406720406144,
+        "mean_observed": 0.5466854724964739
+      },
+      {
+        "bin_low": 0.6,
+        "bin_high": 0.7,
+        "n": 2042,
+        "mean_predicted": 0.6444314838541461,
+        "mean_observed": 0.6508325171400587
+      },
+      {
+        "bin_low": 0.7,
+        "bin_high": 0.8,
+        "n": 1016,
+        "mean_predicted": 0.742677111344673,
+        "mean_observed": 0.7135826771653543
+      },
+      {
+        "bin_low": 0.8,
+        "bin_high": 0.9,
+        "n": 386,
+        "mean_predicted": 0.8357264900075346,
+        "mean_observed": 0.8082901554404145
+      },
+      {
+        "bin_low": 0.9,
+        "bin_high": 1.0,
+        "n": 78,
+        "mean_predicted": 0.9309339048884047,
+        "mean_observed": 0.8846153846153846
+      }
+    ]
+  },
+  "holdout_calibrated": {
+    "n": 17484,
+    "brier": 0.22625770791498495,
+    "log_loss": 0.6439551752008389,
+    "accuracy": 0.6328071379547014,
+    "base_rate_anchor_wins": 0.4631663234957676,
+    "per_surface": {
+      "hard": {
+        "n": 9628,
+        "brier": 0.227732082112273
+      },
+      "clay": {
+        "n": 6765,
+        "brier": 0.22269895714023016
+      },
+      "carpet": {
+        "n": 38,
+        "brier": 0.20095025578843395
+      },
+      "grass": {
+        "n": 1053,
+        "brier": 0.23655339395537986
+      }
+    },
+    "per_tour": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.22890060230281703
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.22283810355224556
+      }
+    },
+    "reliability_deciles": [
+      {
+        "bin_low": 0.0,
+        "bin_high": 0.1,
+        "n": 43,
+        "mean_predicted": 0.055422326331488005,
+        "mean_observed": 0.11627906976744186
+      },
+      {
+        "bin_low": 0.1,
+        "bin_high": 0.2,
+        "n": 250,
+        "mean_predicted": 0.1626148586861957,
+        "mean_observed": 0.188
+      },
+      {
+        "bin_low": 0.2,
+        "bin_high": 0.3,
+        "n": 1160,
+        "mean_predicted": 0.26032562436462353,
+        "mean_observed": 0.22758620689655173
+      },
+      {
+        "bin_low": 0.3,
+        "bin_high": 0.4,
+        "n": 3110,
+        "mean_predicted": 0.3576716302132349,
+        "mean_observed": 0.30289389067524114
+      },
+      {
+        "bin_low": 0.4,
+        "bin_high": 0.5,
+        "n": 5853,
+        "mean_predicted": 0.4525930129097666,
+        "mean_observed": 0.4214932513241073
+      },
+      {
+        "bin_low": 0.5,
+        "bin_high": 0.6,
+        "n": 4677,
+        "mean_predicted": 0.5432877125839369,
+        "mean_observed": 0.5606157793457345
+      },
+      {
+        "bin_low": 0.6,
+        "bin_high": 0.7,
+        "n": 1805,
+        "mean_predicted": 0.6409127227561505,
+        "mean_observed": 0.7085872576177286
+      },
+      {
+        "bin_low": 0.7,
+        "bin_high": 0.8,
+        "n": 494,
+        "mean_predicted": 0.7362812616098902,
+        "mean_observed": 0.791497975708502
+      },
+      {
+        "bin_low": 0.8,
+        "bin_high": 0.9,
+        "n": 82,
+        "mean_predicted": 0.8335813869001977,
+        "mean_observed": 0.8780487804878049
+      },
+      {
+        "bin_low": 0.9,
+        "bin_high": 1.0,
+        "n": 10,
+        "mean_predicted": 0.9630511226378206,
+        "mean_observed": 0.9
+      }
+    ]
+  }
+}
