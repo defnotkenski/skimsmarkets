@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import logging
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -44,10 +45,13 @@ from skimsmarkets.tennis.gbt_backfill import (
 from skimsmarkets.tennis.gbt_features import (
     ALL_FEATURE_COLUMNS,
     CATEGORICAL_FEATURE_COLUMNS,
+    HALF_LIFE_DAYS,
+    MIN_PRIORS_PER_SIDE,
     NUMERIC_FEATURE_COLUMNS,
     PlayerHistory,
     build_training_table,
 )
+from skimsmarkets.tennis.gbt_rankings_backfill import RANKINGS_HISTORY_PATH
 from skimsmarkets.tennis.models import (
     TennisHeadToHead,
     TennisPlayerStats,
@@ -418,6 +422,97 @@ def _capture_holdout_history_rates(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Training-recipe capture — single source of truth a future cold-start
+# session can read off the metrics.json to reproduce the exact training
+# run (or at least to KNOW what's missing if the recipe doesn't match
+# what's in the current code/parquets).
+#
+# Everything in here is captured AT TRAIN TIME and persisted alongside
+# the metrics. If the recipe block on the live metrics.json drifts from
+# what's currently in the code (e.g. hyperparams changed but no re-train
+# yet), comparing them tells you the artifact is stale.
+# ---------------------------------------------------------------------------
+
+
+def _capture_parquet_source(path: Path) -> dict[str, Any] | None:
+    """Snapshot a parquet's identity: path, file mtime + size, row count.
+
+    Row count is read from the parquet's metadata footer (cheap, no
+    column scan) via `pyarrow.parquet.ParquetFile.metadata.num_rows`.
+    Returns None when the file is absent.
+    """
+    if not path.exists():
+        return None
+    stat = path.stat()
+    n_rows: int | None
+    try:
+        # pyarrow is a transitive dep of pandas[parquet] — already loaded
+        # by `pd.read_parquet` elsewhere in this module, so the import
+        # cost is amortised. The footer-read is ~1ms regardless of parquet
+        # size — much cheaper than `len(pd.read_parquet(...))`.
+        import pyarrow.parquet as pq
+        n_rows = pq.ParquetFile(path).metadata.num_rows
+    except Exception:  # noqa: BLE001 — defensive on corrupt parquets
+        n_rows = None
+    return {
+        "path": str(path),
+        "mtime_utc": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+        "size_bytes": stat.st_size,
+        "n_rows": n_rows,
+    }
+
+
+def _capture_code_commit_sha() -> str | None:
+    """Return the current git commit short SHA, or None when not in a
+    git checkout (e.g. installed via wheel, or `.git/` was scrubbed).
+    Defensive: any failure swallows to None — the recipe should never
+    fail a train run because git couldn't be queried.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if out.returncode == 0:
+            sha = out.stdout.strip()
+            return sha if sha else None
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
+
+
+def _capture_training_recipe(*, train_cutoff: date) -> dict[str, Any]:
+    """Build the full recipe block that goes into metrics.json.
+
+    Captures everything a future cold-start session needs to understand
+    how the live artifact was trained without reading code:
+    - CatBoost hyperparams (the pinned `_CATBOOST_PARAMS` dict)
+    - Feature column lists (numeric + categorical separately so the
+      Pool can be rebuilt; also the combined order)
+    - Cold-start + recency-decay constants from `gbt_features` (gate
+      the training set + drive the recency-weighted aggregates)
+    - Per-parquet snapshot: path, mtime, size, n_rows
+    - Code commit SHA (best-effort; None outside a git checkout)
+    """
+    return {
+        "train_cutoff": train_cutoff.isoformat(),
+        "catboost_params": dict(_CATBOOST_PARAMS),
+        "feature_columns": list(ALL_FEATURE_COLUMNS),
+        "numeric_feature_columns": list(NUMERIC_FEATURE_COLUMNS),
+        "categorical_feature_columns": list(CATEGORICAL_FEATURE_COLUMNS),
+        "min_priors_per_side": MIN_PRIORS_PER_SIDE,
+        "half_life_days": HALF_LIFE_DAYS,
+        "data_sources": {
+            "raw_matches": _capture_parquet_source(RAW_MATCHES_PATH),
+            "player_profiles": _capture_parquet_source(PLAYER_PROFILES_PATH),
+            "rankings_history": _capture_parquet_source(RANKINGS_HISTORY_PATH),
+        },
+        "code_commit_sha": _capture_code_commit_sha(),
+        "trainer_module": "skimsmarkets.tennis.gbt_train",
+    }
+
+
 def train_and_evaluate(
     matches_df: pd.DataFrame,
     profiles_df: pd.DataFrame,
@@ -486,6 +581,12 @@ def train_and_evaluate(
         "holdout_n": int(len(holdout_df)),
         "n_dropped_cold_start": int(table.n_dropped_cold_start),
         "n_dropped_other": int(table.n_dropped_other),
+        # Training recipe — single-source-of-truth for cold-start
+        # reproducibility. Captures hyperparams, feature lists, data
+        # source identities, and the commit SHA. Future sessions read
+        # this block off the metrics.json to understand how the live
+        # artifact was trained without grepping the code.
+        "training_recipe": _capture_training_recipe(train_cutoff=train_cutoff),
         "train": {
             "brier": _brier(y_train, train_p),
             "log_loss": _log_loss(y_train, train_p),

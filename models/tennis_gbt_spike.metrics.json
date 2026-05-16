@@ -174,5 +174,114 @@
     "sim_log_loss": 0.6425689972956645
   },
   "model_version": "sha-fcce135c46aa8a9c",
-  "model_path": "models/tennis_gbt_spike.cbm"
+  "model_path": "models/tennis_gbt_spike.cbm",
+  "training_recipe": {
+    "train_cutoff": "2024-12-31",
+    "catboost_params": {
+      "loss_function": "Logloss",
+      "eval_metric": "Logloss",
+      "iterations": 3000,
+      "learning_rate": 0.03,
+      "depth": 6,
+      "l2_leaf_reg": 4.0,
+      "random_seed": 42,
+      "use_best_model": true,
+      "od_type": "Iter",
+      "od_wait": 100,
+      "verbose": 200,
+      "allow_writing_files": false
+    },
+    "feature_columns": [
+      "career_first_serve_in_pct_diff",
+      "career_first_serve_win_pct_diff",
+      "career_second_serve_win_pct_diff",
+      "career_first_serve_return_win_pct_diff",
+      "career_second_serve_return_win_pct_diff",
+      "career_bp_save_pct_diff",
+      "career_bp_convert_pct_diff",
+      "career_tiebreak_winrate_diff",
+      "career_decider_winrate_diff",
+      "career_comeback_winrate_diff",
+      "career_close_match_winrate_diff",
+      "surface_first_serve_win_pct_diff",
+      "surface_record_diff",
+      "last_n_winrate_diff",
+      "days_since_diff",
+      "age_diff",
+      "h2h_advantage",
+      "n_h2h_priors",
+      "h2h_decider_advantage",
+      "n_h2h_decider_priors",
+      "h2h_tiebreak_advantage",
+      "n_h2h_tiebreak_priors",
+      "h2h_comeback_advantage",
+      "n_h2h_comeback_priors",
+      "h2h_close_match_advantage",
+      "n_h2h_close_match_priors",
+      "rank_diff",
+      "rank_points_diff",
+      "surface",
+      "tier",
+      "best_of"
+    ],
+    "numeric_feature_columns": [
+      "career_first_serve_in_pct_diff",
+      "career_first_serve_win_pct_diff",
+      "career_second_serve_win_pct_diff",
+      "career_first_serve_return_win_pct_diff",
+      "career_second_serve_return_win_pct_diff",
+      "career_bp_save_pct_diff",
+      "career_bp_convert_pct_diff",
+      "career_tiebreak_winrate_diff",
+      "career_decider_winrate_diff",
+      "career_comeback_winrate_diff",
+      "career_close_match_winrate_diff",
+      "surface_first_serve_win_pct_diff",
+      "surface_record_diff",
+      "last_n_winrate_diff",
+      "days_since_diff",
+      "age_diff",
+      "h2h_advantage",
+      "n_h2h_priors",
+      "h2h_decider_advantage",
+      "n_h2h_decider_priors",
+      "h2h_tiebreak_advantage",
+      "n_h2h_tiebreak_priors",
+      "h2h_comeback_advantage",
+      "n_h2h_comeback_priors",
+      "h2h_close_match_advantage",
+      "n_h2h_close_match_priors",
+      "rank_diff",
+      "rank_points_diff"
+    ],
+    "categorical_feature_columns": [
+      "surface",
+      "tier",
+      "best_of"
+    ],
+    "min_priors_per_side": 20,
+    "half_life_days": 365.0,
+    "data_sources": {
+      "raw_matches": {
+        "path": "data/tennis_gbt/raw_matches.parquet",
+        "mtime_utc": "2026-05-08T18:10:06.856462+00:00",
+        "size_bytes": 4693763,
+        "n_rows": 127989
+      },
+      "player_profiles": {
+        "path": "data/tennis_gbt/player_profiles.parquet",
+        "mtime_utc": "2026-05-08T18:10:06.858459+00:00",
+        "size_bytes": 19844,
+        "n_rows": 398
+      },
+      "rankings_history": {
+        "path": "data/tennis_gbt/rankings_history.parquet",
+        "mtime_utc": "2026-05-15T22:59:13.355097+00:00",
+        "size_bytes": 2796515,
+        "n_rows": 768378
+      }
+    },
+    "code_commit_sha": "cd0487b",
+    "trainer_module": "skimsmarkets.tennis.gbt_train"
+  }
 }
