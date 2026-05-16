@@ -335,6 +335,90 @@ def _compare_against_sim(
     }
 
 
+# Production thresholds. Mirror `classify.THRESHOLD_LOCK` /
+# `THRESHOLD_LEAN` and the selector-backtest's `LOCK_THRESHOLD` /
+# `LEAN_THRESHOLD` (`tennis/selection_backtest.py:102`) so the
+# bucket-hit-rate metrics produced here line up 1:1 with the
+# production risk-classifier bands AND with the selector-backtest's
+# synthetic Lock label. Held locally to keep `gbt_train` decoupled
+# from the production config import chain.
+_BUCKET_LOCK_THRESHOLD = 0.75
+_BUCKET_LEAN_THRESHOLD = 0.60
+
+
+def _bucket_metrics_for(
+    y_true: np.ndarray, p: np.ndarray, threshold: float
+) -> dict[str, float | int]:
+    """Hit-rate + coverage at a cumulative winner-side-probability
+    threshold. "Winner-side probability" = max(p, 1-p) — same
+    semantics as `selection_backtest._synthetic_lock_label`. A row
+    qualifies if max(p, 1-p) >= threshold; the hit is whether the
+    model's pick (argmax) matched the actual winner.
+
+    Returns:
+      - `coverage`: fraction of input rows that cleared the threshold
+      - `n`: integer count of rows that cleared
+      - `hit_rate`: fraction of cleared rows where prediction was
+        correct (None when n == 0 — undefined). Reported under the
+        same key as float so downstream metric readers don't need a
+        None-branch; absent threshold-coverage shows as `coverage=0,
+        n=0, hit_rate=NaN`.
+
+    Augmentation is fine: each match emits two anchor-mirror rows
+    with the same max(p, 1-p) and the same correctness, so per-row
+    metrics equal per-match metrics under this aggregation.
+    """
+    p_winner = np.maximum(p, 1.0 - p)
+    qualified = p_winner >= threshold
+    n = int(qualified.sum())
+    coverage = float(n / len(p)) if len(p) else 0.0
+    if n == 0:
+        return {"threshold": float(threshold), "n": 0,
+                "coverage": coverage, "hit_rate": float("nan")}
+    # GBT picks the anchor when p >= 0.5; correct when prediction
+    # matches actual anchor-winner (y_true == 1 means anchor won).
+    picks_anchor = p >= 0.5
+    correct = picks_anchor == (y_true == 1)
+    hit_rate = float(correct[qualified].mean())
+    return {"threshold": float(threshold), "n": n,
+            "coverage": coverage, "hit_rate": hit_rate}
+
+
+def _bucket_breakdown(
+    y_true: np.ndarray, p: np.ndarray
+) -> dict[str, dict[str, float | int]]:
+    """Production-threshold bucket scorecard. Two cumulative bands:
+    - `lock`: max(p, 1-p) >= 0.75 (high-conviction subset)
+    - `lock_or_lean`: max(p, 1-p) >= 0.60 (lock + lean combined)
+
+    Cumulative (not partition) because downstream consumers ask
+    "what's the hit rate among matches the model was confident
+    about?" — a 0.78 prediction belongs in BOTH the Lock cohort
+    (it'll fire the Lock band in production) AND any
+    Lock-or-lean cohort. Reporting them cumulatively matches the
+    production risk_classifier's nested if/elif structure.
+    """
+    return {
+        "lock": _bucket_metrics_for(y_true, p, _BUCKET_LOCK_THRESHOLD),
+        "lock_or_lean": _bucket_metrics_for(y_true, p, _BUCKET_LEAN_THRESHOLD),
+    }
+
+
+def _per_tour_bucket_breakdown(
+    holdout_df: pd.DataFrame, p: np.ndarray
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    """Per-tour bucket metrics (ATP / WTA). Lets a tour-skew in
+    confidence-zone hit-rate stand out — if Lock hit-rate drops
+    sharply on WTA while ATP stays clean, that's a calibration drift
+    a tour-blind overall number would mask.
+    """
+    out: dict[str, dict[str, dict[str, float | int]]] = {}
+    for tour, group in holdout_df.groupby("tour"):
+        idx = group.index.to_numpy()
+        out[str(tour)] = _bucket_breakdown(group["target"].to_numpy(), p[idx])
+    return out
+
+
 def _per_tour_breakdown(
     holdout_df: pd.DataFrame, p: np.ndarray
 ) -> dict[str, dict[str, float]]:
@@ -601,6 +685,18 @@ def train_and_evaluate(
             "reliability_deciles": _reliability_deciles(y_holdout, holdout_p),
             "per_tour": _per_tour_breakdown(holdout_df, holdout_p),
             "per_tier": _per_tier_breakdown(holdout_df, holdout_p),
+            # Production-threshold bucket scorecard. Hit-rate +
+            # coverage at the Lock (>= 0.75) and Lock-or-Lean (>=
+            # 0.60) winner-side-probability bands. Mirrors the
+            # production `classify.py` thresholds and the
+            # `selection_backtest._synthetic_lock_label` definition
+            # — so a future "is the model still calibrated at the
+            # Lock band?" check reads off the model card without
+            # re-running the trainer.
+            "buckets": _bucket_breakdown(y_holdout, holdout_p),
+            "per_tour_buckets": _per_tour_bucket_breakdown(
+                holdout_df, holdout_p,
+            ),
         },
         "feature_importance": dict(zip(
             ALL_FEATURE_COLUMNS,

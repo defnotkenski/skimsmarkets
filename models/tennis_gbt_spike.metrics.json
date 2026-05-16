@@ -1,5 +1,5 @@
 {
-  "trained_at_utc": "2026-05-16T07:08:56.693473+00:00",
+  "trained_at_utc": "2026-05-16T07:19:46.201006+00:00",
   "train_cutoff": "2024-12-31",
   "train_n": 122198,
   "holdout_n": 34968,
@@ -131,7 +131,7 @@
         "n_rows": 768378
       }
     },
-    "code_commit_sha": "0ddf1bc",
+    "code_commit_sha": "331c389",
     "trainer_module": "skimsmarkets.tennis.gbt_train"
   },
   "train": {
@@ -260,6 +260,50 @@
         "n": 30,
         "brier": 0.12423876916412309
       }
+    },
+    "buckets": {
+      "lock": {
+        "threshold": 0.75,
+        "n": 7772,
+        "coverage": 0.22226035232212307,
+        "hit_rate": 0.8171641791044776
+      },
+      "lock_or_lean": {
+        "threshold": 0.6,
+        "n": 22832,
+        "coverage": 0.6529398307023564,
+        "hit_rate": 0.7240714786264891
+      }
+    },
+    "per_tour_buckets": {
+      "atp": {
+        "lock": {
+          "threshold": 0.75,
+          "n": 3733,
+          "coverage": 0.18926181301967146,
+          "hit_rate": 0.8004286096972943
+        },
+        "lock_or_lean": {
+          "threshold": 0.6,
+          "n": 12422,
+          "coverage": 0.6297911174204015,
+          "hit_rate": 0.7178393173402029
+        }
+      },
+      "wta": {
+        "lock": {
+          "threshold": 0.75,
+          "n": 4039,
+          "coverage": 0.2649567042770926,
+          "hit_rate": 0.8326318395642486
+        },
+        "lock_or_lean": {
+          "threshold": 0.6,
+          "n": 10410,
+          "coverage": 0.6828916294935713,
+          "hit_rate": 0.7315081652257445
+        }
+      }
     }
   },
   "feature_importance": {
@@ -308,10 +352,10 @@
   "sim_compare": {
     "n_paired": 34968,
     "gbt_brier": 0.21138446568653022,
-    "sim_brier": 0.22557036422586363,
+    "sim_brier": 0.22564608076670098,
     "gbt_log_loss": 0.6102487680517612,
-    "sim_log_loss": 0.6421952943867778
+    "sim_log_loss": 0.6424014864037845
   },
-  "model_version": "sha-8d71fd9c7535702b",
+  "model_version": "sha-5cbd94f64c537a24",
   "model_path": "models/tennis_gbt_spike.cbm"
 }
