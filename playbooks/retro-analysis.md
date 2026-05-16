@@ -9,7 +9,31 @@ This playbook is the conversational equivalent of `skims retro --step analyze`. 
 1. Calibrate output — either the operator's recent stdout or run `uv run skims retro --step calibrate` yourself.
 2. `logs/runs/*.jsonl` — per-event detail (lens reports, defensibility, predicted/market probabilities, negative_edge flag). Recent files first; older ones contextually.
 3. `logs/runs/*.resolutions.jsonl` — settled outcomes (winning side, predicted_correct).
-4. `CLAUDE.md` — load-bearing invariants any prompt-edit recommendation must respect.
+4. `logs/retro/post_match/{atp,wta}/*.json` — per-player box scores (1st-serve %, BP-convert, etc.) keyed by `<player_id>_<event_date>.json`. **These power the `divergence_*` columns called out in the tennis section below — if the date you're analyzing has no matching files, fetch them before doing the per-sport pattern step (see "Fetching post-match" below).**
+5. `CLAUDE.md` — load-bearing invariants any prompt-edit recommendation must respect.
+
+## Fetching post-match (when the cache is empty)
+
+The post-match box-score fetch normally runs inside `skims retro --step analyze`, which the operator skips for cost reasons. That means a fresh slate's `logs/retro/post_match/` may be empty for the dates you're analyzing — in which case the high-yield divergence cuts can't be computed. Run the fetcher directly (no LLM cost, just MatchStat HTTP):
+
+```python
+uv run python -c "
+import asyncio
+from skimsmarkets import config as cfg
+from skimsmarkets.tennis.provider import build_tennis_provider
+from skimsmarkets.retro.post_match import fetch_post_match_for_settled
+
+async def main():
+    config = cfg.Config.from_env()
+    async with build_tennis_provider(config) as provider:
+        pairs = await fetch_post_match_for_settled(provider)
+    print(f'Fetched {len(pairs)} events')
+
+asyncio.run(main())
+"
+```
+
+Caches under `logs/retro/post_match/{atp,wta}/`. Idempotent — re-runs are cache hits. Players below the GBT cold-start gate (no MatchStat player_id) skip silently; expect a small miss rate.
 
 ## Discipline
 

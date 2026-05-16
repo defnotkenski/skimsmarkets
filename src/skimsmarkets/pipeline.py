@@ -53,7 +53,7 @@ from skimsmarkets.tennis import (
 )
 from skimsmarkets.tennis.gbt import predict_for_event as gbt_predict_for_event
 from skimsmarkets.tennis.identity import tennis_match_identity
-from skimsmarkets.tennis.matchstat import _surname_candidates, _surname_token
+from skimsmarkets.tennis.matchstat import _surname_candidates
 from skimsmarkets.tennis.provider import (
     TennisStatsProvider,
     build_tennis_provider,
@@ -1044,22 +1044,38 @@ _TENNIS_STACK_SHIFTS: tuple[tuple[str, str], ...] = (
 
 def _compute_tennis_stack(
     reports: dict[str, BaseModel],
+    tennis_gbt: TennisGbtContext | None = None,
 ) -> tuple[float, float] | None:
     """Reconstruct the literal stack math for a tennis event.
 
     Returns (baseline, stack_team_a) where stack_team_a is the unclipped
     sum of baseline + all six signed shifts; the caller clips to [0,1].
-    Returns None when the form lens didn't emit a baseline (only happens
-    on a partial-failure event the director shouldn't have synthesised
-    anyway — defensive).
+    Returns None when neither GBT prior nor form lens baseline is
+    available (only happens on a partial-failure event the director
+    shouldn't have synthesised anyway — defensive).
+
+    Baseline selection mirrors the director prompt
+    (`DIRECTOR_SYSTEM_TENNIS_TAIL`, "GBT prior — THIS IS YOUR BASELINE
+    ANCHOR" section, effective 2026-05-15): the GBT prior
+    `p_team_a_wins` is the baseline when present; the form lens
+    `team_a_win_probability` is the cold-start fallback. Earlier
+    versions of this helper always used the form lens baseline, which
+    silently desynchronised `stack_team_a_probability` from what the
+    director was actually instructed to compute and made
+    `stack_vs_final_delta` conflate a baseline-mismatch with real
+    director overrides.
     """
-    form = reports.get("tennis_form_and_surface")
-    if form is None:
-        return None
-    baseline = getattr(form, "team_a_win_probability", None)
-    if baseline is None:
-        return None
-    total = float(baseline)
+    if tennis_gbt is not None and tennis_gbt.p_team_a_wins is not None:
+        baseline = float(tennis_gbt.p_team_a_wins)
+    else:
+        form = reports.get("tennis_form_and_surface")
+        if form is None:
+            return None
+        baseline_form = getattr(form, "team_a_win_probability", None)
+        if baseline_form is None:
+            return None
+        baseline = float(baseline_form)
+    total = baseline
     for lens_name, field_name in _TENNIS_STACK_SHIFTS:
         report = reports.get(lens_name)
         if report is None:
@@ -1067,7 +1083,7 @@ def _compute_tennis_stack(
         v = getattr(report, field_name, None)
         if v is not None:
             total += float(v)
-    return float(baseline), total
+    return baseline, total
 
 
 def _team_a_probability(
@@ -1275,7 +1291,7 @@ def _persist_run(result: RunResult) -> None:
                 # gaps are apples-to-apples.
                 reports_typed = result.reports.get(p.event_id, {})
                 stack_pair = (
-                    _compute_tennis_stack(reports_typed)
+                    _compute_tennis_stack(reports_typed, tgbt)
                     if p.lens_set_name == "tennis" else None
                 )
                 team_a_p_final = _team_a_probability(p, reports_typed)
@@ -1293,6 +1309,24 @@ def _persist_run(result: RunResult) -> None:
                     if (team_a_p_final is not None
                         and stack_team_a_clipped is not None)
                     else None
+                )
+                # Director-discipline flag: True iff the director deviated
+                # from the literal stack math (|delta| > 0.01, set above
+                # the ~0.005 float-rounding floor the director introduces
+                # when reporting probs to 2 decimal places) AND did NOT
+                # log a `retracted_shifts` entry explaining which shift
+                # was set aside. The director prompt explicitly requires
+                # logging any deviation — `DIRECTOR_SYSTEM_TENNIS_TAIL`
+                # reads "never just shrink the final number without an
+                # entry." This flag catches silent violations of that
+                # rule; retro can cut on it to measure whether unlogged
+                # overrides correlate with outcomes. None on events
+                # without a computable stack (non-tennis, or tennis
+                # cold-start without baseline).
+                override_without_retract = (
+                    stack_vs_final_delta is not None
+                    and abs(stack_vs_final_delta) > 0.01
+                    and not p.retracted_shifts
                 )
                 # team_a-anchored gaps to deterministic priors. All three
                 # are signed (positive = director above prior) so retro
@@ -1312,6 +1346,84 @@ def _persist_run(result: RunResult) -> None:
                     and ta_name.strip().lower()
                     == p.predicted_winner.strip().lower()
                 )
+                # Director rule-compliance flags. Each mirrors a specific
+                # rule in `DIRECTOR_SYSTEM_TENNIS_TAIL` and fires when
+                # the director shipped a prediction violating it.
+                # Deterministic — does NOT depend on the director
+                # following the rule — so retro can measure compliance
+                # rates over time and decide whether prompt-based
+                # interventions are sticking. All four flags are
+                # tennis-only and None on non-tennis or partial-failure
+                # events; older runs (pre-2026-05-16) parse as None.
+                #
+                # (a) Injury-flag cap: any non-empty injury_concerns
+                # entry should cap confidence at "low" (rule added
+                # 2026-05-16). Fires when injury_concerns is present
+                # AND confidence != "low".
+                injury_concerns_present = False
+                if p.lens_set_name == "tennis":
+                    for r in reports_typed.values():
+                        ic = getattr(r, "injury_concerns", None) or []
+                        if ic:
+                            injury_concerns_present = True
+                            break
+                confidence_should_be_low_injury = (
+                    injury_concerns_present and p.confidence != "low"
+                ) if p.lens_set_name == "tennis" else None
+                # (b) Multi-shift stack cap: |shift_total| ≥ 0.10 AND
+                # ≥2 shifts in the override direction (matching the
+                # pick) each ≥ 0.04 should cap confidence at "low"
+                # (rule added 2026-05-16). Fires when override structure
+                # is met AND confidence != "low".
+                shift_total_signed = 0.0
+                shifts_in_override_dir = 0
+                if p.lens_set_name == "tennis":
+                    pick_sign = 1.0 if predicted_winner_is_team_a else -1.0
+                    for lens_name, field_name in _TENNIS_STACK_SHIFTS:
+                        r = reports_typed.get(lens_name)
+                        if r is None:
+                            continue
+                        v = getattr(r, field_name, None)
+                        if v is None:
+                            continue
+                        shift_total_signed += float(v)
+                        if (float(v) * pick_sign) >= 0.04:
+                            shifts_in_override_dir += 1
+                confidence_should_be_low_stacked = (
+                    abs(shift_total_signed) >= 0.10
+                    and shifts_in_override_dir >= 2
+                    and p.confidence != "low"
+                ) if p.lens_set_name == "tennis" else None
+                # (c) GBT-vs-sim split discipline: when GBT < 0.50 on
+                # the pick AND sim ≥ 0.50 on the pick, the director
+                # must cite the GBT `top_features` entry it believes
+                # is mis-anchored (rule added 2026-05-16). Fires when
+                # the split holds AND no top_features name appears in
+                # `reasoning` (substring match, lowercase).
+                gbt_sim_split_unjustified: bool | None = None
+                if (p.lens_set_name == "tennis"
+                        and tgbt is not None
+                        and tsim is not None
+                        and tgbt.p_team_a_wins is not None
+                        and tsim.p_team_a_wins is not None):
+                    gbt_pick = (
+                        tgbt.p_team_a_wins if predicted_winner_is_team_a
+                        else 1.0 - tgbt.p_team_a_wins
+                    )
+                    sim_pick = (
+                        tsim.p_team_a_wins if predicted_winner_is_team_a
+                        else 1.0 - tsim.p_team_a_wins
+                    )
+                    if gbt_pick < 0.50 and sim_pick >= 0.50:
+                        reasoning_lc = (p.reasoning or "").lower()
+                        feature_names = [
+                            tf.name.lower() for tf in (tgbt.top_features or [])
+                        ]
+                        gbt_sim_split_unjustified = not any(
+                            fn in reasoning_lc for fn in feature_names
+                        )
+                    else:
+                        gbt_sim_split_unjustified = False
                 if (team_a_p_final is not None
                         and p.polymarket_implied_probability is not None):
                     if predicted_winner_is_team_a:
@@ -1434,6 +1546,14 @@ def _persist_run(result: RunResult) -> None:
                     "stack_team_a_probability": stack_team_a_clipped,
                     "team_a_p_final": team_a_p_final,
                     "stack_vs_final_delta": stack_vs_final_delta,
+                    # Deterministic director-discipline flags. See
+                    # `_persist_run` definitions above for each rule.
+                    # All four parse as None on older runs and on
+                    # non-tennis events.
+                    "override_without_retract": override_without_retract,
+                    "confidence_should_be_low_injury": confidence_should_be_low_injury,
+                    "confidence_should_be_low_stacked": confidence_should_be_low_stacked,
+                    "gbt_sim_split_unjustified": gbt_sim_split_unjustified,
                     "gap_to_market_signed": gap_to_market,
                     "gap_to_sim_signed": gap_to_sim,
                     "gap_to_gbt_signed": gap_to_gbt,

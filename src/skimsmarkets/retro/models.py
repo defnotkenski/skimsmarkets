@@ -103,6 +103,27 @@ class PredictionRow(BaseModel):
     stack_team_a_probability: float | None = None
     team_a_p_final: float | None = None
     stack_vs_final_delta: float | None = None
+    # Deterministic director-discipline flags set by
+    # `pipeline._persist_run`. Each mirrors a specific rule in
+    # `DIRECTOR_SYSTEM_TENNIS_TAIL` and fires when the prediction
+    # violates it. Tennis-only; None on non-tennis or partial-failure
+    # events; older runs (pre-2026-05-16 fix) lack these fields and
+    # parse as None.
+    #
+    # `override_without_retract`: |stack_vs_final_delta| > 0.01 AND
+    #   `retracted_shifts` is empty (silent deviation from stack math).
+    # `confidence_should_be_low_injury`: any non-empty injury_concerns
+    #   AND confidence != "low" (injury-flag cap rule).
+    # `confidence_should_be_low_stacked`: |shift_total| ≥ 0.10 AND ≥2
+    #   shifts in override direction each ≥ 0.04 AND confidence !=
+    #   "low" (multi-shift stack cap rule).
+    # `gbt_sim_split_unjustified`: GBT < 0.50 on pick AND sim ≥ 0.50
+    #   on pick AND no GBT top_features name appears in reasoning
+    #   (sim-vs-GBT split discipline rule).
+    override_without_retract: bool | None = None
+    confidence_should_be_low_injury: bool | None = None
+    confidence_should_be_low_stacked: bool | None = None
+    gbt_sim_split_unjustified: bool | None = None
     gap_to_market_signed: float | None = None
     gap_to_sim_signed: float | None = None
     gap_to_gbt_signed: float | None = None

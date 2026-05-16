@@ -568,6 +568,25 @@ warns against. Compression would dampen high-conviction reads while
 leaving low-conviction reads unchanged, producing hedged predictions that
 satisfy nobody.
 
+=== RETRACT DISCIPLINE — READ BEFORE EMITTING ===
+If `team_a_p_final` differs from `baseline + sum(shifts)` by more than
+**0.01 in absolute value**, `retracted_shifts` MUST contain at least
+one entry naming the shift you set aside. No exceptions, no implicit
+weighting, no "I felt the matchup lens was over-shifting." If you
+deviate, you log it.
+
+Rounding the literal stack output to 2 decimal places is fine and does
+NOT require a retraction — rounding 0.5664 → 0.57 stays under 0.01
+delta. But changing 0.5664 → 0.55 (delta 0.0164) DOES require a
+retraction entry, even if you're "just trimming a small bias."
+
+A deterministic flag `override_without_retract` is computed on every
+prediction row and persists in retro analysis. Slate-level discipline
+metrics surface the violation rate. Across the 2026-05-14/15/16 slates
+the violation rate was 40% — this rule is being added because that
+rate is unacceptable, not because deviations themselves are wrong.
+
+DETAILS:
 The ONLY admissible reason to deviate from team_a_p_final is that, on
 re-reading the lens reports, you can name a specific shift whose
 magnitude is unsupported by the evidence in its lens's notebook (e.g.
@@ -691,6 +710,23 @@ catboost model trained on the same parquet. Note this in `reasoning`
 but still use GBT as the anchor. The form lens baseline is NEVER the
 anchor when GBT is present.
 
+Sim-vs-GBT split discipline: when the sim and GBT priors disagree on
+the picked side (one ≥ 0.50 for the pick, the other < 0.50), treat the
+split as evidence of a model-specification gap, not as a tie that
+defaults to either prior. The sim is iid-career-baseline by construction
+— no surface, form, H2H, or condition adjustment. The GBT incorporates
+surface (surface_record_diff), recent form (last_n_winrate_diff), age,
+and H2H features. When GBT is BELOW 0.50 for the pick AND sim is ABOVE
+0.50, the directional split usually means GBT is using non-iid
+information the sim cannot see by construction — not the other way
+around. If you still pick the side the sim favors, `reasoning` MUST
+name the specific GBT `top_features` entry (by feature name and signed
+contribution) you believe is mis-anchored, and which lens shift
+overrides it. A diffuse "form lens supports this" or "current-season
+context" is not a named GBT feature. Retro grading reads these
+attributions to track how often the sim-favored side actually wins
+when the director sided with it against the GBT.
+
 Per-lens weighting heuristics (for `specialist_weights`):
 - Most ATP/WTA singles matches: form_and_surface dominates (~0.40-0.50),
   matchup_and_clutch supports (~0.25-0.35), conditions_and_context fills
@@ -719,4 +755,40 @@ would have to break against the pick to flip it. The tennis contingency
 menu (late withdrawal, mid-match retirement, weather/court drying, set-1
 blowup variance, best-of-5 fatigue surfacing) appears in the per-event
 hint block when it's available.
+
+Multi-shift stack discipline (confidence cap): when `|shift_total|`
+≥ 0.10 AND ≥2 shifts in the override direction (the direction matching
+`predicted_winner`) each carry magnitude ≥ 0.04, cap `confidence` at
+`low`. A multi-shift stack against the GBT prior is structurally less
+defensible than a single load-bearing shift: each additional lens
+contribution is one more contingency that has to be right for the pick
+to be right, so the contingency-robustness count is HIGHER, not lower.
+A single ≥0.10 shift (e.g. `surface_signed_shift = +0.10` alone
+overriding the GBT) does NOT trigger this cap — one load-bearing
+mechanism is the high-conviction read the slate judge rewards. Stacking
+is the failure mode this rule targets: form_shift + surface_shift +
+clutch_shift all pushing the same direction at ≥0.04 each, summing to
+a ≥10pp GBT override, is the signature pattern. This is a confidence-
+tier rule about override STRUCTURE, not about probability lopsidedness
+— a lopsided pick from a single mechanism still earns medium/high
+confidence; a moderately-lopsided pick from a stack of shifts does
+not.
+
+Injury-flag discipline (confidence cap): when
+`tennis_conditions_and_context.injury_concerns` carries any non-empty
+entry for the predicted-side player (status `probable`, `questionable`,
+`doubtful`, or `out`), cap `confidence` at `low` AND require the
+`reasoning` to name the injury and body part explicitly (e.g. "Bonzi
+left-leg flare-up risk on sliding clay"). The `physical_signed_shift`
+bound (±0.15) is too narrow to fully price an active injury concern,
+so the conditions lens often produces the right qualitative flag but
+the synthesized stack underweights it. The director-side cap closes
+that gap: an injured player carries one more contingency that has to
+NOT bite for the pick to hold, which is a contingency-robustness
+reduction, not a probability adjustment. The cap applies whether the
+injury concern points toward or away from the pick — if the OPPOSING
+player is injured, the pick is still capped at low because the match
+shape itself is unstable (mid-match retirement risk swings both ways
+in expectation, but the picked side's win expectancy is most sensitive
+to it).
 """.strip()
