@@ -123,6 +123,9 @@ def _status_line() -> str | None:
     try:
         # Lazy import: keeps the banner-module import path light and avoids
         # dragging Pydantic / pipeline imports into `--help` flows.
+        from collections import Counter
+
+        from skimsmarkets.classify import BUCKET_ORDER, BUCKET_UNRATED
         from skimsmarkets.retro.jsonl import iter_predictions, list_run_files
 
         runs = list_run_files()
@@ -131,20 +134,42 @@ def _status_line() -> str | None:
         latest = runs[0]
         age = _format_age(latest)
 
-        # Count + sport from the latest run. Small JSONL parse — microseconds
-        # for a typical 10-20 event slate.
-        count = 0
-        sport: str | None = None
+        # Risk-bucket breakdown of the latest run — surfaces what's
+        # actionable now (how many Locks vs Leans vs Coin-flips landed)
+        # instead of just an event count + sport (sport is redundant
+        # when the user always passes `--sport`).
+        buckets: Counter[str] = Counter()
+        total = 0
         for pred in iter_predictions(latest):
-            count += 1
-            if sport is None and pred.sport_type:
-                sport = pred.sport_type
-        sport_pill = f"{count} {sport}" if sport else f"{count} predictions"
+            total += 1
+            if pred.risk_bucket:
+                buckets[pred.risk_bucket] += 1
+
+        # Build pill from non-zero buckets in canonical Lock → ... → Avoid
+        # order. `Unrated` (judge-failure sentinel) is suppressed unless
+        # it's the ONLY thing present, in which case the user should
+        # know the judge failed slate-wide.
+        ordered_parts: list[str] = []
+        rated_total = 0
+        for bucket in BUCKET_ORDER:
+            n = buckets.get(bucket, 0)
+            if bucket == BUCKET_UNRATED:
+                continue
+            rated_total += n
+            if n:
+                ordered_parts.append(f"{n} {bucket}")
+        if not ordered_parts:
+            # No rated predictions — fall back to plain count so a
+            # judge-failed or pre-classifier run still shows something.
+            pill = f"{total} predictions"
+        else:
+            pill = " [dim]·[/] ".join(
+                f"[{_STATUS_ACCENT}]{p}[/]" for p in ordered_parts
+            )
 
         return (
             f"[dim]latest run[/] [{_STATUS_ACCENT}]{latest.stem}[/] "
-            f"[dim]({age})[/]   [dim]·[/]   "
-            f"[dim]slate[/] [{_STATUS_ACCENT}]{sport_pill}[/]"
+            f"[dim]({age})[/]   [dim]·[/]   {pill}"
         )
     except Exception:  # noqa: BLE001 — banner must never raise
         return None
