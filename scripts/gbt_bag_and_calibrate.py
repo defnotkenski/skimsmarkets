@@ -36,6 +36,19 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostClassifier, Pool
 
+from skimsmarkets.tennis.gbt_backfill import (
+    PLAYER_PROFILES_PATH,
+    RAW_MATCHES_PATH,
+)
+from skimsmarkets.tennis.gbt_features import (
+    ALL_FEATURE_COLUMNS,
+    CATEGORICAL_FEATURE_COLUMNS,
+    NUMERIC_FEATURE_COLUMNS,
+    build_training_table,
+)
+from skimsmarkets.tennis.gbt_rankings_backfill import RANKINGS_HISTORY_PATH
+from skimsmarkets.tennis.gbt_train import TRAIN_CUTOFF, _auc, _brier, _log_loss
+
 
 class _IsotonicCalibrator:
     """Pool-Adjacent-Violators isotonic regression.
@@ -87,18 +100,6 @@ class _IsotonicCalibrator:
             raise RuntimeError("call fit() before predict()")
         return np.clip(np.interp(x, self._x, self._y), 0.0, 1.0)
 
-from skimsmarkets.tennis.gbt_backfill import (
-    PLAYER_PROFILES_PATH,
-    RAW_MATCHES_PATH,
-)
-from skimsmarkets.tennis.gbt_features import (
-    ALL_FEATURE_COLUMNS,
-    CATEGORICAL_FEATURE_COLUMNS,
-    NUMERIC_FEATURE_COLUMNS,
-    build_training_table,
-)
-from skimsmarkets.tennis.gbt_rankings_backfill import RANKINGS_HISTORY_PATH
-from skimsmarkets.tennis.gbt_train import TRAIN_CUTOFF, _auc, _brier, _log_loss
 
 log = logging.getLogger(__name__)
 

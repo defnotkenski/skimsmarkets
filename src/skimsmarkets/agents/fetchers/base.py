@@ -19,14 +19,11 @@ user-message append.
 
 from __future__ import annotations
 
-import logging
 from typing import Awaitable, Callable, Protocol
 
 from skimsmarkets.agents.schemas import LensNotebook, TokenUsage
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
-
-log = logging.getLogger(__name__)
 
 
 def build_lens_prompts_for_set(

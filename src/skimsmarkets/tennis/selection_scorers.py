@@ -34,8 +34,9 @@ Tier coverage as of v1.0 → v1.13:
 
 NOVEL = not in production `selection.py` today.
 
-Each tier is tested in isolation against the rank-points base in
-`tests_isolated.py` so the user can see per-tier lift before composing.
+Each tier is tested in isolation against the rank-points base via the
+`ABLATION_SCORERS` list below (one composite per tier) so the user can
+see per-tier lift before composing.
 """
 
 from __future__ import annotations

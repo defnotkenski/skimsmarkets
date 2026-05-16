@@ -23,14 +23,12 @@ the ranker's JSONL**. The two halves are deliberately separated:
 history` for per-market enrichment). Kalshi = execution (RSA-signed
 `POST /portfolio/orders`). Cross-venue bridge: surname matching at
 trade time in `kalshi/matcher.py` — Polymarket-sourced predictions
-that have no Kalshi counterpart drop with `MatchOutcome.kind=
-"no_kalshi_match"`. The single-venue collapse was tried briefly
-(2026-05-11 → 2026-05-12) and reverted on data-quality grounds; the
-split is intentional. If you're adding trade logic to the ranker,
-you're in the wrong package — push it into `execute/`.
+with no Kalshi counterpart are labeled and dropped. The single-venue
+collapse was tried and reverted on data-quality grounds; the split is
+intentional. If you're adding trade logic to the ranker, you're in the
+wrong package — push it into `execute/`.
 
-`PolymarketEvent` is the pipeline event type (now correctly named
-since the slate is Polymarket-sourced again). Built by
+`PolymarketEvent` is the pipeline event type, built by
 `polymarket/slate.py:fetch_gamma_slate` → `PolymarketEvent.from_gamma`.
 
 ## Toolchain

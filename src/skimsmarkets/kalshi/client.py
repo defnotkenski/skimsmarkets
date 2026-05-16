@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import logging
 import time
 from pathlib import Path
 
@@ -40,8 +39,6 @@ from skimsmarkets.kalshi.models import (
     OrderRequest,
     OrderResponse,
 )
-
-log = logging.getLogger(__name__)
 
 
 class KalshiOrderError(Exception):

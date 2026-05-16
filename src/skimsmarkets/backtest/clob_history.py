@@ -16,7 +16,6 @@ generous but not unlimited, and this dataset is a few thousand tokens.
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import Any
 
 import httpx
@@ -24,8 +23,6 @@ import httpx
 from skimsmarkets.clob import fetch_price_history as _fetch_core
 
 from . import cache
-
-log = logging.getLogger(__name__)
 
 _FETCH_SEM = asyncio.Semaphore(8)
 

@@ -34,11 +34,6 @@ from skimsmarkets.polymarket.models import PolymarketEvent
 from skimsmarkets.tennis.models import TennisPlayerStats, TennisStatsContext
 from skimsmarkets.tennis.simulation import simulate_match
 
-# Shift bounds from the schemas — re-asserted here so the algorithm
-# self-documents what it's clipping against.
-_FORM_SHIFT_CAP = 0.15
-_SURFACE_SHIFT_CAP = 0.10
-
 # Cold-start gates. The algo emits a useful baseline as long as both
 # players have SOME priors; below these denominators the corresponding
 # shift falls back to zero with the form-grade dropped to 'average'.

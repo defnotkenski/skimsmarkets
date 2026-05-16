@@ -1330,10 +1330,10 @@ def _gamma_market_state(accepting: Any, closed: Any) -> str:
     - `acceptingOrders=False` → MARKET_STATE_HALTED  (not tradable)
     - otherwise               → MARKET_STATE_OPEN    (live tradable book)
 
-    The renderer at `agents/fetchers.py` strips the `MARKET_STATE_`
-    prefix before display, and only surfaces the field when it isn't OPEN —
-    so the "OPEN" string is effectively a no-op tag that downstream code
-    already gates against.
+    Downstream renderers in `agents/fetchers/base.py` and
+    `agents/director.py` strip the `MARKET_STATE_` prefix before display,
+    and only surface the field when it isn't OPEN — so the "OPEN" string
+    is effectively a no-op tag that downstream code already gates against.
     """
     if closed is True:
         return "MARKET_STATE_CLOSED"

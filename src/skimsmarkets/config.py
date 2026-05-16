@@ -236,8 +236,8 @@ KALSHI_TENNIS_SERIES_TICKERS: tuple[str, ...] = (
 # DON'T pass Kalshi's `buy_max_cost` field — per Kalshi's docs that
 # forces FOK behaviour which rejects on insufficient resting volume
 # (the common case for thin tennis books).
-# Common values: 100 ($1) for smoke tests, 2500 ($25) typical, 10000 ($100).
-KALSHI_DEFAULT_BET_SIZE_CENTS = 2500
+# Common values: 100 ($1) for smoke tests, 500 ($5) typical, 10000 ($100).
+KALSHI_DEFAULT_BET_SIZE_CENTS = 500
 
 # Slippage buffer for market orders. Kalshi requires a price field on every
 # order — even "market" type — which acts as a per-contract ceiling for the
