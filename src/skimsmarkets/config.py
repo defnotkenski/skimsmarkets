@@ -6,12 +6,18 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 # Default horizon window — markets whose game_start_time sits further out
-# than this are left out of the slate. 24h catches "today's slate"; use
-# 48-72 on the CLI to pull in tomorrow. Filter runs client-side after the
-# gamma `/events` listing (gamma's order=endDate is settlement-window
-# ordered, not tipoff, so a server-side cut would miss rescheduled
-# fixtures whose endDate is stale).
-DEFAULT_HORIZON_HOURS = 8
+# than this are left out of the slate. 1h pairs with the hourly cron in
+# `playbooks/cloud-trading-routine.md`: each event lands in exactly one
+# run (the hour before kickoff) so there's no cross-run duplication and
+# the retro layer's keep-earliest dedup direction stays meaningful.
+# Override per-invocation with `--horizon` (manual runs often want 8-24h
+# to scout tomorrow's slate; bumping the cron config to >1h needs the
+# retro dedup direction flipped first or your hit-rate metrics will
+# measure stale predictions). Filter runs client-side after the gamma
+# `/events` listing (gamma's order=endDate is settlement-window ordered,
+# not tipoff, so a server-side cut would miss rescheduled fixtures whose
+# endDate is stale).
+DEFAULT_HORIZON_HOURS = 1
 
 # Slate-level sport allowlist. Values are gamma `tag_slug` strings
 # ('tennis', 'soccer', 'nba', 'mma', 'ufc', 'mlb', 'wnba', 'ice-hockey').
