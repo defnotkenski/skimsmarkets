@@ -463,6 +463,36 @@ class TennisStatsProvider(Protocol):
         """
         ...
 
+    async def warm_match_stats_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        """Pre-fetch `/player/match-stats/{id}` for every player named
+        in `identities`. Selection scoring uses
+        `lookup_player_match_stats` afterwards as a synchronous cache
+        hit — the v1 selection algorithm's serve-dominance tier needs
+        `first_serve_win_pct` pre-cap.
+
+        Idempotent — players already cached skip re-fetching. One HTTP
+        per unique (tour, player). The cached payload is also reused
+        by `_player_match_stats` in the post-cap enrichment path, so
+        the warmup HTTP isn't wasted on cap-survivor events.
+        """
+        ...
+
+    def lookup_player_match_stats(
+        self, tour: str, name: str
+    ) -> dict[str, float | None] | None:
+        """Synchronous lookup of career match-stats from the warmed
+        cache. Returns a dict with keys mirroring `TennisPlayerStats`
+        field names (`first_serve_win_pct`, `second_serve_win_pct`,
+        return-side rates, BP save/convert %), or None on cache miss
+        (player not in rankings index, or warmup didn't run).
+
+        Selection callers treat outer-None as "no serve signal" and
+        skip the serve-dominance tier.
+        """
+        ...
+
     async def warm_h2h_for_selection(
         self, identities: Iterable[TennisMatchIdentity]
     ) -> None:
@@ -642,6 +672,19 @@ class StubTennisStatsProvider:
     def lookup_player_profile_extras(
         self, tour: str, name: str
     ) -> tuple[int | None, int | None] | None:
+        return None
+
+    async def warm_match_stats_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        # No backing cache — selection scoring will see None for every
+        # `lookup_player_match_stats` and skip the serve-dominance tier.
+        for _ in identities:
+            pass
+
+    def lookup_player_match_stats(
+        self, tour: str, name: str
+    ) -> dict[str, float | None] | None:
         return None
 
     async def warm_h2h_for_selection(

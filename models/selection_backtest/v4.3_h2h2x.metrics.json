@@ -1,0 +1,41 @@
+{
+  "scorer_name": "v4.3_h2h2x",
+  "slate_cap": 5,
+  "train_cutoff": "2024-12-31",
+  "n_total_matches": 127989,
+  "n_slates_seen": 940,
+  "n_slates_evaluable": 895,
+  "n_dropped_cold_start": 3256,
+  "n_dropped_other": 0,
+  "train": {
+    "n_slates": 0,
+    "n_picks": 0,
+    "n_labelable": 0,
+    "precision_at_k_lock": NaN,
+    "precision_at_k_lock_or_lean": NaN,
+    "base_rate_lock": NaN,
+    "base_rate_lock_or_lean": NaN,
+    "per_tour": {}
+  },
+  "holdout": {
+    "n_slates": 895,
+    "n_picks": 4475,
+    "n_labelable": 3817,
+    "precision_at_k_lock": 0.21921787709497206,
+    "precision_at_k_lock_or_lean": 0.5932960893854748,
+    "base_rate_lock": 0.0809929645941772,
+    "base_rate_lock_or_lean": 0.40164731453411884,
+    "per_tour": {
+      "atp": {
+        "n_picks": 2270,
+        "precision_lock": 0.1841409691629956,
+        "precision_lock_or_lean": 0.573568281938326
+      },
+      "wta": {
+        "n_picks": 2205,
+        "precision_lock": 0.25532879818594106,
+        "precision_lock_or_lean": 0.6136054421768707
+      }
+    }
+  }
+}

@@ -594,6 +594,43 @@ class MatchStatTennisProvider:
         self._h2h_cache: dict[
             tuple[str, int, int], TennisHeadToHead | None
         ] = {}
+        # Per-player career-aggregate match-stats cache keyed by
+        # `(tour, pid)` → the dict-shape `_player_match_stats` produces
+        # (`first_serve_win_pct`, `second_serve_win_pct`, return rates,
+        # BP save/convert %, etc.). Populated by
+        # `warm_match_stats_for_selection` at slate-time pre-cap; read
+        # synchronously by `lookup_player_match_stats` at selector
+        # scoring time (the v1 selection algorithm's serve-dominance
+        # tier needs `first_serve_win_pct`), and re-read by
+        # `_player_match_stats` at post-cap enrichment so the warmup
+        # HTTP isn't wasted on survivors. Empty dict vs missing key
+        # distinguishes "warmup ran, vendor returned empty" from
+        # "warmup didn't fire."
+        self._match_stats_cache: dict[
+            tuple[str, int], dict[str, float | None]
+        ] = {}
+        # Per-player perf-breakdown cache keyed by (tour, pid) → the
+        # tier-records dict `_player_tier_records` already returns. Pure
+        # post-cap dedup: when the same player appears in multiple cap-
+        # survivor events on one slate (Sinner in two markets, say), the
+        # `_player_stats` fan-out reuses the parsed payload instead of
+        # re-fetching `/player/perf-breakdown/{pid}`. Not pre-warmed at
+        # selection time — the v1 selector
+        # (`selection_scorers.score_v1_selection`) doesn't read perf-
+        # breakdown, so a warmup pass there would be pure waste.
+        self._tier_records_cache: dict[
+            tuple[str, int], dict[str, tuple[int, int] | None]
+        ] = {}
+        # Per-player career-titles cache keyed by (tour, pid) → the
+        # titles-by-tier dict OR None for "no kept-tier titles." Same
+        # post-cap dedup motivation as `_tier_records_cache`; same
+        # rationale for skipping a selection-stage warmup. Caches None
+        # explicitly so a second consumer doesn't re-issue the vendor
+        # call for players the parser legitimately dropped — membership
+        # is checked with `in`, not `is not None`.
+        self._career_titles_cache: dict[
+            tuple[str, int], dict[str, int] | None
+        ] = {}
         # Per-fixture cache keyed by `(tour, frozenset({surname_a,
         # surname_b}))` → the `MatchStatsFixture` returned for that
         # matchup. Populated as a side effect of
@@ -1495,7 +1532,29 @@ class MatchStatTennisProvider:
     async def _player_tier_records(
         self, tour: str, pid: int
     ) -> dict[str, tuple[int, int] | None]:
+        """Cache-then-fetch wrapper around `_fetch_tier_records`.
+
+        Memoises the parsed perf-breakdown payload per (tour, pid) for
+        the provider's lifetime. When the same player appears in two
+        cap-survivor events on one slate, the second call hits the
+        cache instead of re-issuing `/player/perf-breakdown/{pid}`.
+        Value is always a dict (never None per `_fetch_tier_records`),
+        so `is not None` correctly discriminates miss from hit.
+        """
+        cached = self._tier_records_cache.get((tour, pid))
+        if cached is not None:
+            return cached
+        result = await self._fetch_tier_records(tour, pid)
+        self._tier_records_cache[(tour, pid)] = result
+        return result
+
+    async def _fetch_tier_records(
+        self, tour: str, pid: int
+    ) -> dict[str, tuple[int, int] | None]:
         """Pull current-year W/L vs top-5/top-10 + at Slams + at Masters.
+
+        Pure parsing helper, separate from cache lookup. Called by
+        `_player_tier_records` on cache miss.
 
         Perf-breakdown ships a year-keyed dict whose value is a 4-axis
         matrix (`court`, `round`, `rank`, `level`). We deliberately
@@ -1556,30 +1615,14 @@ class MatchStatTennisProvider:
         out["record_at_masters"] = _cell("level", "masters")
         return out
 
-    async def _player_match_stats(
+    async def _fetch_match_stats(
         self, tour: str, pid: int
     ) -> dict[str, float | None]:
-        """Career serve / return / break-point percentages.
+        """One match-stats HTTP → career serve / return / BP dict.
 
-        The vendor ships raw counters (numerator + denominator) under
-        `serviceStats`, `rtnStats`, `breakPointsServeStats`, and
-        `breakPointsRtnStats`. We compute the ratios here so the prompt
-        block carries percentages directly — the reasoner shouldn't have
-        to do arithmetic on raw counts in-context. Field naming:
-        `<x>Gm` is the numerator (count of events meeting condition),
-        `<x>OfGm` is the denominator (eligible events).
-
-        `rtnStats` is the awkward one: the vendor stores it as opponent's
-        serve performance against this player (same field shape as
-        `serviceStats`, just from the other side of the net). So
-        return-points-won % is `1 − (rtnStats.winningOnFirstServe /
-        rtnStats.winningOnFirstServeOf)`. Doing the inversion here means
-        the model field is the canonical "return-points-won" reading
-        without further math by the renderer or reasoner.
-
-        Returns a dict so the caller can spread the values directly into
-        `TennisPlayerStats(...)` without N positional args. Keys mirror
-        the model field names exactly.
+        Pure parsing helper, separate from cache lookup. Used by both
+        the selection-stage warmup (`warm_match_stats_for_selection`)
+        and the cache-miss fallback inside `_player_match_stats`.
         """
         body = await self._get(f"/tennis/v2/{tour}/player/match-stats/{pid}")
         data = body.get("data") if isinstance(body, dict) else None
@@ -1638,10 +1681,112 @@ class MatchStatTennisProvider:
         )
         return out
 
+    async def _player_match_stats(
+        self, tour: str, pid: int
+    ) -> dict[str, float | None]:
+        """Cache-then-fetch wrapper around `_fetch_match_stats`.
+
+        Consults `self._match_stats_cache` first when populated by the
+        selection-stage warmup — same vendor data, parsed once, reused
+        for the prompt block. Cache miss falls back to a direct fetch
+        and populates the cache so a second consumer within the same
+        run doesn't re-fetch.
+
+        Returns a dict so the caller can spread the values directly
+        into `TennisPlayerStats(...)`. Keys mirror the model field
+        names exactly (`first_serve_win_pct` etc.).
+        """
+        cached = self._match_stats_cache.get((tour, pid))
+        if cached is not None:
+            return cached
+        result = await self._fetch_match_stats(tour, pid)
+        self._match_stats_cache[(tour, pid)] = result
+        return result
+
+    async def warm_match_stats_for_selection(
+        self, identities: Iterable[TennisMatchIdentity]
+    ) -> None:
+        """Pre-fetch `/player/match-stats/{id}` for every player across
+        `identities` and populate `self._match_stats_cache`.
+
+        Same dedup-by-unique-player pattern as
+        `warm_surface_summary_for_selection`. The v1 selection
+        algorithm's serve-dominance tier needs `first_serve_win_pct`
+        pre-cap; this warmup is what makes the tier callable during
+        selection. Cache reuse downstream: `_player_match_stats`
+        consults this cache before re-fetching, so the warmup HTTP
+        serves both the selector's serve tier AND the eventual prompt's
+        serve / return / BP fields on `TennisPlayerStats`.
+
+        Pre-condition: rankings index warm.
+        """
+        pending: set[tuple[str, int]] = set()
+        for ident in identities:
+            for nm in (ident.player_a, ident.player_b):
+                hit = self._resolve(ident.tour, nm)
+                if hit is None:
+                    continue
+                pid = hit[0]
+                if (ident.tour, pid) in self._match_stats_cache:
+                    continue
+                pending.add((ident.tour, pid))
+        if not pending:
+            return
+        log.info(
+            "matchstat: warming match-stats cache for %d players (selection)",
+            len(pending),
+        )
+
+        async def _one(tour: str, pid: int) -> None:
+            self._match_stats_cache[(tour, pid)] = await self._fetch_match_stats(
+                tour, pid
+            )
+
+        await asyncio.gather(*(_one(tour, pid) for tour, pid in pending))
+
+    def lookup_player_match_stats(
+        self, tour: str, name: str
+    ) -> dict[str, float | None] | None:
+        """Sync career-match-stats lookup from the warmed cache.
+
+        Returns the same dict shape `_player_match_stats` produces
+        (`first_serve_win_pct`, `second_serve_win_pct`, return rates,
+        BP %), or None when the player isn't in the rankings index or
+        the warmup hasn't run. Selection callers treat outer-None as
+        "no serve signal" and skip the serve tier.
+        """
+        hit = self._resolve(tour, name)
+        if hit is None:
+            return None
+        pid = hit[0]
+        return self._match_stats_cache.get((tour, pid))
+
     async def _player_career_titles(
         self, tour: str, pid: int
     ) -> dict[str, int] | None:
+        """Cache-then-fetch wrapper around `_fetch_career_titles`.
+
+        Memoises the titles payload per (tour, pid) for the provider's
+        lifetime, including None ("no kept-tier titles") so a second
+        consumer on the same slate doesn't re-issue the vendor call
+        for a player whose payload legitimately dropped to None.
+        Membership check uses `in` rather than `is not None` because
+        None is a real cached value, not a miss sentinel.
+        """
+        cache_key = (tour, pid)
+        if cache_key in self._career_titles_cache:
+            return self._career_titles_cache[cache_key]
+        result = await self._fetch_career_titles(tour, pid)
+        self._career_titles_cache[cache_key] = result
+        return result
+
+    async def _fetch_career_titles(
+        self, tour: str, pid: int
+    ) -> dict[str, int] | None:
         """Career titles per tier from `/player/titles`.
+
+        Pure parsing helper, separate from cache lookup. Called by
+        `_player_career_titles` on cache miss.
 
         Distinct signal from YTD `record_at_grand_slam` etc.: those are
         current-year W/L; this is "career titles ever won." A 28yo with

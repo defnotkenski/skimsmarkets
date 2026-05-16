@@ -54,6 +54,7 @@ import math
 from collections import Counter
 from datetime import UTC, datetime
 
+from skimsmarkets import config as cfg
 from skimsmarkets.polymarket.models import PolymarketEvent
 from skimsmarkets.tennis.identity import (
     TennisMatchIdentity,
@@ -61,7 +62,8 @@ from skimsmarkets.tennis.identity import (
     _slug_tier,
     tennis_match_identity,
 )
-from skimsmarkets.tennis.models import TennisHeadToHead
+from skimsmarkets.tennis.models import TennisHeadToHead, TennisPlayerStats
+from skimsmarkets.tennis.selection_scorers import score_v1_selection
 from skimsmarkets.tennis.provider import MatchHistoryRow, TennisStatsProvider
 
 log = logging.getLogger(__name__)
@@ -1071,6 +1073,139 @@ def _tennis_imbalance(
     return max(0.0, min(1.0, score_pre_tier * multiplier))
 
 
+def _tennis_imbalance_v1(
+    event: PolymarketEvent, provider: TennisStatsProvider
+) -> float | None:
+    """v1 tennis selector — empirically tuned via 11 iterations of
+    selector-backtest ablation. Composition (additive, clipped):
+
+        score = clip(
+            0.3 * rank_points_ratio
+            + form_alignment
+            + 2.5 * serve_dominance
+            + h2h_bonus
+            + surface_winrate_diff
+            + info_density,
+            0, 1
+        )
+
+    Backtest results on 2025+ holdout, K=5, 895 evaluable slates:
+    Lock precision 0.2487 vs rank-points baseline 0.1928 (+29% lift).
+    K-robust at K=3 (+28%), K=5 (+29%), K=10 (+14%). No overfit
+    (holdout > train at every K). See `tennis/selection_scorers.py`
+    for the canonical scorer + the full ablation history in
+    `memory/project_pre_llm_tennis_algo_overhaul.md`.
+
+    Pre-condition: the slate-level warmups in `select_top_events`
+    have populated the provider's caches for every player in the
+    matchup. Missing data on any tier → that tier contributes 0;
+    `score_v1_selection` never aborts on partial data.
+
+    Returns None when the event isn't a recognizable tennis singles
+    matchup (mirrors `_tennis_imbalance`'s None-on-miss posture so
+    the caller can cascade to `_team_record_imbalance`).
+    """
+    identity = tennis_match_identity(event)
+    if identity is None:
+        return None
+    a_rank_hit = provider.lookup_player_rank(identity.tour, identity.player_a)
+    b_rank_hit = provider.lookup_player_rank(identity.tour, identity.player_b)
+    if a_rank_hit is None or b_rank_hit is None:
+        return None
+    _, a_pts = a_rank_hit
+    _, b_pts = b_rank_hit
+    if a_pts <= 0 or b_pts <= 0:
+        return None
+
+    # Form (cached by warm_form_for_selection).
+    a_form = provider.lookup_player_form(identity.tour, identity.player_a)
+    b_form = provider.lookup_player_form(identity.tour, identity.player_b)
+    a_form_str = a_form[0] if a_form is not None else None
+    b_form_str = b_form[0] if b_form is not None else None
+
+    # Career match-stats (cached by warm_match_stats_for_selection).
+    # v1's serve-dominance tier reads `first_serve_win_pct` from here.
+    a_ms = provider.lookup_player_match_stats(identity.tour, identity.player_a)
+    b_ms = provider.lookup_player_match_stats(identity.tour, identity.player_b)
+    a_fsw = a_ms.get("first_serve_win_pct") if a_ms is not None else None
+    b_fsw = b_ms.get("first_serve_win_pct") if b_ms is not None else None
+
+    # Surface record (cached by warm_surface_summary_for_selection).
+    # v1's surface_wp tier reads the per-surface (W, L) dict.
+    a_sr = provider.lookup_player_surface_record(
+        identity.tour, identity.player_a
+    )
+    b_sr = provider.lookup_player_surface_record(
+        identity.tour, identity.player_b
+    )
+    a_surface_dict = a_sr[1] if a_sr is not None else None
+    b_surface_dict = b_sr[1] if b_sr is not None else None
+
+    # Resolve the event surface using the existing two-step cascade
+    # (slug parse + modal recent-surface fallback). Same helper the
+    # legacy algorithm uses.
+    event_surface = _resolve_event_surface(identity, event.slug or "", provider)
+
+    # H2H (cached by warm_h2h_for_selection). v1's h2h tier needs
+    # just the total meeting count.
+    h2h = provider.lookup_h2h(
+        identity.tour, identity.player_a, identity.player_b
+    )
+    h2h_total = (h2h.a_wins + h2h.b_wins) if h2h is not None else 0
+
+    # Match-history rows (cached by warm_match_history_for_selection).
+    # v1's info-density tier needs the total count + per-surface count
+    # per side, bottlenecked by the worse-served side.
+    a_hist = provider.lookup_player_match_history(
+        identity.tour, identity.player_a
+    )
+    b_hist = provider.lookup_player_match_history(
+        identity.tour, identity.player_b
+    )
+    a_total = len(a_hist) if a_hist is not None else 0
+    b_total = len(b_hist) if b_hist is not None else 0
+    a_surface_n = (
+        sum(1 for r in a_hist if r.surface == event_surface)
+        if a_hist is not None and event_surface is not None
+        else 0
+    )
+    b_surface_n = (
+        sum(1 for r in b_hist if r.surface == event_surface)
+        if b_hist is not None and event_surface is not None
+        else 0
+    )
+
+    # Build synthetic `TennisPlayerStats` carrying just the fields
+    # `score_v1_selection` reads. Unspecified fields stay None
+    # (Pydantic defaults) — the scorer's tier functions all
+    # null-check before using.
+    a_stats = TennisPlayerStats(
+        name=identity.player_a,
+        rank_points=a_pts,
+        last_10_form=a_form_str,
+        first_serve_win_pct=a_fsw,
+        surface_win_loss=a_surface_dict,
+    )
+    b_stats = TennisPlayerStats(
+        name=identity.player_b,
+        rank_points=b_pts,
+        last_10_form=b_form_str,
+        first_serve_win_pct=b_fsw,
+        surface_win_loss=b_surface_dict,
+    )
+
+    return score_v1_selection(
+        a_stats=a_stats,
+        b_stats=b_stats,
+        surface=event_surface,
+        h2h_total_meetings=h2h_total,
+        a_total_matches=a_total,
+        b_total_matches=b_total,
+        a_surface_matches=a_surface_n,
+        b_surface_matches=b_surface_n,
+    )
+
+
 def imbalance_score(
     event: PolymarketEvent, tennis_provider: TennisStatsProvider
 ) -> float:
@@ -1083,13 +1218,24 @@ def imbalance_score(
     signal — we don't try to combine tennis + team-record on the same
     event because they're never both populated.
 
+    Tennis path dispatches between v0 (legacy 10-tier in this module)
+    and v1 (the empirically tuned `_tennis_imbalance_v1` calling
+    `score_v1_selection`) via `cfg.TENNIS_SELECTION_V1_ENABLED`. v1
+    is the default; flip the flag to False for emergency rollback.
+    Backtested holdout Lock precision: v1 = 0.2487, baseline rank-
+    points = 0.1928 (+29%). v0 was never measured against the same
+    harness (Phase 0.5 deferred).
+
     `tennis_provider` is the same provider used for full enrichment;
     the rank lookup against its warm index is free (no HTTP). The stub
     provider's `lookup_player_rank` always returns None, so under the
     no-key configuration tennis events fall through to score 0 and
     the tipoff tiebreaker decides.
     """
-    s = _tennis_imbalance(event, tennis_provider)
+    if cfg.TENNIS_SELECTION_V1_ENABLED:
+        s = _tennis_imbalance_v1(event, tennis_provider)
+    else:
+        s = _tennis_imbalance(event, tennis_provider)
     if s is not None:
         return s
     s = _team_record_imbalance(event)
@@ -1187,6 +1333,20 @@ async def select_top_events(
             # cached payload for cap-survivor events. Net cost per run:
             # ~one MatchStat call cluster per non-cap-survivor matchup.
             await tennis_provider.warm_h2h_for_selection(tennis_identities)
+            # Match-stats warmup feeds `lookup_player_match_stats`
+            # (career first-serve / return / BP %). The v1 selection
+            # algorithm's serve-dominance tier needs `first_serve_win_pct`
+            # pre-cap. Same dedup-by-unique-player pattern as the
+            # form / match-history / surface warmups; one HTTP per
+            # unique player. The cached payload is reused by
+            # `_player_match_stats` in the post-cap enrichment path so
+            # the warmup HTTP is not wasted on cap-survivor events.
+            # Skipped when the legacy v0 algorithm is in use — the
+            # v0 algorithm doesn't read serve stats.
+            if cfg.TENNIS_SELECTION_V1_ENABLED:
+                await tennis_provider.warm_match_stats_for_selection(
+                    tennis_identities
+                )
 
     scored = [
         (ev, imbalance_score(ev, tennis_provider), _earliest_tipoff(ev))

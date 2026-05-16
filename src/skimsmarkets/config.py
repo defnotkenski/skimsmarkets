@@ -69,6 +69,19 @@ MIN_OPEN_INTEREST_DOLLARS = 0.0
 # truncation), same posture as the horizon + blowout filters.
 MAX_SLATE_EVENTS = 5
 
+# Toggle between the v1 tennis selection algorithm (empirically tuned
+# via 11 iterations of selector-backtest ablation — see
+# `tennis/selection_scorers.py:score_v1_selection`) and the legacy
+# 10-tier `_tennis_imbalance` in `selection.py`. v1 lifted holdout
+# Lock-precision-at-K from 0.1928 to 0.2487 (+29%) on the 2025+ split
+# vs the rank-points baseline; the legacy algorithm has not been
+# directly measured against the same backtest harness (Phase 0.5 was
+# deferred — see `memory/project_pre_llm_tennis_algo_overhaul.md`).
+# Flip to False to roll back to the legacy algorithm if v1 misbehaves
+# in production. Affects ONLY tennis events; team-sport scoring in
+# `_team_record_imbalance` is unaffected.
+TENNIS_SELECTION_V1_ENABLED = True
+
 # Concurrency caps. See plan for rationale.
 # Each event runs through 4 Grok fetchers (Stage A) → 4 Claude reasoners
 # (Stage B) → 1 Claude director, all parallel where possible. The fetcher
