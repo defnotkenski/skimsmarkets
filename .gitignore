@@ -26,8 +26,10 @@ htmlcov/
 .idea/
 .vscode/
 
-# Claude Code
-.claude/
+# Claude Code — ignore machine-specific contents (settings.local.json,
+# worktrees/) but track shared skills so they sync alongside the playbooks.
+.claude/*
+!.claude/skills/
 
 # OS
 .DS_Store
