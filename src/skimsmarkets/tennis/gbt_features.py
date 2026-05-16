@@ -779,6 +779,28 @@ NUMERIC_FEATURE_COLUMNS: tuple[str, ...] = (
     # this change).
     "h2h_advantage",
     "n_h2h_priors",
+    # Matchup-conditioned clutch — derived from `_H2HRecord` sub-counts
+    # the parquet now carries (added 2026-05-15). Each advantage is
+    # centered at 0 like `h2h_advantage` so anchor-swap symmetry holds.
+    # Each pairs with its own sample-size count so the GBT can learn
+    # to discount thin-sample rates. Distinct from the career-aggregate
+    # clutch columns above — these say "deciders specifically vs THIS
+    # opponent" rather than "deciders generally."
+    "h2h_decider_advantage",
+    "n_h2h_decider_priors",
+    "h2h_tiebreak_advantage",
+    "n_h2h_tiebreak_priors",
+    "h2h_comeback_advantage",
+    "n_h2h_comeback_priors",
+    "h2h_close_match_advantage",
+    "n_h2h_close_match_priors",
+    # Point-in-time rankings — anchor minus opp under the symmetric
+    # form. `rank_diff` uses opp − anchor because lower rank number =
+    # stronger player; positive `rank_diff` therefore means anchor is
+    # the higher-ranked side. `rank_points_diff` is the natural sign
+    # (anchor − opp) since higher points = stronger.
+    "rank_diff",
+    "rank_points_diff",
 )
 
 CATEGORICAL_FEATURE_COLUMNS: tuple[str, ...] = ("surface", "tier", "best_of")
@@ -800,6 +822,10 @@ def compute_features(
     best_of: int | None,
     anchor_birthdate: date | None,
     opponent_birthdate: date | None,
+    anchor_rank: int | None = None,
+    opponent_rank: int | None = None,
+    anchor_rank_points: int | None = None,
+    opponent_rank_points: int | None = None,
 ) -> dict[str, Any]:
     """Build one feature row from two pre-positioned `PlayerHistory`
     snapshots. Returns a dict suitable for catboost's pandas ingestion
@@ -809,6 +835,12 @@ def compute_features(
     MatchStat id. Differential features are anchor − opponent, so a
     positive value means the anchor is the stronger side on that
     metric. Categoricals are match-level, no anchor-relativity.
+
+    `anchor_rank` / `opponent_rank` (and the corresponding `_points`)
+    are optional point-in-time values. The training path looks them up
+    from `rankings_history.parquet`; the inference path reads them off
+    the live `TennisStatsContext.player_*` blocks. None on either side
+    → rank_diff / rank_points_diff land NaN and catboost ignores them.
     """
 
     # Differential numerics. _diff_or_nan returns None when either
@@ -892,6 +924,43 @@ def compute_features(
     feats["h2h_advantage"] = None if h2h_rate is None else h2h_rate - 0.5
     feats["n_h2h_priors"] = n_h2h
 
+    # Matchup-conditioned clutch sub-counts from `_H2HRecord`. Same
+    # `winrate − 0.5` centering as `h2h_advantage` for anchor-swap
+    # symmetry. Each rate pairs with its own sample-size column so the
+    # GBT can learn that a "1-0 in deciders" rate is less trustworthy
+    # than "7-2 in deciders" without us having to bake in a hand-tuned
+    # confidence-shrinkage rule.
+    h2h_dec, n_dec = anchor_history.h2h_decider_winrate(opponent_id)
+    feats["h2h_decider_advantage"] = None if h2h_dec is None else h2h_dec - 0.5
+    feats["n_h2h_decider_priors"] = n_dec
+
+    h2h_tb, n_tb = anchor_history.h2h_tiebreak_winrate(opponent_id)
+    feats["h2h_tiebreak_advantage"] = None if h2h_tb is None else h2h_tb - 0.5
+    feats["n_h2h_tiebreak_priors"] = n_tb
+
+    h2h_cb, n_cb = anchor_history.h2h_comeback_winrate(opponent_id)
+    feats["h2h_comeback_advantage"] = None if h2h_cb is None else h2h_cb - 0.5
+    feats["n_h2h_comeback_priors"] = n_cb
+
+    h2h_cm, n_cm = anchor_history.h2h_close_match_winrate(opponent_id)
+    feats["h2h_close_match_advantage"] = (
+        None if h2h_cm is None else h2h_cm - 0.5
+    )
+    feats["n_h2h_close_match_priors"] = n_cm
+
+    # Point-in-time rank diffs. `rank` is lower=stronger so flip the
+    # sign convention (opp − anchor) to land in the "positive = anchor
+    # stronger" frame the other numeric columns use. `rank_points` is
+    # higher=stronger so keep the natural anchor − opp orientation.
+    feats["rank_diff"] = (
+        None if (anchor_rank is None or opponent_rank is None)
+        else opponent_rank - anchor_rank
+    )
+    feats["rank_points_diff"] = (
+        None if (anchor_rank_points is None or opponent_rank_points is None)
+        else anchor_rank_points - opponent_rank_points
+    )
+
     # Categoricals — never None; catboost can take a literal "unknown"
     # token but mixing None with strings breaks pandas → catboost
     # ingestion. Use string sentinels so the column dtype stays object.
@@ -907,6 +976,66 @@ def _years_from(on_date: date, birthdate: date | None) -> float | None:
         return None
     delta = on_date - birthdate
     return delta.days / 365.25
+
+
+# ---------------------------------------------------------------------------
+# Rank-history helpers — load `rankings_history.parquet` into a
+# (tour, player_id) → sorted timeline dict, look up the most recent
+# rank on or before a given match date via bisect. Used by both the
+# training path (build_training_table) and the algo backtest harness.
+# ---------------------------------------------------------------------------
+
+
+def _build_rank_lookup(
+    rankings_df: pd.DataFrame,
+) -> dict[tuple[str, int], list[tuple[int, int, int | None]]]:
+    """Return `{(tour, player_id): [(epoch_seconds, rank, points), ...]}`
+    sorted ascending by date. Caller uses bisect for the "most recent
+    rank on or before match_date" lookup.
+    """
+    out: dict[tuple[str, int], list[tuple[int, int, int | None]]] = {}
+    ts = pd.to_datetime(rankings_df["ranking_date"]).astype("int64") // 10**9
+    tours = rankings_df["tour"].to_numpy()
+    pids = rankings_df["player_id"].to_numpy()
+    ranks = rankings_df["rank"].to_numpy()
+    points = rankings_df["rank_points"].to_numpy()
+    for i in range(len(rankings_df)):
+        pt = int(points[i]) if pd.notna(points[i]) else None
+        key = (str(tours[i]), int(pids[i]))
+        out.setdefault(key, []).append(
+            (int(ts.iloc[i]), int(ranks[i]), pt)
+        )
+    for k in out:
+        out[k].sort()
+    return out
+
+
+def lookup_rank_at(
+    lookup: dict[tuple[str, int], list[tuple[int, int, int | None]]],
+    tour: str,
+    pid: int,
+    on_date: date,
+) -> tuple[int | None, int | None]:
+    """Return (rank, rank_points) at or before `on_date`, or (None, None)
+    when the (tour, player_id) has no snapshot history (e.g. unranked
+    player or pre-2008 dates). Bisect on the sorted timestamps; O(log n)
+    per lookup.
+    """
+    entries = lookup.get((tour, pid))
+    if not entries:
+        return None, None
+    target_ts = int(pd.Timestamp(on_date).timestamp())
+    lo, hi = 0, len(entries)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if entries[mid][0] <= target_ts:
+            lo = mid + 1
+        else:
+            hi = mid
+    idx = lo - 1
+    if idx < 0:
+        return None, None
+    return entries[idx][1], entries[idx][2]
 
 
 @dataclass
@@ -926,11 +1055,19 @@ def build_training_table(
     matches_df: pd.DataFrame,
     profiles_df: pd.DataFrame,
     *,
+    rankings_df: pd.DataFrame | None = None,
     min_priors: int = MIN_PRIORS_PER_SIDE,
 ) -> TrainingTable:
     """Walk the parquet chronologically. For each row, snapshot both
     players' state BEFORE folding the match in; that snapshot becomes
     the feature row IF both sides have ≥ min_priors prior matches.
+
+    `rankings_df` is the optional `rankings_history.parquet` table; when
+    provided, `compute_features` receives point-in-time `rank` and
+    `rank_points` for each player and emits the `rank_diff` /
+    `rank_points_diff` features. When None, those features land NaN and
+    catboost ignores them (the model degrades gracefully on rank-free
+    re-trains).
 
     Returns a `TrainingTable` whose `rows` DataFrame carries
     `ALL_FEATURE_COLUMNS + ['target', 'match_id', 'match_date',
@@ -947,6 +1084,8 @@ def build_training_table(
         if isinstance(bd, pd.Timestamp) and not pd.isna(bd):
             bd_date = bd.date()
         profile_lookup[(str(tour), int(pid))] = {"birthdate": bd_date}
+
+    rank_lookup = _build_rank_lookup(rankings_df) if rankings_df is not None else {}
 
     df = matches_df.sort_values("match_date").reset_index(drop=True)
     store = HistoryStore()
@@ -986,9 +1125,25 @@ def build_training_table(
         best_of = _row_get_int(row, "best_of")
         match_id = _row_get_int(row, "match_id")
 
-        for anchor_id, opp_id, anchor_h, opp_h, a_prof, o_prof, anchor_won in (
-            (p1, p2, h1, h2, p1_prof, p2_prof, winner_side == 1),
-            (p2, p1, h2, h1, p2_prof, p1_prof, winner_side == 2),
+        # Point-in-time rank lookups (None when rankings_df was not
+        # provided OR when this player has no snapshot ≤ match_date).
+        p1_rank, p1_pts = (
+            lookup_rank_at(rank_lookup, tour, p1, on_date)
+            if rank_lookup else (None, None)
+        )
+        p2_rank, p2_pts = (
+            lookup_rank_at(rank_lookup, tour, p2, on_date)
+            if rank_lookup else (None, None)
+        )
+
+        for (
+            anchor_id, opp_id, anchor_h, opp_h, a_prof, o_prof,
+            anchor_won, a_rank, a_pts, o_rank, o_pts,
+        ) in (
+            (p1, p2, h1, h2, p1_prof, p2_prof, winner_side == 1,
+             p1_rank, p1_pts, p2_rank, p2_pts),
+            (p2, p1, h2, h1, p2_prof, p1_prof, winner_side == 2,
+             p2_rank, p2_pts, p1_rank, p1_pts),
         ):
             feats = compute_features(
                 anchor_history=anchor_h,
@@ -1001,6 +1156,10 @@ def build_training_table(
                 best_of=best_of,
                 anchor_birthdate=a_prof.get("birthdate"),
                 opponent_birthdate=o_prof.get("birthdate"),
+                anchor_rank=a_rank,
+                opponent_rank=o_rank,
+                anchor_rank_points=a_pts,
+                opponent_rank_points=o_pts,
             )
             feats.update({
                 "target": int(anchor_won),

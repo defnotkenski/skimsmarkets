@@ -1,168 +1,178 @@
 {
-  "trained_at_utc": "2026-05-08T18:10:45.015007+00:00",
+  "trained_at_utc": "2026-05-16T00:07:33.921679+00:00",
   "train_cutoff": "2024-12-31",
   "train_n": 122198,
   "holdout_n": 34968,
   "n_dropped_cold_start": 49406,
   "n_dropped_other": 0,
   "train": {
-    "brier": 0.2252479102629713,
-    "log_loss": 0.640982289137699,
-    "auc": 0.6789767447529692,
+    "brier": 0.22369168259379957,
+    "log_loss": 0.6376070136653186,
+    "auc": 0.6849209301519988,
     "base_rate_anchor_wins": 0.5
   },
   "holdout": {
-    "brier": 0.2205511990680958,
-    "log_loss": 0.6313787609672735,
-    "auc": 0.7011787644287883,
+    "brier": 0.21677606654108736,
+    "log_loss": 0.6233947976090473,
+    "auc": 0.7186246394454915,
     "base_rate_anchor_wins": 0.5,
     "reliability_deciles": [
       {
         "bin_low": 0.0,
         "bin_high": 0.1,
-        "n": 14,
-        "mean_predicted": 0.08323936222683173,
-        "mean_observed": 0.07142857142857142
+        "n": 15,
+        "mean_predicted": 0.08962882438604115,
+        "mean_observed": 0.13333333333333333
       },
       {
         "bin_low": 0.1,
         "bin_high": 0.2,
-        "n": 454,
-        "mean_predicted": 0.16649467912740806,
-        "mean_observed": 0.12555066079295155
+        "n": 465,
+        "mean_predicted": 0.16592213170674994,
+        "mean_observed": 0.09247311827956989
       },
       {
         "bin_low": 0.2,
         "bin_high": 0.30000000000000004,
-        "n": 2399,
-        "mean_predicted": 0.25824572747453645,
-        "mean_observed": 0.2184243434764485
+        "n": 2212,
+        "mean_predicted": 0.2611636790785364,
+        "mean_observed": 0.1984629294755877
       },
       {
         "bin_low": 0.30000000000000004,
         "bin_high": 0.4,
-        "n": 5803,
-        "mean_predicted": 0.3550607260748972,
-        "mean_observed": 0.30708254351197656
+        "n": 5917,
+        "mean_predicted": 0.3565160155917843,
+        "mean_observed": 0.2857867162413385
       },
       {
         "bin_low": 0.4,
         "bin_high": 0.5,
-        "n": 8830,
-        "mean_predicted": 0.45210087464912274,
-        "mean_observed": 0.4352208380520951
+        "n": 8972,
+        "mean_predicted": 0.4503213607096277,
+        "mean_observed": 0.42019616584930897
       },
       {
         "bin_low": 0.5,
         "bin_high": 0.6000000000000001,
-        "n": 8895,
-        "mean_predicted": 0.5480431195975691,
-        "mean_observed": 0.5641371557054525
+        "n": 8840,
+        "mean_predicted": 0.5496603522968992,
+        "mean_observed": 0.5829185520361991
       },
       {
         "bin_low": 0.6000000000000001,
         "bin_high": 0.7000000000000001,
-        "n": 5641,
-        "mean_predicted": 0.6449525740595311,
-        "mean_observed": 0.6959758907995036
+        "n": 5868,
+        "mean_predicted": 0.6440505990760128,
+        "mean_observed": 0.7138718473074301
       },
       {
         "bin_low": 0.7000000000000001,
         "bin_high": 0.8,
-        "n": 2419,
-        "mean_predicted": 0.7415473340385597,
-        "mean_observed": 0.7788342290202563
+        "n": 2184,
+        "mean_predicted": 0.7390085461611756,
+        "mean_observed": 0.8035714285714286
       },
       {
         "bin_low": 0.8,
         "bin_high": 0.9,
-        "n": 498,
-        "mean_predicted": 0.8336813577821602,
-        "mean_observed": 0.8734939759036144
+        "n": 482,
+        "mean_predicted": 0.8348895780633243,
+        "mean_observed": 0.8921161825726142
       },
       {
         "bin_low": 0.9,
         "bin_high": 1.0,
-        "n": 15,
-        "mean_predicted": 0.9152257173691402,
-        "mean_observed": 0.9333333333333333
+        "n": 13,
+        "mean_predicted": 0.9117867429610337,
+        "mean_observed": 0.9230769230769231
       }
     ],
     "per_tour": {
       "atp": {
         "n": 19724,
-        "brier": 0.22362213979679635,
-        "log_loss": 0.6380274683580546,
+        "brier": 0.22040363902324012,
+        "log_loss": 0.6313947610290053,
         "base_rate_anchor_wins": 0.5
       },
       "wta": {
         "n": 15244,
-        "brier": 0.21657775148656275,
-        "log_loss": 0.6227760907641926,
+        "brier": 0.21208240086029617,
+        "log_loss": 0.6130437559864252,
         "base_rate_anchor_wins": 0.5
       }
     },
     "per_tier": {
       "challenger": {
         "n": 16168,
-        "brier": 0.21797951194649826
+        "brier": 0.21747231277587836
       },
       "futures": {
         "n": 504,
-        "brier": 0.21332840977019224
+        "brier": 0.2097622979224819
       },
       "grand_slam": {
         "n": 3906,
-        "brier": 0.21251516866140954
+        "brier": 0.20438488960790557
       },
       "main_tour": {
         "n": 8026,
-        "brier": 0.2251288252148837
+        "brier": 0.21871822334929897
       },
       "masters": {
         "n": 5754,
-        "brier": 0.22747839373216613
+        "brier": 0.22165211245574473
       },
       "team_cup": {
         "n": 580,
-        "brier": 0.22490442905863894
+        "brier": 0.2162065905443336
       },
       "tour_finals": {
         "n": 30,
-        "brier": 0.13668716609989925
+        "brier": 0.12890088997961474
       }
     }
   },
   "feature_importance": {
-    "career_first_serve_in_pct_diff": 7.070465111690953,
-    "career_first_serve_win_pct_diff": 17.6996946329938,
-    "career_second_serve_win_pct_diff": 7.8811158393105805,
-    "career_first_serve_return_win_pct_diff": 4.090235366643218,
-    "career_second_serve_return_win_pct_diff": 9.50755747673939,
-    "career_bp_save_pct_diff": 3.3899435009402716,
-    "career_bp_convert_pct_diff": 2.1940669917595557,
-    "career_tiebreak_winrate_diff": 1.834414279724367,
+    "career_first_serve_in_pct_diff": 5.966235277833658,
+    "career_first_serve_win_pct_diff": 12.157378066417017,
+    "career_second_serve_win_pct_diff": 5.768678933507382,
+    "career_first_serve_return_win_pct_diff": 2.8061387113470393,
+    "career_second_serve_return_win_pct_diff": 6.891459835172458,
+    "career_bp_save_pct_diff": 2.893093023138002,
+    "career_bp_convert_pct_diff": 1.4297462872946267,
+    "career_tiebreak_winrate_diff": 1.1047822949733006,
     "career_decider_winrate_diff": 0.0,
-    "career_comeback_winrate_diff": 4.325210828671813,
-    "career_close_match_winrate_diff": 2.875255386989806,
-    "surface_first_serve_win_pct_diff": 3.5488061751733855,
-    "surface_record_diff": 10.605467736913537,
-    "last_n_winrate_diff": 3.03322659009928,
-    "days_since_diff": 5.198095007472728,
-    "age_diff": 1.2854781446154409,
-    "h2h_advantage": 3.796736788969929,
-    "n_h2h_priors": 2.1511337398253376,
-    "surface": 2.8951438713315163,
-    "tier": 6.617952530135109,
+    "career_comeback_winrate_diff": 2.7771042374202515,
+    "career_close_match_winrate_diff": 2.4214062314408693,
+    "surface_first_serve_win_pct_diff": 3.803533658619333,
+    "surface_record_diff": 7.241121593795512,
+    "last_n_winrate_diff": 2.266195062904246,
+    "days_since_diff": 3.0582394177470746,
+    "age_diff": 2.3548477241976316,
+    "h2h_advantage": 2.8943952522153866,
+    "n_h2h_priors": 0.8125599814831781,
+    "h2h_decider_advantage": 0.0,
+    "n_h2h_decider_priors": 0.0,
+    "h2h_tiebreak_advantage": 0.5214674281036358,
+    "n_h2h_tiebreak_priors": 0.416104092022312,
+    "h2h_comeback_advantage": 0.7449441172308927,
+    "n_h2h_comeback_priors": 1.2510985774488868,
+    "h2h_close_match_advantage": 0.3218694920142198,
+    "n_h2h_close_match_priors": 0.20842562460143527,
+    "rank_diff": 9.70667759662548,
+    "rank_points_diff": 14.375668192264811,
+    "surface": 1.7440524299909723,
+    "tier": 4.062776860190354,
     "best_of": 0.0
   },
   "sim_compare": {
     "n_paired": 34968,
-    "gbt_brier": 0.2205511990680958,
-    "sim_brier": 0.2256258238031915,
-    "gbt_log_loss": 0.6313787609672735,
-    "sim_log_loss": 0.6423837769402296
+    "gbt_brier": 0.21677606654108736,
+    "sim_brier": 0.2257154255319149,
+    "gbt_log_loss": 0.6233947976090473,
+    "sim_log_loss": 0.6425689972956645
   },
-  "model_version": "sha-be7cdc2b96a607c1",
+  "model_version": "sha-fcce135c46aa8a9c",
   "model_path": "models/tennis_gbt_spike.cbm"
 }

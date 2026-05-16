@@ -1,0 +1,168 @@
+{
+  "trained_at_utc": "2026-05-08T18:10:45.015007+00:00",
+  "train_cutoff": "2024-12-31",
+  "train_n": 122198,
+  "holdout_n": 34968,
+  "n_dropped_cold_start": 49406,
+  "n_dropped_other": 0,
+  "train": {
+    "brier": 0.2252479102629713,
+    "log_loss": 0.640982289137699,
+    "auc": 0.6789767447529692,
+    "base_rate_anchor_wins": 0.5
+  },
+  "holdout": {
+    "brier": 0.2205511990680958,
+    "log_loss": 0.6313787609672735,
+    "auc": 0.7011787644287883,
+    "base_rate_anchor_wins": 0.5,
+    "reliability_deciles": [
+      {
+        "bin_low": 0.0,
+        "bin_high": 0.1,
+        "n": 14,
+        "mean_predicted": 0.08323936222683173,
+        "mean_observed": 0.07142857142857142
+      },
+      {
+        "bin_low": 0.1,
+        "bin_high": 0.2,
+        "n": 454,
+        "mean_predicted": 0.16649467912740806,
+        "mean_observed": 0.12555066079295155
+      },
+      {
+        "bin_low": 0.2,
+        "bin_high": 0.30000000000000004,
+        "n": 2399,
+        "mean_predicted": 0.25824572747453645,
+        "mean_observed": 0.2184243434764485
+      },
+      {
+        "bin_low": 0.30000000000000004,
+        "bin_high": 0.4,
+        "n": 5803,
+        "mean_predicted": 0.3550607260748972,
+        "mean_observed": 0.30708254351197656
+      },
+      {
+        "bin_low": 0.4,
+        "bin_high": 0.5,
+        "n": 8830,
+        "mean_predicted": 0.45210087464912274,
+        "mean_observed": 0.4352208380520951
+      },
+      {
+        "bin_low": 0.5,
+        "bin_high": 0.6000000000000001,
+        "n": 8895,
+        "mean_predicted": 0.5480431195975691,
+        "mean_observed": 0.5641371557054525
+      },
+      {
+        "bin_low": 0.6000000000000001,
+        "bin_high": 0.7000000000000001,
+        "n": 5641,
+        "mean_predicted": 0.6449525740595311,
+        "mean_observed": 0.6959758907995036
+      },
+      {
+        "bin_low": 0.7000000000000001,
+        "bin_high": 0.8,
+        "n": 2419,
+        "mean_predicted": 0.7415473340385597,
+        "mean_observed": 0.7788342290202563
+      },
+      {
+        "bin_low": 0.8,
+        "bin_high": 0.9,
+        "n": 498,
+        "mean_predicted": 0.8336813577821602,
+        "mean_observed": 0.8734939759036144
+      },
+      {
+        "bin_low": 0.9,
+        "bin_high": 1.0,
+        "n": 15,
+        "mean_predicted": 0.9152257173691402,
+        "mean_observed": 0.9333333333333333
+      }
+    ],
+    "per_tour": {
+      "atp": {
+        "n": 19724,
+        "brier": 0.22362213979679635,
+        "log_loss": 0.6380274683580546,
+        "base_rate_anchor_wins": 0.5
+      },
+      "wta": {
+        "n": 15244,
+        "brier": 0.21657775148656275,
+        "log_loss": 0.6227760907641926,
+        "base_rate_anchor_wins": 0.5
+      }
+    },
+    "per_tier": {
+      "challenger": {
+        "n": 16168,
+        "brier": 0.21797951194649826
+      },
+      "futures": {
+        "n": 504,
+        "brier": 0.21332840977019224
+      },
+      "grand_slam": {
+        "n": 3906,
+        "brier": 0.21251516866140954
+      },
+      "main_tour": {
+        "n": 8026,
+        "brier": 0.2251288252148837
+      },
+      "masters": {
+        "n": 5754,
+        "brier": 0.22747839373216613
+      },
+      "team_cup": {
+        "n": 580,
+        "brier": 0.22490442905863894
+      },
+      "tour_finals": {
+        "n": 30,
+        "brier": 0.13668716609989925
+      }
+    }
+  },
+  "feature_importance": {
+    "career_first_serve_in_pct_diff": 7.070465111690953,
+    "career_first_serve_win_pct_diff": 17.6996946329938,
+    "career_second_serve_win_pct_diff": 7.8811158393105805,
+    "career_first_serve_return_win_pct_diff": 4.090235366643218,
+    "career_second_serve_return_win_pct_diff": 9.50755747673939,
+    "career_bp_save_pct_diff": 3.3899435009402716,
+    "career_bp_convert_pct_diff": 2.1940669917595557,
+    "career_tiebreak_winrate_diff": 1.834414279724367,
+    "career_decider_winrate_diff": 0.0,
+    "career_comeback_winrate_diff": 4.325210828671813,
+    "career_close_match_winrate_diff": 2.875255386989806,
+    "surface_first_serve_win_pct_diff": 3.5488061751733855,
+    "surface_record_diff": 10.605467736913537,
+    "last_n_winrate_diff": 3.03322659009928,
+    "days_since_diff": 5.198095007472728,
+    "age_diff": 1.2854781446154409,
+    "h2h_advantage": 3.796736788969929,
+    "n_h2h_priors": 2.1511337398253376,
+    "surface": 2.8951438713315163,
+    "tier": 6.617952530135109,
+    "best_of": 0.0
+  },
+  "sim_compare": {
+    "n_paired": 34968,
+    "gbt_brier": 0.2205511990680958,
+    "sim_brier": 0.2256258238031915,
+    "gbt_log_loss": 0.6313787609672735,
+    "sim_log_loss": 0.6423837769402296
+  },
+  "model_version": "sha-be7cdc2b96a607c1",
+  "model_path": "models/tennis_gbt_spike.cbm"
+}

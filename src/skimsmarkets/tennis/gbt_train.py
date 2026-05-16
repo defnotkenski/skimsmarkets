@@ -422,6 +422,7 @@ def train_and_evaluate(
     matches_df: pd.DataFrame,
     profiles_df: pd.DataFrame,
     *,
+    rankings_df: pd.DataFrame | None = None,
     train_cutoff: date = TRAIN_CUTOFF,
     skip_sim_compare: bool = False,
 ) -> TrainOutput:
@@ -431,8 +432,14 @@ def train_and_evaluate(
     comparison runs Monte Carlo across thousands of holdout rows
     which is the slow part of the trainer (~5-10 minutes for the
     spike's holdout).
+
+    `rankings_df` is forwarded to `build_training_table` so the new
+    rank-diff features get populated. None → train without rank
+    features (the model still trains; catboost handles NaN columns).
     """
-    table = build_training_table(matches_df, profiles_df)
+    table = build_training_table(
+        matches_df, profiles_df, rankings_df=rankings_df,
+    )
     rows = table.rows
     if rows.empty:
         raise RuntimeError(
@@ -548,13 +555,25 @@ def run_train_cli(*, features_only: bool, skip_sim_compare: bool) -> dict[str, A
         if PLAYER_PROFILES_PATH.exists()
         else pd.DataFrame()
     )
+    # Rankings history is opt-in: missing → train without the rank
+    # features (rank_diff / rank_points_diff land NaN, catboost skips
+    # them). Run `skims gbt rankings` to populate.
+    from skimsmarkets.tennis.gbt_rankings_backfill import (
+        RANKINGS_HISTORY_PATH,
+    )
+    rankings_df: pd.DataFrame | None = None
+    if RANKINGS_HISTORY_PATH.exists():
+        rankings_df = pd.read_parquet(RANKINGS_HISTORY_PATH)
     log.info(
-        "loaded backfill: %d matches, %d profiles",
+        "loaded backfill: %d matches, %d profiles, %d rankings rows",
         len(matches_df), len(profiles_df),
+        0 if rankings_df is None else len(rankings_df),
     )
 
     if features_only:
-        table = build_training_table(matches_df, profiles_df)
+        table = build_training_table(
+            matches_df, profiles_df, rankings_df=rankings_df,
+        )
         rows = table.rows
         log.info("feature-build smoke: %d rows ready, columns:", len(rows))
         for col in ALL_FEATURE_COLUMNS:
@@ -570,7 +589,11 @@ def run_train_cli(*, features_only: bool, skip_sim_compare: bool) -> dict[str, A
             "n_dropped_other": table.n_dropped_other,
         }
 
-    out = train_and_evaluate(matches_df, profiles_df, skip_sim_compare=skip_sim_compare)
+    out = train_and_evaluate(
+        matches_df, profiles_df,
+        rankings_df=rankings_df,
+        skip_sim_compare=skip_sim_compare,
+    )
     return out.metrics
 
 

@@ -260,17 +260,31 @@ def predict_for_event(event: PolymarketEvent) -> TennisGbtContext | None:
     # predict(A_anchor) + predict(B_anchor) drifts by up to ~0.07 on
     # 100 random pairs from the spike model. With it, the drift is
     # zero by construction.
+    # Rank values come straight off the live `TennisStatsContext`
+    # blocks the MatchStats provider populates at slate time. Live
+    # ranks are current-week snapshots (not point-in-time historical
+    # like the training path), but at prediction time "current rank"
+    # IS the point-in-time value, so the semantics are identical.
+    a_rank = stats.player_a.rank_singles
+    b_rank = stats.player_b.rank_singles
+    a_pts = stats.player_a.rank_points
+    b_pts = stats.player_b.rank_points
+
     feats_a = compute_features(
         anchor_history=h_a, opponent_history=h_b,
         anchor_id=p_a_id, opponent_id=p_b_id,
         on_date=on_date, surface=surface, tier=tier, best_of=best_of,
         anchor_birthdate=a_birth, opponent_birthdate=b_birth,
+        anchor_rank=a_rank, opponent_rank=b_rank,
+        anchor_rank_points=a_pts, opponent_rank_points=b_pts,
     )
     feats_b = compute_features(
         anchor_history=h_b, opponent_history=h_a,
         anchor_id=p_b_id, opponent_id=p_a_id,
         on_date=on_date, surface=surface, tier=tier, best_of=best_of,
         anchor_birthdate=b_birth, opponent_birthdate=a_birth,
+        anchor_rank=b_rank, opponent_rank=a_rank,
+        anchor_rank_points=b_pts, opponent_rank_points=a_pts,
     )
     pool_a = Pool(data=_features_dataframe(feats_a), cat_features=cat_idx)
     pool_b = Pool(data=_features_dataframe(feats_b), cat_features=cat_idx)
