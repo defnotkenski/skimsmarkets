@@ -1,0 +1,63 @@
+{
+  "run_at_utc": "2026-05-16T06:43:46.558108+00:00",
+  "params": {
+    "depth": 6,
+    "lr": 0.03,
+    "l2": 4.0,
+    "min_data_in_leaf": null,
+    "n_seeds": 5,
+    "val_days": 90
+  },
+  "val_cutoff": "2024-10-02",
+  "train_cutoff": "2024-12-31",
+  "n_train": 117568,
+  "n_val": 4630,
+  "n_holdout": 34968,
+  "per_seed": [
+    {
+      "seed": 42,
+      "holdout_brier": 0.21148954386609903,
+      "holdout_ll": 0.6103959976913955,
+      "holdout_auc": 0.7254392367678216,
+      "best_iter": 815
+    },
+    {
+      "seed": 43,
+      "holdout_brier": 0.21141552328910165,
+      "holdout_ll": 0.6103630399523425,
+      "holdout_auc": 0.7257355792197707,
+      "best_iter": 546
+    },
+    {
+      "seed": 44,
+      "holdout_brier": 0.21144250278528887,
+      "holdout_ll": 0.6103644444884846,
+      "holdout_auc": 0.7256503295283314,
+      "best_iter": 823
+    },
+    {
+      "seed": 45,
+      "holdout_brier": 0.21153027765308563,
+      "holdout_ll": 0.610590521670831,
+      "holdout_auc": 0.7253771543179316,
+      "best_iter": 706
+    },
+    {
+      "seed": 46,
+      "holdout_brier": 0.21146319668359786,
+      "holdout_ll": 0.6104612345457671,
+      "holdout_auc": 0.7256226838973893,
+      "best_iter": 599
+    }
+  ],
+  "bag": {
+    "holdout_brier": 0.2114007935820428,
+    "holdout_ll": 0.6102680385203566,
+    "holdout_auc": 0.7257564990884106
+  },
+  "bag_plus_isotonic": {
+    "holdout_brier": 0.21254308602156072,
+    "holdout_ll": 0.617207737538501,
+    "holdout_auc": 0.7257540161829692
+  }
+}

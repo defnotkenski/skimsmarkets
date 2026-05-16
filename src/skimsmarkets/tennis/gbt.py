@@ -32,6 +32,7 @@ from skimsmarkets.tennis.gbt_backfill import (
     PLAYER_PROFILES_PATH,
     RAW_MATCHES_PATH,
 )
+from skimsmarkets.tennis.gbt_rankings_backfill import RANKINGS_HISTORY_PATH
 from skimsmarkets.tennis.gbt_features import (
     ALL_FEATURE_COLUMNS,
     CATEGORICAL_FEATURE_COLUMNS,
@@ -94,7 +95,15 @@ class _ModelBundle:
         self.model = CatBoostClassifier()
         self.model.load_model(str(MODEL_PATH))
         matches_df = pd.read_parquet(RAW_MATCHES_PATH)
-        self.history = build_history_store(matches_df)
+        # Rankings is opt-in — when missing, schedule-strength feature
+        # lands NaN at slate time and catboost reads as missing. Same
+        # graceful-degrade discipline as the training path.
+        rankings_df = (
+            pd.read_parquet(RANKINGS_HISTORY_PATH)
+            if RANKINGS_HISTORY_PATH.exists()
+            else None
+        )
+        self.history = build_history_store(matches_df, rankings_df=rankings_df)
         self.model_mtime = MODEL_PATH.stat().st_mtime
         self.parquet_mtime = RAW_MATCHES_PATH.stat().st_mtime
         # Hash the artefact bytes so retro grading can detect retraining.
