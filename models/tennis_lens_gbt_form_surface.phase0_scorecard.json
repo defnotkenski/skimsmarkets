@@ -1,0 +1,137 @@
+{
+  "variant_label": "v1_first_cut",
+  "train_cutoff": "2024-12-31",
+  "train_n_augmented": 122198,
+  "holdout_n_augmented": 34968,
+  "holdout_n_single_direction": 17484,
+  "n_paired_with_algo": 17484,
+  "feature_columns": [
+    "last_n_winrate_diff",
+    "days_since_diff",
+    "age_diff",
+    "surface_first_serve_win_pct_diff",
+    "surface_record_diff",
+    "rank_diff",
+    "rank_points_diff",
+    "surface",
+    "tier",
+    "best_of"
+  ],
+  "feature_importance": {
+    "last_n_winrate_diff": 7.977972725830352,
+    "days_since_diff": 8.500826116697473,
+    "age_diff": 5.551512456589628,
+    "surface_first_serve_win_pct_diff": 14.114038356777693,
+    "surface_record_diff": 15.135122603861666,
+    "rank_diff": 15.128924407745924,
+    "rank_points_diff": 23.003692829633323,
+    "surface": 3.7706916389027856,
+    "tier": 6.817218863961189,
+    "best_of": 0.0
+  },
+  "brier": {
+    "algo_lens": 0.2252208206934315,
+    "full_gbt": 0.21667021360766242,
+    "per_lens_gbt": 0.21872841126226508,
+    "combined_5050": 0.21696611811169458,
+    "combined_fitted": 0.21666989340821055,
+    "combined_fitted_weight_on_per_lens": 0.0003665687179287021
+  },
+  "log_loss": {
+    "algo_lens": 0.6429898689853879,
+    "full_gbt": 0.6231391730194064,
+    "per_lens_gbt": 0.6278498534053407
+  },
+  "bucket_hit_rate": {
+    "algo_lens": {
+      "lock": {
+        "threshold": 0.75,
+        "n_high_confidence": 2824,
+        "n_correct": 2197,
+        "hit_rate": 0.7779745042492918,
+        "frac_of_holdout": 0.16151910318005033
+      },
+      "lean": {
+        "threshold": 0.6,
+        "n_high_confidence": 9811,
+        "n_correct": 6872,
+        "hit_rate": 0.7004382835592702,
+        "frac_of_holdout": 0.5611416151910318
+      }
+    },
+    "full_gbt": {
+      "lock": {
+        "threshold": 0.75,
+        "n_high_confidence": 1245,
+        "n_correct": 1081,
+        "hit_rate": 0.8682730923694779,
+        "frac_of_holdout": 0.0712079615648593
+      },
+      "lean": {
+        "threshold": 0.6,
+        "n_high_confidence": 8620,
+        "n_correct": 6436,
+        "hit_rate": 0.7466357308584687,
+        "frac_of_holdout": 0.4930221917181423
+      }
+    },
+    "per_lens_gbt": {
+      "lock": {
+        "threshold": 0.75,
+        "n_high_confidence": 826,
+        "n_correct": 724,
+        "hit_rate": 0.8765133171912833,
+        "frac_of_holdout": 0.047243193777167694
+      },
+      "lean": {
+        "threshold": 0.6,
+        "n_high_confidence": 7551,
+        "n_correct": 5685,
+        "hit_rate": 0.752880413190306,
+        "frac_of_holdout": 0.4318805765271105
+      }
+    }
+  },
+  "per_tour": {
+    "algo_lens": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.22745104894032847
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.22233515932228243
+      }
+    },
+    "full_gbt": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.2202158864023659
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.2120825167956228
+      }
+    },
+    "per_lens_gbt": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.22186196387979004
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.21467395102688974
+      }
+    }
+  },
+  "verdict": {
+    "primary_threshold_brier_lift": 0.002,
+    "co_primary_threshold_hit_rate_lift": 0.02,
+    "sanity_threshold_brier_lift_vs_algo": 0.002,
+    "sanity_passes": true,
+    "co_primary_passes_lock": true,
+    "co_primary_passes_lean": true,
+    "primary_passes_5050": false,
+    "primary_passes_fitted": false
+  }
+}

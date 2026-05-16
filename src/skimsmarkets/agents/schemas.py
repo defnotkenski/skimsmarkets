@@ -450,6 +450,22 @@ class MarketPrediction(BaseModel):
             "synthesis. See that field's description for usage."
         ),
     )
+    gbt_p_for_predicted_winner: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description=(
+            "The deterministic GBT prior's probability for the side the "
+            "director picked, oriented to `predicted_winner` (so direct "
+            "subtraction against `predicted_yes_probability` gives the "
+            "divergence signal — see `judge.py`). None when no GBT block "
+            "is attached to the event (cold-start: one player has <20 "
+            "prior matches) or the sport has no GBT prior. Surfaced to "
+            "the judge as a defensibility signal: |director - GBT| > 0.10 "
+            "flags the director's reasoning as materially diverging from "
+            "the best-calibrated point predictor in the system. Persisted "
+            "to JSONL so the retro layer can grade director-vs-GBT "
+            "agreement against actual outcomes."
+        ),
+    )
 
 
 class DefensibilityAssessment(BaseModel):

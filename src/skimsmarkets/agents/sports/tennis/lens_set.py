@@ -354,6 +354,13 @@ if cfg.ALGORITHMIC_LENSES_ENABLED:
         compute=compute_matchup_clutch_report,
     )
 else:
+    # Lazy import to avoid a circular dependency: deterministic_notebook
+    # is its own module that doesn't reach back into lens_set.
+    from skimsmarkets.agents.sports.tennis.deterministic_notebook import (
+        build_form_surface_deterministic_notebook,
+        build_matchup_clutch_deterministic_notebook,
+    )
+
     _form_spec = LensSpec(
         name="tennis_form_and_surface",
         fetcher_system_builder=tennis_form_and_surface_notebook_system,
@@ -362,6 +369,12 @@ else:
         render_extras=_render_tennis_form_extras,
         fetcher_sport_hint=_FETCHER_HINT_FORM_AND_SURFACE,
         reasoner_sport_hint=_REASONER_HINT_FORM_AND_SURFACE,
+        # Bypass-fetcher path: builder returns a placeholder LensNotebook
+        # when the structured tennis_stats block is rich (both players
+        # have rank + YTD + last-10 form + career serve rates + surface
+        # W-L for this match's surface). Gated at run time by
+        # `cfg.FETCHER_BYPASS_ON_RICH_DATA` in `pipeline._run_lenses`.
+        deterministic_notebook=build_form_surface_deterministic_notebook,
     )
     _matchup_spec = LensSpec(
         name="tennis_matchup_and_clutch",
@@ -371,6 +384,11 @@ else:
         render_extras=_render_tennis_matchup_extras,
         fetcher_sport_hint=_FETCHER_HINT_MATCHUP_AND_CLUTCH,
         reasoner_sport_hint=_REASONER_HINT_MATCHUP_AND_CLUTCH,
+        # Bypass-fetcher path: rich = handedness + career BP rates +
+        # at least one career clutch record (decider/tiebreak/comeback/
+        # close) per player AND a present head_to_head context (even
+        # zero-meeting H2H is informative). See deterministic_notebook.py.
+        deterministic_notebook=build_matchup_clutch_deterministic_notebook,
     )
 
 

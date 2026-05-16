@@ -141,6 +141,46 @@ FETCHER_PROVIDER = "grok"
 ALGORITHMIC_LENSES_ENABLED: bool = False
 
 
+# Tennis-only quality filter — drop tennis events whose structured
+# `tennis_stats` block lacks rich coverage for BOTH lenses
+# (form_and_surface AND matchup_and_clutch). Non-tennis events pass
+# through untouched. Applied AFTER `enrich_tennis_stats` runs (see
+# `pipeline.py:filter_rich_stats` stage), so the post-selection slate
+# can shrink below `MAX_SLATE_EVENTS` when many of the selected events
+# lack rich coverage — bump `MAX_SLATE_EVENTS` upward if you need a
+# fuller post-filter slate.
+#
+# Default True (user-flipped 2026-05-15) — only events with rich
+# structured coverage reach the LLM stage by default. CLI flag overrides
+# this constant when passed explicitly (`--require-rich-stats` /
+# `--no-require-rich-stats`); omitting the flag inherits this value.
+# Set False to revert to processing every selected tennis event
+# regardless of coverage.
+REQUIRE_RICH_STATS: bool = True
+
+
+# Fetcher-bypass switch for tennis lenses with rich structured data. When
+# True AND the lens spec carries a `deterministic_notebook` builder AND
+# the builder accepts the event (returns non-None), the pipeline SKIPS
+# the fetcher LLM Stage A call and runs the reasoner directly against a
+# deterministic placeholder notebook + the rendered structured block.
+# The reasoner has `code_execution` + `web_search` server-side tools
+# (always — independent of this flag) to fill any gap.
+#
+# Cost intent: ~50% LLM token cut per bypassed lens (fetcher call
+# eliminated; reasoner adds a small tool fee only if it actually uses
+# its tools). The deterministic_notebook builder's coverage threshold
+# decides which events qualify — thin-data events still take the LLM
+# fetcher path so cold-start / ITF coverage doesn't regress.
+#
+# Default True — user-flipped 2026-05-15 ahead of A/B comparison on
+# the bet that ~50% LLM cost cut outweighs the lens-prose loss. The
+# coverage gate keeps thin events on the LLM fetcher path automatically
+# so cold-start / ITF coverage doesn't regress. Set to False to roll
+# back to the legacy two-stage chain on every event.
+FETCHER_BYPASS_ON_RICH_DATA: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Kalshi execute module — venue config + safety defaults
 # ---------------------------------------------------------------------------

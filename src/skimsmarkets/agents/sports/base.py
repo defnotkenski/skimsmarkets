@@ -40,11 +40,14 @@ two breakpoints per director call, well within the Anthropic 4-cap.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from pydantic import BaseModel
 
 from skimsmarkets.polymarket.models import PolymarketEvent
+
+if TYPE_CHECKING:
+    from skimsmarkets.agents.schemas import LensNotebook
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,20 @@ class LensSpec:
     fetcher_sport_hint: str | None = None
     reasoner_sport_hint: str | None = None
     compute: Callable[[PolymarketEvent], BaseModel | None] | None = None
+    # Optional fetcher-bypass: when set AND `cfg.FETCHER_BYPASS_ON_RICH_DATA`
+    # is True AND the builder returns non-None for a given event, the
+    # pipeline skips the fetcher Stage A LLM call and runs the reasoner
+    # directly against the deterministic notebook + structured event
+    # context (the reasoner has `web_search` + `code_execution` tools
+    # to fill gaps when needed — see `agents/reasoners.py`).
+    # Returns None when the structured data is too thin for bypass — in
+    # that case the pipeline falls through to the LLM fetcher path. Only
+    # meaningful for LLM-mode specs; validated to be None for algorithmic
+    # specs (compute set) since those have no reasoner to consume the
+    # notebook.
+    deterministic_notebook: Callable[
+        [PolymarketEvent], "LensNotebook | None"
+    ] | None = None
 
     def __post_init__(self) -> None:
         if self.compute is not None:
@@ -77,6 +94,13 @@ class LensSpec:
                 raise ValueError(
                     f"LensSpec {self.name!r}: algorithmic specs (compute set) "
                     f"must leave fetcher_system_builder + reasoner_system as None."
+                )
+            if self.deterministic_notebook is not None:
+                raise ValueError(
+                    f"LensSpec {self.name!r}: algorithmic specs (compute set) "
+                    f"must leave deterministic_notebook as None — algorithmic "
+                    f"path skips the reasoner entirely so a notebook has nowhere "
+                    f"to go."
                 )
         else:
             if self.fetcher_system_builder is None or self.reasoner_system is None:

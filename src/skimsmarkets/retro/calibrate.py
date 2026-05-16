@@ -189,6 +189,37 @@ def _negative_edge_label(flag: bool | None) -> str:
     return "negative edge" if flag else "non-negative edge"
 
 
+# Thresholds mirror the judge rubric's three bands in `agents/judge.py`
+# (§5 GBT divergence). Same bands → cuts answer the question
+# "does the judge's divergence band correlate with director hit rate?"
+# A drop in hit-rate from `aligned` → `divergent` validates the
+# divergence-as-penalty design; a flat or inverted pattern would tell
+# us the divergence isn't actually informative on real outcomes.
+_GBT_DIVERGENCE_ORDER: list[str] = [
+    "aligned (|gap| <= 0.05)",
+    "moderate (0.05 < |gap| <= 0.10)",
+    "divergent (|gap| > 0.10)",
+    "no GBT prior",
+]
+
+
+def _gbt_divergence_label(gap: float | None) -> str:
+    """Map a signed gap (`team_a_p_final - gbt.p_team_a_wins`, team_a
+    frame) to one of the four bucket labels. The magnitude is what
+    matters for the cut; the sign is preserved in the row itself for
+    finer-grained analysis but isn't bucketed here (otherwise we'd
+    have 7 buckets which dilutes the per-bucket sample size).
+    """
+    if gap is None:
+        return "no GBT prior"
+    mag = abs(gap)
+    if mag <= 0.05:
+        return "aligned (|gap| <= 0.05)"
+    if mag <= 0.10:
+        return "moderate (0.05 < |gap| <= 0.10)"
+    return "divergent (|gap| > 0.10)"
+
+
 def _aggregate_one_cut(
     feats: Iterable[EventFeatures],
     name: str,
@@ -281,6 +312,20 @@ def aggregate(
                 "Negative-edge vs non-negative-edge pick",
                 list(_NEGATIVE_EDGE_ORDER),
                 lambda f: _negative_edge_label(f.negative_edge),
+            ),
+            # Director-vs-GBT divergence cut — settled-event hit-rate by
+            # the same three bands the judge penalizes against. Validates
+            # (or invalidates) the divergence-as-defensibility-signal
+            # design landed alongside Option 1 (GBT-as-baseline-anchor).
+            # `no GBT prior` carries the cold-start subset (sport without
+            # GBT, or tennis events below the 20-prior-match cold-start
+            # gate); kept as its own bucket so the "with GBT" cohort
+            # isn't diluted by the cohort the signal can't apply to.
+            _aggregate_one_cut(
+                scope,
+                "Director vs GBT divergence",
+                list(_GBT_DIVERGENCE_ORDER),
+                lambda f: _gbt_divergence_label(f.gap_to_gbt_signed),
             ),
         ]
 

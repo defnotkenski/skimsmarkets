@@ -1,0 +1,161 @@
+{
+  "variant_label": "matchup_clutch_v1_first_cut",
+  "train_cutoff": "2024-12-31",
+  "train_n_augmented": 122198,
+  "holdout_n_augmented": 34968,
+  "holdout_n_single_direction": 17484,
+  "n_paired_with_algo": 17484,
+  "feature_columns": [
+    "career_first_serve_in_pct_diff",
+    "career_first_serve_win_pct_diff",
+    "career_second_serve_win_pct_diff",
+    "career_first_serve_return_win_pct_diff",
+    "career_second_serve_return_win_pct_diff",
+    "career_bp_save_pct_diff",
+    "career_bp_convert_pct_diff",
+    "career_tiebreak_winrate_diff",
+    "career_decider_winrate_diff",
+    "career_comeback_winrate_diff",
+    "career_close_match_winrate_diff",
+    "h2h_advantage",
+    "n_h2h_priors",
+    "h2h_decider_advantage",
+    "n_h2h_decider_priors",
+    "h2h_tiebreak_advantage",
+    "n_h2h_tiebreak_priors",
+    "h2h_comeback_advantage",
+    "n_h2h_comeback_priors",
+    "h2h_close_match_advantage",
+    "n_h2h_close_match_priors",
+    "best_of"
+  ],
+  "feature_importance": {
+    "career_first_serve_in_pct_diff": 8.552473126272082,
+    "career_first_serve_win_pct_diff": 28.67867189414224,
+    "career_second_serve_win_pct_diff": 12.450541006288967,
+    "career_first_serve_return_win_pct_diff": 5.042945722558315,
+    "career_second_serve_return_win_pct_diff": 15.736725152124489,
+    "career_bp_save_pct_diff": 4.889030914063479,
+    "career_bp_convert_pct_diff": 1.642643487203712,
+    "career_tiebreak_winrate_diff": 1.4882667121374382,
+    "career_decider_winrate_diff": 0.0,
+    "career_comeback_winrate_diff": 6.409037502511165,
+    "career_close_match_winrate_diff": 2.8444880276841498,
+    "h2h_advantage": 4.126713009592438,
+    "n_h2h_priors": 1.3229622108391348,
+    "h2h_decider_advantage": 0.0,
+    "n_h2h_decider_priors": 0.0,
+    "h2h_tiebreak_advantage": 0.9467621866693946,
+    "n_h2h_tiebreak_priors": 1.2176062767990157,
+    "h2h_comeback_advantage": 1.0717017843132906,
+    "n_h2h_comeback_priors": 1.8813089909062215,
+    "h2h_close_match_advantage": 1.1172125521249743,
+    "n_h2h_close_match_priors": 0.5809094437695288,
+    "best_of": 0.0
+  },
+  "brier": {
+    "algo_lens": 0.22544029481612496,
+    "full_gbt": 0.21667021360766242,
+    "per_lens_gbt": 0.2224020830375463,
+    "combined_5050": 0.21889287013461425,
+    "combined_fitted": 0.216671371854804,
+    "combined_fitted_weight_on_per_lens": 0.0003665687179287021
+  },
+  "log_loss": {
+    "algo_lens": 0.6433920293130717,
+    "full_gbt": 0.6231391730194064,
+    "per_lens_gbt": 0.6354407923959254
+  },
+  "bucket_hit_rate": {
+    "algo_lens": {
+      "lock": {
+        "threshold": 0.75,
+        "n_high_confidence": 2853,
+        "n_correct": 2233,
+        "hit_rate": 0.7826848930949877,
+        "frac_of_holdout": 0.16317776252573782
+      },
+      "lean": {
+        "threshold": 0.6,
+        "n_high_confidence": 9767,
+        "n_correct": 6814,
+        "hit_rate": 0.6976553701238866,
+        "frac_of_holdout": 0.5586250285975749
+      }
+    },
+    "full_gbt": {
+      "lock": {
+        "threshold": 0.75,
+        "n_high_confidence": 1245,
+        "n_correct": 1081,
+        "hit_rate": 0.8682730923694779,
+        "frac_of_holdout": 0.0712079615648593
+      },
+      "lean": {
+        "threshold": 0.6,
+        "n_high_confidence": 8620,
+        "n_correct": 6436,
+        "hit_rate": 0.7466357308584687,
+        "frac_of_holdout": 0.4930221917181423
+      }
+    },
+    "per_lens_gbt": {
+      "lock": {
+        "threshold": 0.75,
+        "n_high_confidence": 1339,
+        "n_correct": 1110,
+        "hit_rate": 0.8289768483943242,
+        "frac_of_holdout": 0.0765843056508808
+      },
+      "lean": {
+        "threshold": 0.6,
+        "n_high_confidence": 8516,
+        "n_correct": 6129,
+        "hit_rate": 0.719704086425552,
+        "frac_of_holdout": 0.48707389613360785
+      }
+    }
+  },
+  "per_tour": {
+    "algo_lens": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.22739446004716207
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.2229118275492019
+      }
+    },
+    "full_gbt": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.2202158864023659
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.2120825167956228
+      }
+    },
+    "per_lens_gbt": {
+      "atp": {
+        "n": 9862,
+        "brier": 0.22569965354873606
+      },
+      "wta": {
+        "n": 7622,
+        "brier": 0.21813540232626924
+      }
+    }
+  },
+  "verdict": {
+    "primary_threshold_brier_lift": 0.002,
+    "co_primary_threshold_hit_rate_lift": 0.02,
+    "sanity_threshold_brier_lift_vs_algo": 0.002,
+    "sanity_passes": true,
+    "co_primary_passes_lock": true,
+    "co_primary_passes_lean": true,
+    "primary_passes_5050": false,
+    "primary_passes_fitted": false
+  }
+}

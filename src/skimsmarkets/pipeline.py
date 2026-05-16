@@ -30,6 +30,9 @@ from skimsmarkets.agents.schemas import (
 from skimsmarkets.agents.sports._director_shared import PROMPT_VERSION
 from skimsmarkets.agents.sports import resolve_lens_set
 from skimsmarkets.agents.sports.base import LensSet, LensSpec
+from skimsmarkets.agents.sports.tennis.deterministic_notebook import (
+    is_tennis_event_rich_coverage,
+)
 from skimsmarkets.calibration import apply_temperature, load_temperature
 from skimsmarkets.classify import classify_risk
 from skimsmarkets.progress import ProgressReporter
@@ -936,15 +939,43 @@ async def _run_lenses(
                 coverage="thin",
             )
             return _LensOutcome(lens=lens, notebook=notebook, report=report)
-        try:
-            async with fetcher_sem:
-                with _time_stage(per_event_timings, f"fetcher:{lens}"):
-                    notebook = await provider.fetch(
-                        event, lens, lens_set=lens_set,
-                        token_sink=per_event_tokens,
-                    )
-        except Exception as e:  # noqa: BLE001
-            return _LensOutcome(lens=lens, error_stage="fetcher", error=e)
+
+        # Fetcher-bypass path — when the lens has a deterministic_notebook
+        # builder AND the flag is on AND the builder accepts this event
+        # (rich coverage), skip the fetcher LLM call and go straight to
+        # the reasoner (which has web_search + code_execution tools to
+        # fill any residual gap, see agents/reasoners.py).
+        bypass_notebook: LensNotebook | None = None
+        if (
+            cfg.FETCHER_BYPASS_ON_RICH_DATA
+            and spec.deterministic_notebook is not None
+        ):
+            try:
+                with _time_stage(per_event_timings, f"bypass_check:{lens}"):
+                    bypass_notebook = spec.deterministic_notebook(event)
+            except Exception:  # noqa: BLE001
+                # Coverage check itself shouldn't fail per-event; if it
+                # does, log and fall through to the fetcher path rather
+                # than dropping the event.
+                log.exception(
+                    "deterministic_notebook builder crashed for lens=%s event=%s — "
+                    "falling through to fetcher path",
+                    lens, event.id,
+                )
+                bypass_notebook = None
+
+        if bypass_notebook is not None:
+            notebook = bypass_notebook
+        else:
+            try:
+                async with fetcher_sem:
+                    with _time_stage(per_event_timings, f"fetcher:{lens}"):
+                        notebook = await provider.fetch(
+                            event, lens, lens_set=lens_set,
+                            token_sink=per_event_tokens,
+                        )
+            except Exception as e:  # noqa: BLE001
+                return _LensOutcome(lens=lens, error_stage="fetcher", error=e)
         try:
             async with reasoner_sem:
                 with _time_stage(per_event_timings, f"reasoner:{lens}"):
@@ -1710,6 +1741,7 @@ async def run_pipeline(
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
     tennis_stats_disabled: bool = False,
+    require_rich_stats: bool = False,
     progress: ProgressReporter | None = None,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon,
@@ -1962,6 +1994,28 @@ async def run_pipeline(
             await enrich_tennis_stats(
                 tennis_provider, events, tennis_sem, result.errors
             )
+        # Opt-in quality filter: when `--require-rich-stats` is set,
+        # drop tennis events whose structured tennis_stats block lacks
+        # rich coverage for BOTH lenses (form_and_surface AND
+        # matchup_and_clutch). Non-tennis events pass through unchanged.
+        # Runs immediately after `enrich_tennis_stats` so the dropped
+        # events don't pay the pure-CPU sim + GBT costs downstream. The
+        # selector ran earlier capped to MAX_SLATE_EVENTS — this filter
+        # can shrink the slate further; document in `--require-rich-stats`
+        # help text that the user should bump MAX_SLATE_EVENTS if they
+        # need a fuller post-filter slate.
+        if require_rich_stats:
+            with _time_stage(stage_timings, "filter_rich_stats"):
+                pre_n = len(events)
+                events = [e for e in events if is_tennis_event_rich_coverage(e)]
+                dropped = pre_n - len(events)
+                log.info(
+                    "rich-stats filter: dropped %d/%d, %d remain",
+                    dropped, pre_n, len(events),
+                )
+                # Keep `considered_events` in sync — downstream reporting
+                # reads this to show "slate size after pre-LLM gates."
+                result.considered_events = len(events)
         # Career-baseline Monte Carlo sim — pure CPU on the inputs
         # `enrich_tennis_stats` just attached. Director-only feed, so
         # this MUST run before the lens chain so the director's

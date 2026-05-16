@@ -1,0 +1,78 @@
+{
+  "n_holdout": 17484,
+  "n_train": 61099,
+  "corr_train": 0.7853652801380658,
+  "corr_holdout": 0.808168882825966,
+  "fitted_weight_on_algo": 0.0003665687179287021,
+  "brier": {
+    "algo_lens": 0.22515416980016237,
+    "full_gbt": 0.21667021360766242,
+    "combined_5050": 0.21832125969757452,
+    "combined_fitted": 0.21666952593471298
+  },
+  "primary_threshold_brier_lift": 0.002,
+  "primary_passes_5050": false,
+  "primary_passes_fitted": false,
+  "bucket_hit_rate": {
+    "lock": {
+      "algo_lens": {
+        "threshold": 0.75,
+        "n_high_confidence": 2886,
+        "n_correct": 2257,
+        "hit_rate": 0.782051282051282,
+        "frac_of_holdout": 0.16506520247083048
+      },
+      "full_gbt": {
+        "threshold": 0.75,
+        "n_high_confidence": 1245,
+        "n_correct": 1081,
+        "hit_rate": 0.8682730923694779,
+        "frac_of_holdout": 0.0712079615648593
+      },
+      "combined_5050": {
+        "threshold": 0.75,
+        "n_high_confidence": 1702,
+        "n_correct": 1419,
+        "hit_rate": 0.8337250293772033,
+        "frac_of_holdout": 0.09734614504690002
+      },
+      "combined_fitted": {
+        "threshold": 0.75,
+        "n_high_confidence": 1245,
+        "n_correct": 1081,
+        "hit_rate": 0.8682730923694779,
+        "frac_of_holdout": 0.0712079615648593
+      }
+    },
+    "lean": {
+      "algo_lens": {
+        "threshold": 0.6,
+        "n_high_confidence": 9794,
+        "n_correct": 6802,
+        "hit_rate": 0.6945068409230141,
+        "frac_of_holdout": 0.5601692976435598
+      },
+      "full_gbt": {
+        "threshold": 0.6,
+        "n_high_confidence": 8620,
+        "n_correct": 6436,
+        "hit_rate": 0.7466357308584687,
+        "frac_of_holdout": 0.4930221917181423
+      },
+      "combined_5050": {
+        "threshold": 0.6,
+        "n_high_confidence": 8961,
+        "n_correct": 6546,
+        "hit_rate": 0.7304988282557751,
+        "frac_of_holdout": 0.512525737817433
+      },
+      "combined_fitted": {
+        "threshold": 0.6,
+        "n_high_confidence": 8619,
+        "n_correct": 6436,
+        "hit_rate": 0.746722357582086,
+        "frac_of_holdout": 0.492964996568291
+      }
+    }
+  }
+}

@@ -185,6 +185,11 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
             slugs=opts.slugs or None,
             sports=opts.sports or None,
             tennis_stats_disabled=args.no_tennis_stats,
+            require_rich_stats=(
+                args.require_rich_stats
+                if args.require_rich_stats is not None
+                else cfg.REQUIRE_RICH_STATS
+            ),
             progress=progress,
         )
     print_run_summary(result, console=_CONSOLE)
@@ -663,6 +668,24 @@ def _build_slate_parser() -> argparse.ArgumentParser:
             f"books often open at $0/$0 OI. Set to 0 to disable. "
             f"Defaults to ${cfg.MIN_OPEN_INTEREST_DOLLARS:.0f} from "
             f"config.py."
+        ),
+    )
+    p.add_argument(
+        "--require-rich-stats",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            f"Tennis-only quality filter — drop tennis events where the "
+            f"structured MatchStats `tennis_stats` block lacks rich "
+            f"coverage for BOTH lenses (form_and_surface AND "
+            f"matchup_and_clutch). Non-tennis events pass through "
+            f"untouched. Applied AFTER `enrich_tennis_stats` runs, so "
+            f"the post-selection slate can shrink below `MAX_SLATE_EVENTS` "
+            f"when many of the selected events lack rich coverage — "
+            f"bump MAX_SLATE_EVENTS upward if you need a fuller slate. "
+            f"rank-only flag (not applied in `skims fetch`). "
+            f"Defaults to {cfg.REQUIRE_RICH_STATS} from config.py; pass "
+            f"`--require-rich-stats` / `--no-require-rich-stats` to override."
         ),
     )
     p.add_argument(

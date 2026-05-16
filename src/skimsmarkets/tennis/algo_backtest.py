@@ -79,6 +79,24 @@ class BacktestResult:
     n_dropped_other: int
     train_cutoff: str
     algo_version: str
+    # Per-row holdout tuples — exposed for downstream harnesses (lens-
+    # GBT backtest) that need to align algo predictions row-for-row
+    # with GBT predictions on the same matches. Tuple shape:
+    # (pred, anchor_won, surface, tour, match_id, anchor_id).
+    # Empty list when the harness was run without populating them
+    # (older call sites). The CLI scorecard sidecar doesn't serialize
+    # this — it's only useful in-process.
+    holdout_predictions: list[tuple[float, int, str | None, str, int, int]] = field(
+        default_factory=list
+    )
+    # Per-row TRAIN tuples — exposed for harnesses that fit a
+    # combination weight on the train fold (e.g. checking whether the
+    # algo lens itself adds info over the full-feature GBT via the
+    # same PRIMARY test the per-lens GBT was evaluated against). Same
+    # tuple shape as holdout_predictions.
+    train_predictions: list[tuple[float, int, str | None, str, int, int]] = field(
+        default_factory=list
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +288,15 @@ def run_backtest(
     store = HistoryStore()
     train: list[tuple[float, int, str | None, str]] = []  # (pred, label, surface, tour)
     holdout: list[tuple[float, int, str | None, str]] = []
+    # Per-row holdout tuples with match_id + anchor_id so downstream
+    # harnesses can align by (match_id, anchor_id) — the GBT's
+    # augmented holdout carries both anchor orientations per match,
+    # and joining on this pair is the unambiguous way to keep the
+    # comparison row-for-row.
+    holdout_rows: list[tuple[float, int, str | None, str, int, int]] = []
+    # Per-row TRAIN tuples — same shape — for harnesses that fit a
+    # combination weight on the train fold.
+    train_rows: list[tuple[float, int, str | None, str, int, int]] = []
     n_cold = 0
     n_other = 0
     n_processed = 0
@@ -355,6 +382,13 @@ def run_backtest(
 
         bucket = train if on_date <= train_cutoff else holdout
         bucket.append((pred, anchor_won, surface, tour))
+        mid = _row_get_int(row, "match_id")
+        if mid is not None:
+            row_tuple = (pred, anchor_won, surface, tour, mid, anchor)
+            if on_date > train_cutoff:
+                holdout_rows.append(row_tuple)
+            else:
+                train_rows.append(row_tuple)
 
         # Fold AFTER snapshot.
         _add_match_from_row(store, row)
@@ -387,6 +421,8 @@ def run_backtest(
         n_dropped_other=n_other,
         train_cutoff=train_cutoff.isoformat(),
         algo_version=algo_version,
+        holdout_predictions=holdout_rows,
+        train_predictions=train_rows,
     )
 
 

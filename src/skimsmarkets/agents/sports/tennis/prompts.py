@@ -239,17 +239,39 @@ You receive (a) the same event context the fetcher saw and (b) a `LensNotebook`
 produced by the fetcher. Read both, then emit the typed report per the schema
 you've been given.
 
+Tools available — use SPARINGLY, only when the notebook leaves a load-bearing
+gap. Each tool call costs real money and adds latency; default to NOT using
+them when the notebook + event context are sufficient.
+
+- web_search: pull a qualitative signal the notebook is missing AND that
+  the structured tennis_stats block doesn't cover — e.g. loss color (was
+  the recent 6-3 6-2 a clean win or a tight scrap?), training-block
+  reports, surface-trajectory commentary, late-breaking withdrawal news.
+  DO NOT re-search numbers the structured block or notebook already
+  provide. Cap: 3 uses per call (enforced server-side).
+- code_execution: validate or compute a load-bearing number — binomial
+  CI on a small-sample H2H rate, recency-weighted Elo from recent_matches,
+  alternative baseline candidates. Use when the notebook's number is
+  thin-sample (denominator <10) OR when no `computed_numbers` covers
+  the figure your prose needs.
+
+When you DO use a tool, mention what you found in `key_form_facts` /
+`key_matchup_facts` / equivalent — the director's defensibility check needs
+to see the evidence chain.
+
 Rules:
 - `team_a_name` and `team_b_name` come from the EVENT CONTEXT (canonical).
   If the notebook echoes them differently, trust the event context.
 - `team_a` is the reference side named in the event context. Positive signed
   shifts push the synthesized probability TOWARD team_a; negative shifts push
   it TOWARD team_b. Apply this convention without exception.
-- Use `notebook.computed_numbers` AS-IS. They were derived deterministically
-  by the fetcher's `code_execution`. Do not recompute the math; pick the
-  most defensible value and explain the choice in your prose fields.
+- Use `notebook.computed_numbers` AS-IS when present. They were derived
+  deterministically by the fetcher's `code_execution`. Do not recompute the
+  math; pick the most defensible value and explain the choice in your prose
+  fields.
 - If `notebook.coverage == 'thin'`, set `confidence='low'` and call out
-  what's missing in `caveats`.
+  what's missing in `caveats`. This is also the regime where a targeted
+  web_search or code_execution call may be worth the cost.
 - LIVE events: when the event context's `Game state` shows `LIVE`, weight
   the in-play state (set score, current break, retirement risk if visible)
   above pre-match baselines.
@@ -263,12 +285,20 @@ form-and-surface fetcher and emit a `TennisFormSurfaceReport`.
 Fields you OWN (verdict — derive from notebook + event context):
 - `team_a_win_probability` — your best estimate of the BASELINE probability
   team_a wins ABSENT matchup adjustments and ABSENT match-day conditions /
-  stakes. The director will stack the other five signed shifts on top of
-  this baseline. Don't pre-bake H2H, court conditions, fatigue, or stakes —
-  those are owned by the matchup and conditions lenses. Anchor on the
-  computed candidates from the notebook (e.g. ranking-implied,
-  surface-Elo-implied, recent-form-weighted) and the surface-conditioned
-  tier records.
+  stakes. ADVISORY ONLY when the event context carries a `--- Tennis GBT
+  prior ---` block: the director will use the GBT's `p(team_a wins)` as
+  the stacking-math anchor (it's the best-calibrated baseline in the
+  system, holdout Brier 0.21667). Your number is read as a cross-check —
+  meaningful divergence from the GBT (>10pp) is itself a data-quality
+  flag the director surfaces. Still produce your best estimate (the
+  cross-check is informative), but don't over-invest in micro-tuning.
+  When NO GBT block is present (cold-start: one player has <20 prior
+  matches), the director falls back to your baseline as the anchor — in
+  that case it IS load-bearing. Don't pre-bake H2H, court conditions,
+  fatigue, or stakes — those are owned by the matchup and conditions
+  lenses. Anchor on the computed candidates from the notebook (e.g.
+  ranking-implied, surface-Elo-implied, recent-form-weighted) and the
+  surface-conditioned tier records.
 - `form_signed_shift` — bound `[-0.15, +0.15]`, positive = toward team_a.
   Drives off form quality (last_10_form, recent_matches with loss color,
   ytd_win_loss, training-block disruptions). Magnitude scales with how
@@ -482,7 +512,21 @@ Sign convention: ALL six signed shifts are positive-toward-team_a.
 
 Synthesis stacking math — apply EXACTLY this composition:
 
-    baseline = TennisFormSurfaceReport.team_a_win_probability
+    # Baseline anchor — GBT prior when present, form lens baseline only
+    # as fallback. The GBT (tennis_gbt_spike) is the best calibrated
+    # point estimate in the system (holdout Brier 0.21667 vs form lens
+    # algo 0.22515); empirically validated to dominate every other
+    # baseline candidate at LOCK/LEAN bucket-hit-rate too. The form
+    # lens's `team_a_win_probability` is retained as ADVISORY only —
+    # use it as a sanity-check (significant divergence between the
+    # form lens baseline and the GBT baseline is itself a data-quality
+    # signal worth noting in `reasoning`), but it is NOT the anchor.
+    if tennis_gbt block is present:
+        baseline = tennis_gbt.p_team_a_wins
+    else:
+        # Cold-start path: at least one player has <20 prior matches so
+        # the GBT couldn't predict. Fall back to the form lens baseline.
+        baseline = TennisFormSurfaceReport.team_a_win_probability
 
     shift_total = (
         form_signed_shift              # tennis_form_and_surface
@@ -598,38 +642,54 @@ Use it as a sanity check on the synthesized read:
   from the lens reports alone — same posture as before this
   enrichment shipped.
 
-Gradient-boosted-tree prior (when present): the per-event context
-block may carry a `--- Tennis GBT prior ---` block with `p(team_a
-wins)`, prior-match counts per side, and a top-N feature contribution
-list. This is a SECOND deterministic prior alongside the iid sim,
-computed from a catboost model trained on point-in-time aggregated
-career rates + surface splits + recent form + age + H2H.
-Use it together with the sim as the deterministic backstop:
-- The GBT and the sim read the same upstream career rates; they
-  diverge when surface/form/age interactions matter. A material
-  GBT-vs-sim spread is itself a signal — the GBT thinks the
-  contextual deltas the sim ignores point one way.
-- If team_a_p_final deviates from the GBT by ≥1000 bps (10pp),
-  `reasoning` MUST name WHICH lens-shift signals justify the
-  deviation — citing the shift FIELD name and VALUE (e.g.
-  `surface_signed_shift = +0.06`), not a free-text gesture toward
-  the lens generically. At least one cited shift must have magnitude
-  ≥ 0.05 — a 10pp deviation cannot be carried by a stack of
-  sub-0.02 shifts. Same shift-citation discipline as the material-
-  deviation rule above.
+Gradient-boosted-tree prior — THIS IS YOUR BASELINE ANCHOR.
+
+The per-event context block may carry a `--- Tennis GBT prior ---`
+block with `p(team_a wins)`, prior-match counts per side, and a top-N
+feature contribution list. This is the catboost model trained on
+point-in-time aggregated career rates + surface splits + recent form
++ age + H2H, holdout Brier 0.21667 — empirically the best calibrated
+point predictor in the system. As of 2026-05-15 it is the BASELINE
+ANCHOR for the stacking math above, not just a sanity check.
+
+How to use it:
+- Read `p(team_a wins)` from the GBT block and use it as `baseline`
+  in the stacking math. Lens shifts stack on top of it. Your
+  synthesised `team_a_p_final = gbt_p + shift_total` (clipped).
+- Because shifts are bounded (form ±0.15, surface ±0.10, h2h ±0.15,
+  clutch ±0.10, physical ±0.15, stakes ±0.10 = max ±0.75), the
+  absolute deviation `|team_a_p_final - gbt_p|` IS `|shift_total|`.
+  If your `shift_total` exceeds 10pp (|±0.10|), your `reasoning`
+  MUST name WHICH shifts produced it AND explain why those shifts
+  overcome the GBT's reading — citing the shift FIELD name and VALUE
+  (e.g. `surface_signed_shift = +0.06`), not a free-text gesture
+  toward the lens generically. At least one cited shift must have
+  magnitude ≥ 0.05 — a 10pp deviation cannot be carried by a stack
+  of sub-0.02 shifts.
 - The GBT's `top_features` list shows what the model leaned on for
-  THIS prediction (per-row SHAP, anchor-relative). Read it as a
-  sanity check: if the model's top contributor is
-  `surface_first_serve_win_pct_diff` and your synthesis didn't move
-  on surface, your read may be missing what the historical evidence
-  emphasises.
+  THIS prediction (per-row SHAP, anchor-relative). Use it to
+  pre-flight lens shifts: if the model's top contributor is
+  `surface_first_serve_win_pct_diff` and your `surface_signed_shift`
+  is 0.0, you're either ignoring something the historical evidence
+  emphasises OR the surface lens already incorporated it (read its
+  reasoning to confirm).
 - Cold-start gate (≥ 20 prior matches per side): when one side is a
   qualifier or comeback player below the gate, the GBT block is
-  absent. Synthesize from the sim + lenses alone, same posture
-  as the sim's own gate failing.
+  ABSENT. Fall back to `TennisFormSurfaceReport.team_a_win_probability`
+  as the baseline (the explicit cold-start branch in the stacking
+  math). Same posture as before the GBT-as-anchor change shipped.
 - The GBT model_version stamps which artefact produced the number.
   Retro grading uses it to detect retraining boundaries; you can
   ignore it during synthesis.
+
+Form lens baseline as a cross-check: when the GBT IS present, the
+form lens's `team_a_win_probability` is ADVISORY. If `|form_lens_baseline
+- gbt_p| > 0.10`, that's a data-quality flag — the LLM lens read the
+structured data and reached a meaningfully different baseline than the
+catboost model trained on the same parquet. Note this in `reasoning`
+("form lens baseline 0.62 vs GBT 0.48 — divergence suggests [hypothesis]")
+but still use GBT as the anchor. The form lens baseline is NEVER the
+anchor when GBT is present.
 
 Per-lens weighting heuristics (for `specialist_weights`):
 - Most ATP/WTA singles matches: form_and_surface dominates (~0.40-0.50),

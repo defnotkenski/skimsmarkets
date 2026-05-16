@@ -12,6 +12,7 @@ from anthropic.types import (
 )
 from pydantic import BaseModel, ValidationError
 
+from skimsmarkets.agents.fetchers.base import pick_team_a_market
 from skimsmarkets.agents.schemas import EventPrediction, MarketPrediction, TokenUsage
 from skimsmarkets.agents.sport_hints import render_director_sport_hint
 from skimsmarkets.agents.sports import DIRECTOR_SHARED_PREAMBLE
@@ -168,6 +169,43 @@ def _find_market_for_winner(
     return None
 
 
+def _gbt_p_for_predicted_winner(
+    event: PolymarketEvent, predicted_winner: str
+) -> float | None:
+    """Orient the tennis_gbt prediction to the side the director picked.
+
+    The GBT emits `p_team_a_wins` where team_a is the Polymarket favorite
+    (highest yes_implied_probability). When the director picks team_a,
+    the comparable probability is `p_team_a_wins`; when the director
+    picks the underdog, it's `1 - p_team_a_wins`. The result is the
+    GBT's belief about the SAME side `predicted_yes_probability` refers
+    to, so the judge can subtract directly to compute divergence.
+
+    Returns None when:
+      - No GBT block attached (cold-start: <20 prior matches per side,
+        or non-tennis event with no GBT prior populated)
+      - team_a market can't be resolved (no labeled sides with implied
+        probabilities)
+
+    Currently tennis-only (we only attach `event.tennis_gbt`); other
+    sports may grow analogous priors later. The MarketPrediction field
+    is named sport-agnostically (`gbt_p_for_predicted_winner`) so this
+    helper is the only place the tennis_gbt knowledge lives.
+    """
+    if event.tennis_gbt is None:
+        return None
+    team_a_market = pick_team_a_market(event)
+    if team_a_market is None or team_a_market.yes_sub_title is None:
+        return None
+    if (
+        predicted_winner.strip().lower()
+        == team_a_market.yes_sub_title.strip().lower()
+    ):
+        return event.tennis_gbt.p_team_a_wins
+    # Underdog pick — binary-market assumption (tennis is always H2H).
+    return 1.0 - event.tennis_gbt.p_team_a_wins
+
+
 def _project_to_market_prediction(
     event: PolymarketEvent,
     winner_market: PolymarketMarket,
@@ -199,6 +237,14 @@ def _project_to_market_prediction(
         disagreements_flagged=event_pred.disagreements_flagged,
         uw_flow_note=event_pred.uw_flow_note,
         retracted_shifts=event_pred.retracted_shifts,
+        # GBT prior oriented to predicted_winner — the judge subtracts
+        # this from `predicted_yes_probability` to compute divergence
+        # (the case-defensibility signal the GBT-as-baseline-anchor
+        # design uses to catch director reads that materially diverge
+        # from the best-calibrated point predictor in the system).
+        gbt_p_for_predicted_winner=_gbt_p_for_predicted_winner(
+            event, event_pred.predicted_winner
+        ),
     )
 
 

@@ -26,10 +26,12 @@ import logging
 from anthropic import AsyncAnthropic
 from anthropic.types import (
     CacheControlEphemeralParam,
+    CodeExecutionTool20260120Param,
     MessageParam,
     OutputConfigParam,
     TextBlockParam,
     ThinkingConfigAdaptiveParam,
+    WebSearchTool20260209Param,
 )
 from pydantic import BaseModel, ValidationError
 
@@ -44,6 +46,38 @@ from skimsmarkets.agents.sports.base import LensSpec
 from skimsmarkets.polymarket.models import PolymarketEvent
 
 log = logging.getLogger(__name__)
+
+
+# Server-side tools available to every reasoner call. Anthropic
+# executes both internally and returns the final structured output —
+# no client-side tool loop required, the `messages.parse` flow handles
+# the round-trips transparently.
+#
+# `code_execution` lets the reasoner validate or compute load-bearing
+# numbers (binomial CIs on small-sample H2H, recency-weighted baselines)
+# without depending on the fetcher's `computed_numbers`. Critical for
+# the fetcher-bypass path where the reasoner runs on a deterministic
+# notebook built from structured `tennis_stats` and may want to derive
+# alternative baselines itself.
+#
+# `web_search` is the qualitative-context escape hatch — loss color,
+# training-block reports, tactical commentary that the structured
+# data block doesn't cover. `max_uses=3` caps cost (each search has a
+# per-request fee) while leaving enough budget for a couple of
+# targeted lookups when the notebook flags `coverage='thin'`.
+_CODE_EXEC_TOOL: CodeExecutionTool20260120Param = {
+    "name": "code_execution",
+    "type": "code_execution_20260120",
+}
+_WEB_SEARCH_TOOL: WebSearchTool20260209Param = {
+    "name": "web_search",
+    "type": "web_search_20260209",
+    "max_uses": 3,
+}
+_REASONER_TOOLS: list[CodeExecutionTool20260120Param | WebSearchTool20260209Param] = [
+    _CODE_EXEC_TOOL,
+    _WEB_SEARCH_TOOL,
+]
 
 
 async def run_reasoner(
@@ -108,6 +142,12 @@ async def run_reasoner(
                 output_format=spec.report_schema,
                 thinking=ThinkingConfigAdaptiveParam(type="adaptive"),
                 output_config=OutputConfigParam(effort="max"),
+                # Server-side tools — Anthropic handles the internal
+                # turn loop and returns the final structured output.
+                # The reasoner uses these sparingly per the system
+                # prompt's guidance (only when notebook is thin or a
+                # load-bearing number needs validation).
+                tools=_REASONER_TOOLS,
             )
             report = parsed.parsed_output
             if report is None:

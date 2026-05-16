@@ -111,6 +111,34 @@ Rubric — judge each event against these signals (in roughly this priority):
    is fragile; penalize. Diffuse weights — no lens above ~1.4× equal
    share — mean removing any one input wouldn't flip the call; boost.
 
+5. GBT divergence (when present). `gbt_prior_p_for_predicted_winner` is
+   the deterministic GBT model's belief about the SAME side the director
+   picked (oriented to predicted_winner so subtraction is direct). The
+   GBT is the best-calibrated point predictor in the system (holdout
+   Brier 0.21667, dominates LOCK/LEAN bucket-hit-rate) and serves as the
+   stacking-math BASELINE ANCHOR in tennis. `gbt_divergence` is
+   `|predicted_yes_probability - gbt_prior_p_for_predicted_winner|`. Use
+   it as a defensibility signal:
+   - `gbt_divergence ≤ 0.05` — director's stack barely moved off the GBT
+     anchor; strong corroboration unless the reasoning provides a clear
+     mechanism for moving. Neutral-to-boost.
+   - `0.05 < gbt_divergence ≤ 0.10` — meaningful stacked shifts; check
+     that `reasoning` names which shifts produced the deviation. Neutral
+     when shifts are well-justified.
+   - `gbt_divergence > 0.10` — material divergence from the empirically-
+     best point predictor. The director's reasoning MUST name the
+     specific shift(s) that overcome the GBT's reading per the tennis
+     director tail. If reasoning fails to name a concrete mechanism
+     (e.g. "the matchup lens shows X" without citing the shift field +
+     value), penalize and flag `gbt_divergence_unsupported`. If the
+     reasoning DOES name a concrete mechanism, this is a high-conviction
+     read that the director earned — don't penalize the divergence
+     itself, just verify the mechanism is concrete (not gestural).
+   When `gbt_prior_p_for_predicted_winner` is null (cold-start: one
+   player has <20 prior matches, GBT couldn't predict), this signal is
+   absent — don't penalize and don't boost on this axis; the director
+   fell back to the form lens baseline by design.
+
 Output, per event in the input batch:
 - `event_id` — copy verbatim from the event you're scoring.
 - `defensibility_score` — float in [0,1], higher = stronger case.
@@ -123,12 +151,13 @@ Output, per event in the input batch:
 - `defensibility_flags` — up to 3 short snake_case slugs naming the
   specific weaknesses present. Use the vocabulary below; coin a new flag
   only when none fits. Empty list when the case is clean.
-    * `thin_reasoning`        — reasoning prose doesn't support the confidence tier
-    * `lens_disagreement`     — disagreements_flagged is non-empty
-    * `uw_contra`             — uw_flow_note explicitly diverges from predicted_winner
-    * `concentrated_weights`  — one specialist_weight > 0.6
-    * `low_confidence_tier`   — director self-reported confidence='low' (a single common contingency flips the pick) AND reasoning doesn't name a clear contingency-survival case
-    * `live_volatility`       — reasoning mentions LIVE/in-play state with rapidly-changing context
+    * `thin_reasoning`             — reasoning prose doesn't support the confidence tier
+    * `lens_disagreement`          — disagreements_flagged is non-empty
+    * `uw_contra`                  — uw_flow_note explicitly diverges from predicted_winner
+    * `concentrated_weights`       — one specialist_weight > 0.6
+    * `low_confidence_tier`        — director self-reported confidence='low' (a single common contingency flips the pick) AND reasoning doesn't name a clear contingency-survival case
+    * `live_volatility`            — reasoning mentions LIVE/in-play state with rapidly-changing context
+    * `gbt_divergence_unsupported` — gbt_divergence > 0.10 AND reasoning does NOT name a concrete shift+mechanism that overcomes the GBT's reading (per rubric §5)
 
 Cover EVERY event in the batch — return one assessment per input event,
 keyed by `event_id`. Do not skip events. If an event's record is too sparse
@@ -160,6 +189,12 @@ def _render_event_block(p: MarketPrediction) -> str:
     evidence (notebooks, specialist reports) and the market price are
     intentionally omitted — the judge scores the *case* on internal
     soundness alone, blind to the market like every other LLM stage.
+
+    The `gbt_prior_p_for_predicted_winner` + `gbt_divergence` lines are
+    shown when the GBT prior was attached (tennis events past the
+    cold-start gate). The director's stacking math anchors on this
+    GBT prediction; significant `|director - GBT|` divergence is a
+    case-defensibility signal the judge weighs per the rubric.
     """
     title = p.event_title or p.event_id
     weights_str = ", ".join(
@@ -169,6 +204,20 @@ def _render_event_block(p: MarketPrediction) -> str:
         "; ".join(p.disagreements_flagged) if p.disagreements_flagged else "(none)"
     )
     uw = p.uw_flow_note if p.uw_flow_note else "(no UW coverage)"
+    if p.gbt_p_for_predicted_winner is not None:
+        divergence = abs(
+            p.predicted_yes_probability - p.gbt_p_for_predicted_winner
+        )
+        gbt_lines = (
+            f"gbt_prior_p_for_predicted_winner: {p.gbt_p_for_predicted_winner:.3f}\n"
+            f"gbt_divergence: {divergence:.3f}  "
+            f"(|director - GBT|; >0.10 = material per rubric §5)\n"
+        )
+    else:
+        gbt_lines = (
+            "gbt_prior_p_for_predicted_winner: (no GBT prior attached — "
+            "cold-start or non-tennis event)\n"
+        )
     return (
         f"event_id: {p.event_id}\n"
         f"event_title: {title}\n"
@@ -178,6 +227,7 @@ def _render_event_block(p: MarketPrediction) -> str:
         f"specialist_weights: {weights_str}\n"
         f"disagreements_flagged: {disagreements}\n"
         f"uw_flow_note: {uw}\n"
+        f"{gbt_lines}"
         f"headline: {p.headline}\n"
         f"reasoning: {p.reasoning}"
     )
