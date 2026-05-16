@@ -1,5 +1,5 @@
 {
-  "trained_at_utc": "2026-05-16T06:46:28.535229+00:00",
+  "trained_at_utc": "2026-05-16T07:08:56.693473+00:00",
   "train_cutoff": "2024-12-31",
   "train_n": 122198,
   "holdout_n": 34968,
@@ -131,7 +131,7 @@
         "n_rows": 768378
       }
     },
-    "code_commit_sha": "e99d49a",
+    "code_commit_sha": "0ddf1bc",
     "trainer_module": "skimsmarkets.tennis.gbt_train"
   },
   "train": {
@@ -308,10 +308,10 @@
   "sim_compare": {
     "n_paired": 34968,
     "gbt_brier": 0.21138446568653022,
-    "sim_brier": 0.22568193229524136,
+    "sim_brier": 0.22557036422586363,
     "gbt_log_loss": 0.6102487680517612,
-    "sim_log_loss": 0.6424384434971263
+    "sim_log_loss": 0.6421952943867778
   },
-  "model_version": "sha-fb75dd51200dd412",
+  "model_version": "sha-8d71fd9c7535702b",
   "model_path": "models/tennis_gbt_spike.cbm"
 }
