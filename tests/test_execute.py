@@ -807,6 +807,102 @@ def _t_calibration() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Unusual Whales (Hashdive) client schema — regression test against a
+# real `/detail_agg` response captured at 2026-05-17 (the API migration
+# from `api.unusualwhales.com/api/predictions/market/{id}` to
+# `phx.unusualwhales.com/hashdive/api/assets/{id}/detail_agg`). Verifies
+# the field renames (`tags_score` → `unusual_score`, `whale_trades` from
+# the new fanned-out shape, `size`+`price` on trades instead of the old
+# maker/taker amount pair, new insider signals `pnl_percent`/
+# `invested_zscore`/`n_positions`) all decode without losing data the
+# downstream consumers expect. If the vendor changes the response shape
+# again, this test fires before the live pipeline silently degrades to
+# `attached unusual-whales context to 0/N events`.
+# ---------------------------------------------------------------------------
+
+
+def _t_uw_schema_decode() -> int:
+    import json
+
+    from skimsmarkets.unusual_whales.client import _context_from_detail
+    from skimsmarkets.unusual_whales.rendering import render_uw_block
+
+    fixture = (
+        REPO_ROOT
+        / "tests/fixtures/uw_detail_agg_tennis_sinner_french_open_2026.json"
+    )
+    payload = json.loads(fixture.read_text())
+    ctx = _context_from_detail(payload["asset_id"], payload)
+    assert ctx is not None, "fixture should decode to a context"
+    n = 1
+
+    # Core identifiers + the renamed score field (tags_score → unusual_score).
+    assert ctx.asset_id == payload["asset_id"]
+    assert ctx.question and "Sinner" in ctx.question
+    # outcome_label resolves outcomes[outcome_index] — `Yes` for this fixture.
+    assert ctx.outcome_label == "Yes"
+    # The new `tags_score` field carries the value the old client expected
+    # under `unusual_score`. Float coercion off the JSON string must work.
+    assert ctx.unusual_score is not None and ctx.unusual_score > 0
+    n += 4
+
+    # MCI scalar pair — same shape across the API migration.
+    assert ctx.mci is not None
+    assert ctx.mci.value is not None and ctx.mci.delta is not None
+    n += 2
+
+    # Liquidity block — best_bid / best_ask / mid_price / spread /
+    # total_liquidity all preserved across the migration; the new
+    # ask_liquidity / bid_liquidity fields are optional and harmless if
+    # ignored.
+    assert ctx.liquidity is not None
+    assert ctx.liquidity.best_bid is not None and ctx.liquidity.best_ask is not None
+    assert ctx.liquidity.total_liquidity is not None
+    n += 3
+
+    # Smart trades — fixture has at least one fill. Verifies the new
+    # `size` + `price` shape lands cleanly (old shape was maker/taker
+    # amount pair) and the derived `usdc_notional` math works.
+    assert ctx.smart_trades, "fixture should carry at least one smart trade"
+    trade = ctx.smart_trades[0]
+    assert trade.size is not None and trade.size > 0
+    assert trade.price is not None and 0 < trade.price < 1
+    assert trade.usdc_notional is not None
+    assert abs(trade.usdc_notional - trade.size * trade.price) < 1e-9
+    n += 5
+
+    # Insiders — fixture has multiple; the top insider carries the new
+    # Hashdive-only signal fields. invested_zscore is the most directly
+    # actionable (z>2 = "this wallet sized this market unusually large
+    # vs its own trading-history baseline").
+    assert ctx.insiders, "fixture should carry at least one insider"
+    top = ctx.insiders[0]
+    assert top.user_address and top.user_address.startswith("0x")
+    assert top.total_invested_usd is not None
+    assert top.invested_zscore is not None  # NEW field — must decode
+    assert top.pnl_percent is not None  # NEW field
+    assert top.n_positions is not None  # NEW field
+    n += 5
+
+    # has_actionable_signal — insiders present, so context is actionable
+    # even though smart_trades is single-fill and unusual_score is < 5.0.
+    assert ctx.has_actionable_signal() is True
+    n += 1
+
+    # Rendering — no crashes, contains the key field markers the
+    # director prompt reads off. If a field rename breaks the render,
+    # the director sees `?` placeholders and we want to catch that here.
+    rendered = render_uw_block(ctx)
+    assert "Flow signals" in rendered
+    assert "Sinner" in rendered
+    assert "tag weights:" in rendered
+    assert "MCI:" in rendered
+    n += 4
+
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -832,6 +928,7 @@ def main() -> int:
         ("execute implied-prob gate", _t_implied_gate),
         ("retro scoring metrics", _t_metrics),
         ("temperature calibration", _t_calibration),
+        ("uw hashdive schema decode", _t_uw_schema_decode),
     ]
     failures = 0
     for name, fn in groups:

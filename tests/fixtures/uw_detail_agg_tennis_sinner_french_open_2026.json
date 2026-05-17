@@ -1,0 +1,1574 @@
+{
+    "active": true,
+    "asset_id": "16684003019585301187556121691683382680088297222373235105315599633539481594481",
+    "category": "Sports",
+    "closed": false,
+    "description": "The 2026 French Open is scheduled for May 18 - June 7, 2026.\n\nThis market will resolve to the player that wins the 2026 French Open Men\u2019s Singles Tournament.\n\nIf at any point it becomes impossible for a listed player to win the 2026 French Open Men\u2019s Singles Tournament per the rules of the tournament, the corresponding market will resolve to \u201cNo\u201d.\n\nIf the 2026 French Open Men\u2019s Singles Tournament is cancelled, postponed after July 31, 2026, or there is otherwise no winner declared within that timeframe, this market will resolve to \u201cOther\u201d.\n\nThe primary resolution source will be official information from the French Open (https://www.rolandgarros.com/en-us/); however, a consensus of credible reporting may also be used.",
+    "end_date": "2026-06-07T00:00:00Z",
+    "image": "https://polymarket-upload.s3.us-east-2.amazonaws.com/2026-mens-french-open-winner-w_tvGmhMUtTi.png",
+    "insiders": [
+        {
+            "avg_price": "0.477451",
+            "created_at": "2026-04-22T18:05:09.149117Z",
+            "days_since_first_trade": 2,
+            "first_trade_at": "2025-11-06T02:29:31Z",
+            "invested_zscore": "2.9653197152229614",
+            "n_positions": 4,
+            "pnl_percent": "0.44517447863759841324",
+            "total_invested_usd": "2668.995715",
+            "user_address": "0x502848bf292b398508873d8d2204c3ff33849bb7"
+        },
+        {
+            "avg_price": "0.65",
+            "created_at": "2026-04-28T10:47:14.385977Z",
+            "days_since_first_trade": 19,
+            "first_trade_at": "2025-11-06T15:30:01Z",
+            "invested_zscore": "0.77195891385426659645",
+            "n_positions": 2,
+            "pnl_percent": "0.06153846153846153846",
+            "total_invested_usd": "1040",
+            "user_address": "0xf80fa29e32f8202293af77f7a3bc281c1c118baa"
+        }
+    ],
+    "liquidity": {
+        "ask_liquidity": "1169421.07",
+        "best_ask": "0.7",
+        "best_bid": "0.69",
+        "bid_liquidity": "54832.78",
+        "mid_price": "0.6950",
+        "spread": "0.01",
+        "total_liquidity": "1224253.85"
+    },
+    "mci": {
+        "delta": "-4.0",
+        "value": "38.0"
+    },
+    "outcome_assets": [
+        {
+            "asset_id": "78630665703702147442323042260825934682761220107443468388673692640534750252675",
+            "label": "No",
+            "prices": [
+                {
+                    "date": "2026-01-02",
+                    "price": "0.95"
+                },
+                {
+                    "date": "2026-01-03",
+                    "price": "0.55"
+                },
+                {
+                    "date": "2026-01-04",
+                    "price": "0.740"
+                },
+                {
+                    "date": "2026-01-10",
+                    "price": "0.540"
+                },
+                {
+                    "date": "2026-01-13",
+                    "price": "0.7800"
+                },
+                {
+                    "date": "2026-01-19",
+                    "price": "0.75"
+                },
+                {
+                    "date": "2026-01-20",
+                    "price": "0.7100"
+                },
+                {
+                    "date": "2026-01-21",
+                    "price": "0.740"
+                },
+                {
+                    "date": "2026-01-22",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-01-23",
+                    "price": "0.5600"
+                },
+                {
+                    "date": "2026-01-24",
+                    "price": "0.68"
+                },
+                {
+                    "date": "2026-01-25",
+                    "price": "0.60"
+                },
+                {
+                    "date": "2026-01-27",
+                    "price": "0.61"
+                },
+                {
+                    "date": "2026-01-28",
+                    "price": "0.62"
+                },
+                {
+                    "date": "2026-01-29",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-01-30",
+                    "price": "0.530"
+                },
+                {
+                    "date": "2026-01-31",
+                    "price": "0.6750"
+                },
+                {
+                    "date": "2026-02-01",
+                    "price": "0.6"
+                },
+                {
+                    "date": "2026-02-02",
+                    "price": "0.62"
+                },
+                {
+                    "date": "2026-02-03",
+                    "price": "0.670"
+                },
+                {
+                    "date": "2026-02-04",
+                    "price": "0.680"
+                },
+                {
+                    "date": "2026-02-05",
+                    "price": "0.64"
+                },
+                {
+                    "date": "2026-02-06",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-02-07",
+                    "price": "0.6700"
+                },
+                {
+                    "date": "2026-02-08",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-02-09",
+                    "price": "0.720"
+                },
+                {
+                    "date": "2026-02-10",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-02-11",
+                    "price": "0.6650"
+                },
+                {
+                    "date": "2026-02-12",
+                    "price": "0.6600"
+                },
+                {
+                    "date": "2026-02-15",
+                    "price": "0.6600"
+                },
+                {
+                    "date": "2026-02-16",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-02-18",
+                    "price": "0.6800"
+                },
+                {
+                    "date": "2026-02-19",
+                    "price": "0.710"
+                },
+                {
+                    "date": "2026-02-20",
+                    "price": "0.6700"
+                },
+                {
+                    "date": "2026-02-21",
+                    "price": "0.72"
+                },
+                {
+                    "date": "2026-02-22",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-02-23",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-02-24",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-02-25",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-02-26",
+                    "price": "0.680"
+                },
+                {
+                    "date": "2026-02-27",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-02-28",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-03-01",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-03-02",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-03-03",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-03-04",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-03-05",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-03-06",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-03-07",
+                    "price": "0.7100"
+                },
+                {
+                    "date": "2026-03-08",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-03-09",
+                    "price": "0.70"
+                },
+                {
+                    "date": "2026-03-10",
+                    "price": "0.710"
+                },
+                {
+                    "date": "2026-03-11",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-03-12",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-03-13",
+                    "price": "0.710"
+                },
+                {
+                    "date": "2026-03-14",
+                    "price": "0.7200"
+                },
+                {
+                    "date": "2026-03-17",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-03-18",
+                    "price": "0.690"
+                },
+                {
+                    "date": "2026-03-19",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-03-20",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-03-21",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-03-22",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-03-23",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-03-24",
+                    "price": "0.6900"
+                },
+                {
+                    "date": "2026-03-25",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-03-26",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-03-27",
+                    "price": "0.66"
+                },
+                {
+                    "date": "2026-03-28",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-03-29",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-03-30",
+                    "price": "0.66"
+                },
+                {
+                    "date": "2026-03-31",
+                    "price": "0.66"
+                },
+                {
+                    "date": "2026-04-01",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-04-02",
+                    "price": "0.660"
+                },
+                {
+                    "date": "2026-04-03",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-04-05",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-04-06",
+                    "price": "0.66"
+                },
+                {
+                    "date": "2026-04-07",
+                    "price": "0.6600"
+                },
+                {
+                    "date": "2026-04-08",
+                    "price": "0.650"
+                },
+                {
+                    "date": "2026-04-09",
+                    "price": "0.670"
+                },
+                {
+                    "date": "2026-04-10",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-04-11",
+                    "price": "0.6300"
+                },
+                {
+                    "date": "2026-04-12",
+                    "price": "0.64"
+                },
+                {
+                    "date": "2026-04-13",
+                    "price": "0.64"
+                },
+                {
+                    "date": "2026-04-14",
+                    "price": "0.6300"
+                },
+                {
+                    "date": "2026-04-15",
+                    "price": "0.6100"
+                },
+                {
+                    "date": "2026-04-16",
+                    "price": "0.6"
+                },
+                {
+                    "date": "2026-04-17",
+                    "price": "0.560"
+                },
+                {
+                    "date": "2026-04-18",
+                    "price": "0.59"
+                },
+                {
+                    "date": "2026-04-19",
+                    "price": "0.5900"
+                },
+                {
+                    "date": "2026-04-20",
+                    "price": "0.4"
+                },
+                {
+                    "date": "2026-04-21",
+                    "price": "0.440"
+                },
+                {
+                    "date": "2026-04-22",
+                    "price": "0.43"
+                },
+                {
+                    "date": "2026-04-23",
+                    "price": "0.44"
+                },
+                {
+                    "date": "2026-04-24",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-04-25",
+                    "price": "0.36"
+                },
+                {
+                    "date": "2026-04-26",
+                    "price": "0.3400"
+                },
+                {
+                    "date": "2026-04-27",
+                    "price": "0.32"
+                },
+                {
+                    "date": "2026-04-28",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-04-30",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-05-01",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-05-02",
+                    "price": "0.32"
+                },
+                {
+                    "date": "2026-05-03",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-05-04",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-05-05",
+                    "price": "0.2900"
+                },
+                {
+                    "date": "2026-05-06",
+                    "price": "0.3000"
+                },
+                {
+                    "date": "2026-05-07",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-05-08",
+                    "price": "0.2900"
+                },
+                {
+                    "date": "2026-05-09",
+                    "price": "0.27"
+                },
+                {
+                    "date": "2026-05-10",
+                    "price": "0.29"
+                },
+                {
+                    "date": "2026-05-11",
+                    "price": "0.2900"
+                },
+                {
+                    "date": "2026-05-12",
+                    "price": "0.2900"
+                },
+                {
+                    "date": "2026-05-13",
+                    "price": "0.3000"
+                },
+                {
+                    "date": "2026-05-14",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-05-15",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-05-16",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-05-17",
+                    "price": "0.31"
+                }
+            ]
+        },
+        {
+            "asset_id": "16684003019585301187556121691683382680088297222373235105315599633539481594481",
+            "label": "Yes",
+            "prices": [
+                {
+                    "date": "2026-01-02",
+                    "price": "0.110"
+                },
+                {
+                    "date": "2026-01-03",
+                    "price": "0.45"
+                },
+                {
+                    "date": "2026-01-04",
+                    "price": "0.260"
+                },
+                {
+                    "date": "2026-01-10",
+                    "price": "0.4902"
+                },
+                {
+                    "date": "2026-01-13",
+                    "price": "0.2200"
+                },
+                {
+                    "date": "2026-01-19",
+                    "price": "0.25"
+                },
+                {
+                    "date": "2026-01-20",
+                    "price": "0.2900"
+                },
+                {
+                    "date": "2026-01-21",
+                    "price": "0.26"
+                },
+                {
+                    "date": "2026-01-22",
+                    "price": "0.29"
+                },
+                {
+                    "date": "2026-01-23",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-01-24",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-01-25",
+                    "price": "0.4"
+                },
+                {
+                    "date": "2026-01-27",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-01-29",
+                    "price": "0.32"
+                },
+                {
+                    "date": "2026-01-30",
+                    "price": "0.3600"
+                },
+                {
+                    "date": "2026-01-31",
+                    "price": "0.3250"
+                },
+                {
+                    "date": "2026-02-01",
+                    "price": "0.4014"
+                },
+                {
+                    "date": "2026-02-02",
+                    "price": "0.38"
+                },
+                {
+                    "date": "2026-02-03",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-02-04",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-02-05",
+                    "price": "0.36"
+                },
+                {
+                    "date": "2026-02-06",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-02-07",
+                    "price": "0.3300"
+                },
+                {
+                    "date": "2026-02-08",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-02-09",
+                    "price": "0.280"
+                },
+                {
+                    "date": "2026-02-10",
+                    "price": "0.30"
+                },
+                {
+                    "date": "2026-02-11",
+                    "price": "0.3350"
+                },
+                {
+                    "date": "2026-02-12",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-02-15",
+                    "price": "0.3400"
+                },
+                {
+                    "date": "2026-02-16",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-02-17",
+                    "price": "0.37"
+                },
+                {
+                    "date": "2026-02-18",
+                    "price": "0.320"
+                },
+                {
+                    "date": "2026-02-19",
+                    "price": "0.290"
+                },
+                {
+                    "date": "2026-02-20",
+                    "price": "0.3300"
+                },
+                {
+                    "date": "2026-02-21",
+                    "price": "0.28"
+                },
+                {
+                    "date": "2026-02-22",
+                    "price": "0.29"
+                },
+                {
+                    "date": "2026-02-23",
+                    "price": "0.29"
+                },
+                {
+                    "date": "2026-02-24",
+                    "price": "0.320"
+                },
+                {
+                    "date": "2026-02-25",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-02-26",
+                    "price": "0.32"
+                },
+                {
+                    "date": "2026-02-27",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-02-28",
+                    "price": "0.3100"
+                },
+                {
+                    "date": "2026-03-01",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-03-02",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-03-03",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-03-04",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-03-05",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-03-06",
+                    "price": "0.3000"
+                },
+                {
+                    "date": "2026-03-07",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-03-08",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-03-09",
+                    "price": "0.30"
+                },
+                {
+                    "date": "2026-03-10",
+                    "price": "0.2900"
+                },
+                {
+                    "date": "2026-03-11",
+                    "price": "0.29"
+                },
+                {
+                    "date": "2026-03-12",
+                    "price": "0.3100"
+                },
+                {
+                    "date": "2026-03-13",
+                    "price": "0.29"
+                },
+                {
+                    "date": "2026-03-14",
+                    "price": "0.3"
+                },
+                {
+                    "date": "2026-03-15",
+                    "price": "0.30"
+                },
+                {
+                    "date": "2026-03-16",
+                    "price": "0.29"
+                },
+                {
+                    "date": "2026-03-17",
+                    "price": "0.320"
+                },
+                {
+                    "date": "2026-03-18",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-03-19",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-03-20",
+                    "price": "0.32"
+                },
+                {
+                    "date": "2026-03-21",
+                    "price": "0.31"
+                },
+                {
+                    "date": "2026-03-22",
+                    "price": "0.3300"
+                },
+                {
+                    "date": "2026-03-23",
+                    "price": "0.3300"
+                },
+                {
+                    "date": "2026-03-24",
+                    "price": "0.3100"
+                },
+                {
+                    "date": "2026-03-25",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-03-26",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-03-27",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-03-28",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-03-29",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-03-30",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-03-31",
+                    "price": "0.3534"
+                },
+                {
+                    "date": "2026-04-01",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-04-02",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-04-03",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-04-06",
+                    "price": "0.34"
+                },
+                {
+                    "date": "2026-04-07",
+                    "price": "0.3400"
+                },
+                {
+                    "date": "2026-04-08",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-04-09",
+                    "price": "0.33"
+                },
+                {
+                    "date": "2026-04-10",
+                    "price": "0.32"
+                },
+                {
+                    "date": "2026-04-11",
+                    "price": "0.3622"
+                },
+                {
+                    "date": "2026-04-12",
+                    "price": "0.36"
+                },
+                {
+                    "date": "2026-04-13",
+                    "price": "0.3700"
+                },
+                {
+                    "date": "2026-04-14",
+                    "price": "0.36"
+                },
+                {
+                    "date": "2026-04-15",
+                    "price": "0.3900"
+                },
+                {
+                    "date": "2026-04-16",
+                    "price": "0.4"
+                },
+                {
+                    "date": "2026-04-17",
+                    "price": "0.43"
+                },
+                {
+                    "date": "2026-04-18",
+                    "price": "0.41"
+                },
+                {
+                    "date": "2026-04-19",
+                    "price": "0.41"
+                },
+                {
+                    "date": "2026-04-20",
+                    "price": "0.59"
+                },
+                {
+                    "date": "2026-04-21",
+                    "price": "0.56"
+                },
+                {
+                    "date": "2026-04-22",
+                    "price": "0.5600"
+                },
+                {
+                    "date": "2026-04-23",
+                    "price": "0.56"
+                },
+                {
+                    "date": "2026-04-24",
+                    "price": "0.66"
+                },
+                {
+                    "date": "2026-04-25",
+                    "price": "0.6600"
+                },
+                {
+                    "date": "2026-04-26",
+                    "price": "0.65"
+                },
+                {
+                    "date": "2026-04-27",
+                    "price": "0.68"
+                },
+                {
+                    "date": "2026-04-28",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-04-30",
+                    "price": "0.66"
+                },
+                {
+                    "date": "2026-05-01",
+                    "price": "0.67"
+                },
+                {
+                    "date": "2026-05-02",
+                    "price": "0.68"
+                },
+                {
+                    "date": "2026-05-03",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-05-04",
+                    "price": "0.69"
+                },
+                {
+                    "date": "2026-05-05",
+                    "price": "0.72"
+                },
+                {
+                    "date": "2026-05-06",
+                    "price": "0.7100"
+                },
+                {
+                    "date": "2026-05-07",
+                    "price": "0.710"
+                },
+                {
+                    "date": "2026-05-08",
+                    "price": "0.70"
+                },
+                {
+                    "date": "2026-05-09",
+                    "price": "0.73"
+                },
+                {
+                    "date": "2026-05-10",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-05-11",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-05-12",
+                    "price": "0.7"
+                },
+                {
+                    "date": "2026-05-13",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-05-14",
+                    "price": "0.70"
+                },
+                {
+                    "date": "2026-05-15",
+                    "price": "0.71"
+                },
+                {
+                    "date": "2026-05-16",
+                    "price": "0.68"
+                },
+                {
+                    "date": "2026-05-17",
+                    "price": "0.69"
+                }
+            ]
+        }
+    ],
+    "outcome_index": 0,
+    "outcomes": [
+        "Yes",
+        "No"
+    ],
+    "question": "Will Jannik Sinner win the 2026 Men's French Open?",
+    "question_type": "yes_no",
+    "smart_trades": [
+        {
+            "executed_at": "2026-04-20T22:21:52Z",
+            "fee": "0.0",
+            "maker_address": "0x1c1ff44c75fcfbb4e04a1ebbfc7643ff60d94c94",
+            "maker_side": "buyer",
+            "price": "0.5799",
+            "size": "21.7759",
+            "taker_side": "seller",
+            "transaction_hash": "p17BczkStFmy0zTAuUa8WqflZKu03GDcbyvvx/Guwik="
+        }
+    ],
+    "tag_info": [
+        {
+            "score": "0.20",
+            "tag": "contrarian_whales"
+        },
+        {
+            "score": "0.10",
+            "tag": "momentum"
+        },
+        {
+            "score": "0.05",
+            "tag": "closing_soon"
+        },
+        {
+            "score": "0.35",
+            "tag": "insider_trades"
+        },
+        {
+            "score": "0.30",
+            "tag": "smart_money"
+        }
+    ],
+    "tag_scores": [
+        {
+            "normalized": "0",
+            "tag": "smart_money",
+            "value": "0",
+            "weighted": "0"
+        },
+        {
+            "normalized": "0.98039215686274509800",
+            "tag": "momentum",
+            "value": "0.01470588235294117647",
+            "weighted": "0.0980392156862745098000"
+        },
+        {
+            "normalized": "0",
+            "tag": "closing_soon",
+            "value": "0",
+            "weighted": "0"
+        },
+        {
+            "normalized": "0",
+            "tag": "contrarian_whales",
+            "value": "0",
+            "weighted": "0"
+        },
+        {
+            "normalized": "2.00",
+            "tag": "insider_trades",
+            "value": "1",
+            "weighted": "0.7000"
+        }
+    ],
+    "tags": [
+        "insider_trades"
+    ],
+    "tags_score": "0.35",
+    "trades": [
+        {
+            "executed_at": "2026-05-17T07:23:01Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.69000000000000000000",
+            "size": "589.6",
+            "taker_address": "0xb52c3fcda5ecae2a12dd1a5f7bc76d75ba24450c",
+            "taker_side": "buyer",
+            "transaction_hash": "0xa7bc0a0c9c54e3e91617c6f40de95aa8c60ed65253aed3642a6b0d666e158d09"
+        },
+        {
+            "executed_at": "2026-05-17T06:43:34Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.69000000000000000000",
+            "size": "32.57",
+            "taker_address": "0xb023237b1d016b4b7c5616ffd8aadad80ee9f142",
+            "taker_side": "buyer",
+            "transaction_hash": "0x522ca89ababaad39904d42091618f3fe0b25b5d3010cff38cfe0ec7efed27e4e"
+        },
+        {
+            "executed_at": "2026-05-17T01:50:05Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "6.5625",
+            "taker_address": "0x087b959eb9e374bbab7b69d39a4b58efd5dccdcf",
+            "taker_side": "seller",
+            "transaction_hash": "0x2df4745d92650da9fb5317f6dd19e44da51716cf35ac98f10ef443a87107f348"
+        },
+        {
+            "executed_at": "2026-05-16T20:19:36Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "0.34",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0xd524da072d63a052ee33cf237bbbf80284c804661c6cbbced955b40e5e807af1"
+        },
+        {
+            "executed_at": "2026-05-16T20:16:27Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "8.0",
+            "taker_address": "0xbcc276705fb6d5a22e4aef994ede92f109918c9a",
+            "taker_side": "seller",
+            "transaction_hash": "0x21aef0ac34c5ba2ea47633f3ebe778854b720c2bcaf53680e682f59e3f540ed0"
+        },
+        {
+            "executed_at": "2026-05-16T19:57:47Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "9.61",
+            "taker_address": "0xbcc276705fb6d5a22e4aef994ede92f109918c9a",
+            "taker_side": "seller",
+            "transaction_hash": "0xd1e4950e5e91d72305089b162cf472fc1f2c27b9d5a0a06576ecadb5dfe00b37"
+        },
+        {
+            "executed_at": "2026-05-16T19:57:45Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "9.375",
+            "taker_address": "0x728be6d3b781bf0f2842939f321443bc86ed5d09",
+            "taker_side": "seller",
+            "transaction_hash": "0xd820fd10f1a7bfc259ff4b326de1d44d3d501934489fb3b14a02b197bd6cd277"
+        },
+        {
+            "executed_at": "2026-05-16T19:03:55Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "61.0",
+            "taker_address": "0x72b2d0ffab41c12727fdfe52e530320d50325548",
+            "taker_side": "seller",
+            "transaction_hash": "0xefcaf9276781ea608c410832b7d73484beebbeeab6cf3b164e36de7b2dde4f08"
+        },
+        {
+            "executed_at": "2026-05-16T18:37:33Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "20.0",
+            "taker_address": "0x72b2d0ffab41c12727fdfe52e530320d50325548",
+            "taker_side": "seller",
+            "transaction_hash": "0x820742deb902d7aed8dd8c3d4550ef0347a94428247c0aa357aaca09ac2dcf4a"
+        },
+        {
+            "executed_at": "2026-05-16T17:48:41Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.60000000000000000000",
+            "size": "15.15",
+            "taker_address": "0xe8733a4109665a4e340272f876457ae577c0271d",
+            "taker_side": "seller",
+            "transaction_hash": "0x007a9fb35700cc578ef4a6278af0d552f916e927c82b7e1f2dbb9a076cbf62a4"
+        },
+        {
+            "executed_at": "2026-05-16T17:39:13Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.60999990859933245721",
+            "size": "10.065572",
+            "taker_address": "0x30f67d821c57a54e25e5e521dbd3b5b18309004f",
+            "taker_side": "buyer",
+            "transaction_hash": "0xd60e4cdbc4dbb15acd766c1bab4f371dce625f9d70197c5dcdf72a25da1451ca"
+        },
+        {
+            "executed_at": "2026-05-16T17:36:21Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.53000000000000000000",
+            "size": "13.94",
+            "taker_address": "0x2523eceee440e3f40cc0b98aa49802e5103c9c0a",
+            "taker_side": "seller",
+            "transaction_hash": "0xa27e3ac2252f310e8724bb6a3221e2374f6991859ef6329a291e0f3b7ac05130"
+        },
+        {
+            "executed_at": "2026-05-16T17:36:18Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.62364051287463064584",
+            "size": "379.04",
+            "taker_address": "0x1d603dad31fac599c1de6b6002d066993460453d",
+            "taker_side": "seller",
+            "transaction_hash": "0xfad20be5f3c2cbe7d04876484088fc9296b709f0395df82d9910b75626f63c82"
+        },
+        {
+            "executed_at": "2026-05-16T17:33:26Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "14.7",
+            "taker_address": "0xe04be39ce1c91a6fc694167e9dd3c8828817b742",
+            "taker_side": "seller",
+            "transaction_hash": "0x3b2dcf771f625354bddc3cc3b5f213d77b85217982f1a3da9edc9d06b64e7f35"
+        },
+        {
+            "executed_at": "2026-05-16T16:34:03Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.70000000000000000000",
+            "size": "659.93",
+            "taker_address": "0x16b9933c62a5e61373436248136289bf5ace3d59",
+            "taker_side": "buyer",
+            "transaction_hash": "0x0ebbeb962709b528e911f8e7bb2008cb47f5cf67492ccee90a60d75d4e10ec0e"
+        },
+        {
+            "executed_at": "2026-05-16T16:25:53Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.69000000000000000000",
+            "size": "176.23",
+            "taker_address": "0x16b9933c62a5e61373436248136289bf5ace3d59",
+            "taker_side": "buyer",
+            "transaction_hash": "0xc765959ff4840e1f156fd846bf3177edec8c0bf9e84a0904408274cab156771f"
+        },
+        {
+            "executed_at": "2026-05-16T15:53:57Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "526.64",
+            "taker_address": "0x16b9933c62a5e61373436248136289bf5ace3d59",
+            "taker_side": "seller",
+            "transaction_hash": "0xaac0243a13ab2acf809492eb8d6bd126ca84e221b99eea65ae6168271976cdde"
+        },
+        {
+            "executed_at": "2026-05-16T15:39:46Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "1.75",
+            "taker_address": "0x0083978cf0a964cfdf77a727b11d7885d8c4526f",
+            "taker_side": "seller",
+            "transaction_hash": "0x8dd184db601eadb43fed06588f14658ff99821e8bb4b85b72b0c49feec011731"
+        },
+        {
+            "executed_at": "2026-05-16T14:56:22Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.69000000000000000000",
+            "size": "30.0",
+            "taker_address": "0x5c6aa76706dffbf9eec63b88c908136eeecb3b2e",
+            "taker_side": "buyer",
+            "transaction_hash": "0x67dd64d01e21d6c4738f5fffa9ff3e00d78db5dc3b5e3aec506ec0e4426c146d"
+        },
+        {
+            "executed_at": "2026-05-16T14:29:10Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "30.46875",
+            "taker_address": "0x76dcd6debebc8dbe96a7784014dfc4d584702b9f",
+            "taker_side": "seller",
+            "transaction_hash": "0x1c259fbe81772b8fa6c70acf9f535ee27b5928dfc49e557f02c1203bbef8ccd4"
+        },
+        {
+            "executed_at": "2026-05-16T14:10:14Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.68000000000000000000",
+            "size": "3.125",
+            "taker_address": "0x11810257f3d2625276edcac4aa642a3c52721066",
+            "taker_side": "seller",
+            "transaction_hash": "0x588f3828cfbc6452f9674d4f63e15090d75b0739c95310bd1fe704c4873960f3"
+        },
+        {
+            "executed_at": "2026-05-16T14:04:33Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.69000000000000000000",
+            "size": "25.0",
+            "taker_address": "0xf294919e16868d927b0247891543b9187d6e7967",
+            "taker_side": "seller",
+            "transaction_hash": "0x8746b8dad46766925610b9137c10b24bc3e97629cb113474b622868935452bdf"
+        },
+        {
+            "executed_at": "2026-05-16T12:01:26Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.70000000000000000000",
+            "size": "3.33",
+            "taker_address": "0x7ed17fece2b8769a8ae7ea505c3714b6b587afcf",
+            "taker_side": "buyer",
+            "transaction_hash": "0x0e917623a27b01e1cec3ab9fea4b6634f9b8e3a05d097074d702e4aa5a5b8429"
+        },
+        {
+            "executed_at": "2026-05-16T07:50:41Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.69999999299999937000",
+            "size": "14.285713",
+            "taker_address": "0xbe215cd0c96e74a4d70b6c695ec79af64c5f2f9c",
+            "taker_side": "buyer",
+            "transaction_hash": "0xe475866617a7507ab8e14f2b1e035c2b6183e111b900307b5c31dbb1769f1fd4"
+        },
+        {
+            "executed_at": "2026-05-16T07:30:44Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.69000000000000000000",
+            "size": "285.95",
+            "taker_address": "0xb4f334eb2ec0fd1eda346cd854babafcf4c6999f",
+            "taker_side": "seller",
+            "transaction_hash": "0x7514dea7346b93c0b36c04e2e0f6131fbe5e6783fc5d01ad7f83da20e45af78d"
+        },
+        {
+            "executed_at": "2026-05-15T20:56:02Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.71000000000000000000",
+            "size": "14.99",
+            "taker_address": "0x4b8f686d506f0587ae3976bd859dc028519e6922",
+            "taker_side": "buyer",
+            "transaction_hash": "0x77b2cf4623e238f656c0ab5faf3e725975df56c21311653a424b41cf01c44de0"
+        },
+        {
+            "executed_at": "2026-05-15T19:51:02Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.69000000000000000000",
+            "size": "20.54",
+            "taker_address": "0xe3ee705218ea698a29fbff6847a47b889df97c1e",
+            "taker_side": "seller",
+            "transaction_hash": "0x852bc6dc9c6f5918a1e988544beac949d0ec56eeba136f1a8b80ef9f4979da19"
+        },
+        {
+            "executed_at": "2026-05-15T19:48:35Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.69000000000000000000",
+            "size": "4.53",
+            "taker_address": "0x3de69fd6347a62a618656371e30a17b0c490e560",
+            "taker_side": "seller",
+            "transaction_hash": "0xdc3a514f5a2992b56c0421f4399a77e480b55315f0d9952a37044be3caf5f460"
+        },
+        {
+            "executed_at": "2026-05-15T19:38:27Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.70999997795030439605",
+            "size": "4.53521",
+            "taker_address": "0x3de69fd6347a62a618656371e30a17b0c490e560",
+            "taker_side": "buyer",
+            "transaction_hash": "0xefd8bfeea36d5ec7b2387ecd4e15c758b909d225be78cc08b4c0c0d89a86993a"
+        },
+        {
+            "executed_at": "2026-05-15T19:33:40Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.71000000000000000000",
+            "size": "3.5",
+            "taker_address": "0x1bb0aab975b52960b6e14d5be1e69ecdc047c5c7",
+            "taker_side": "buyer",
+            "transaction_hash": "0xc217b927371a3894255f85ae0776b5bed4c040d295b58e63f134e33f7d41501a"
+        },
+        {
+            "executed_at": "2026-05-15T19:12:05Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "1752.04",
+            "taker_address": "0xe5241830e8876c115d7dc8311ad9f43d85fdd34f",
+            "taker_side": "seller",
+            "transaction_hash": "0xaf22724e84e395ed30aa5cf0c6147f57b95e7aa9df2c063bb766145b5bfe4938"
+        },
+        {
+            "executed_at": "2026-05-15T19:09:56Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "10.22",
+            "taker_address": "0x3de69fd6347a62a618656371e30a17b0c490e560",
+            "taker_side": "seller",
+            "transaction_hash": "0x4eeaf28d4a1c611eb53fdb3c2ead3e13d35fba57d497b5f08b081fe02f52f79e"
+        },
+        {
+            "executed_at": "2026-05-15T19:00:46Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "2.91",
+            "taker_address": "0x253320cbbbb1b4f6fd3cd947808ed141bd08926e",
+            "taker_side": "seller",
+            "transaction_hash": "0xf932437323a26978570cb5c2eaeb4254646380a5ee77de4fd48aca1365359887"
+        },
+        {
+            "executed_at": "2026-05-15T18:52:24Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "100.0",
+            "taker_address": "0x68cae334373b57820eeea2ba3472e56124cd6a72",
+            "taker_side": "seller",
+            "transaction_hash": "0x210ce7069c3a26bb07dbd6ce2962958ba234afeb5161e17642e929343c22be10"
+        },
+        {
+            "executed_at": "2026-05-15T18:43:27Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.71000000000000000000",
+            "size": "1.4",
+            "taker_address": "0x65e65d103d7b5b5d35ef394c74be29005139293e",
+            "taker_side": "buyer",
+            "transaction_hash": "0xb4a22739a0ece7c484a0e128bb083dc577e48e954e494a70bc5f9aa02f964d4b"
+        },
+        {
+            "executed_at": "2026-05-15T18:30:02Z",
+            "fee": "0",
+            "maker_side": "seller",
+            "price": "0.70999997946280768259",
+            "size": "10.225351",
+            "taker_address": "0x3de69fd6347a62a618656371e30a17b0c490e560",
+            "taker_side": "buyer",
+            "transaction_hash": "0x6e5bcc9b7345dec19ac15b2cefd21913e58206720e92cea5b4d6cefd6982eeb5"
+        },
+        {
+            "executed_at": "2026-05-15T18:28:50Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "7.2",
+            "taker_address": "0x253320cbbbb1b4f6fd3cd947808ed141bd08926e",
+            "taker_side": "seller",
+            "transaction_hash": "0x46844adc7ac22956024bdd130bb57e1b47882bb1967e8554590ea10997aed33f"
+        },
+        {
+            "executed_at": "2026-05-15T17:14:24Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "23.68",
+            "taker_address": "0x4f1d5ae26fc31472966e951af3183308736d8de2",
+            "taker_side": "seller",
+            "transaction_hash": "0xdf874ec3492dff55d2805e0de0c16800f666a7d62890f0206b929277f24e8128"
+        },
+        {
+            "executed_at": "2026-05-15T17:00:40Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "24.98",
+            "taker_address": "0x4f1d5ae26fc31472966e951af3183308736d8de2",
+            "taker_side": "seller",
+            "transaction_hash": "0x6f8ddcfae323ac3ec2fa1f4f5412b1bb8fc8791a8d4f2cf041a212591de07f50"
+        },
+        {
+            "executed_at": "2026-05-15T17:00:19Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "13.46",
+            "taker_address": "0x4f1d5ae26fc31472966e951af3183308736d8de2",
+            "taker_side": "seller",
+            "transaction_hash": "0xdb8efea20dba12396bbd66db7bf30c1265fea88428cf21a3c3e2c750fac9d4cd"
+        },
+        {
+            "executed_at": "2026-05-15T16:18:12Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "30.0",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0x446de8003a175b2fde4c607e79041fe1056d5979454e047ddca96812d884c8d8"
+        },
+        {
+            "executed_at": "2026-05-15T16:17:26Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "30.0",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0xa5dc76bd04e56a47b8bbf1046ad6bcbb2a59b58000e68ec52e82a973e94f882a"
+        },
+        {
+            "executed_at": "2026-05-15T16:13:02Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "30.0",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0x93032e44bdeeb911ed87a3a5628762d14f93dc34d608e96058f7836f754ba75e"
+        },
+        {
+            "executed_at": "2026-05-15T16:10:18Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "30.0",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0x1ad39da6c4481955268f673dd3996ff31aeee93ff8665bf42aef30e8e4aee025"
+        },
+        {
+            "executed_at": "2026-05-15T16:05:52Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "2.11",
+            "taker_address": "0x0957bf4725f6d0c62428f356d40d5cf7eeb977e8",
+            "taker_side": "seller",
+            "transaction_hash": "0x01438208569a034dcb4636dda2184a7b8487b50e953f78ee3f9df40227c6c97a"
+        },
+        {
+            "executed_at": "2026-05-15T16:04:38Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "30.00",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0x2385815629693ac2c1a10fbe50cf5e210f06e2f071df3a83492a45a021b72469"
+        },
+        {
+            "executed_at": "2026-05-15T16:04:14Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "30.0",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0x490d90c72d008c430a85c911fd9d1a742a4d1cf9c74e4a43fae5662191b35e03"
+        },
+        {
+            "executed_at": "2026-05-15T15:59:39Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "27.0",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0xe5f895e46b34b468e857c971bb42ae97f3f672e9f3ffe7ac3c2be450baca81b0"
+        },
+        {
+            "executed_at": "2026-05-15T15:51:13Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "33.97",
+            "taker_address": "0xd1a63a243042d864520512fbdbd2fd20e0ab1507",
+            "taker_side": "seller",
+            "transaction_hash": "0xc1d11ab1576feff0d630820bbf9fc1fc94e0813e4eebb8665bdf014f7e755927"
+        },
+        {
+            "executed_at": "2026-05-15T15:47:13Z",
+            "fee": "0",
+            "maker_side": "buyer",
+            "price": "0.70000000000000000000",
+            "size": "30.0",
+            "taker_address": "0x764b305694b026c1acce7bf862c3b5456a146bad",
+            "taker_side": "seller",
+            "transaction_hash": "0x017623b211969d0b5f2fc9dfe59bf6fc828a7a97accff4ce202246fa0ec5a024"
+        }
+    ],
+    "volume": "433.7598",
+    "whale_trades": [],
+    "winning_outcome": null
+}
