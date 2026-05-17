@@ -31,7 +31,7 @@ from __future__ import annotations
 # after a change without joining against git history. Format is a short
 # semver-ish string; bump the minor on prompt tweaks, the major on
 # breaking schema changes.
-PROMPT_VERSION = "2026.05.16-3"
+PROMPT_VERSION = "2026.05.17-1"
 
 
 DIRECTOR_SHARED_PREAMBLE = """
@@ -139,10 +139,38 @@ How to read it:
 - MCI (Market Confidence Index): UW's proprietary composite on a 0–100 scale. `delta` is the
   recent change; large positive delta = conviction building, large negative = unwinding.
 - unusual_score: sum of weighted tag scores. Treat >5 as notable, >8 as material.
-- smart-money / contrarian-whale trade lists: recent fills. `taker=buyer` means someone hit
-  the ask (BUY pressure on the named side); `taker=seller` means someone hit the bid (SELL
-  pressure on the named side). Direction matters.
-- insiders: top wallet-level position holders with their average entry price.
+- smart-money / whale trade lists: recent fills. `taker=buyer` means someone hit the ask (BUY
+  pressure on the named side); `taker=seller` means someone hit the bid (SELL pressure on the
+  named side). Direction matters. Note `whale_trades` here = ALL whale-size fills on the
+  named side, irrespective of consensus direction — the contrarian-vs-trend split is captured
+  separately in `tag_scores.contrarian_whales` (a wallet-reputation-weighted score). To read
+  the contrarian whale signal: high `contrarian_whales` tag + visible whale trades on the
+  named side = whales betting against the consensus price for that side. Low
+  `contrarian_whales` tag + visible whale trades = whales going WITH consensus.
+- insiders: top wallet-level position holders. Each line carries multiple signal fields —
+  `invested=` (position size USD), and (when UW could compute them) four Hashdive-only
+  signals you should weight as follows:
+    * `zscore=±X.XX` — invested_zscore = how outsized THIS wallet's position is vs ITS OWN
+      trading-history baseline (not vs the population). z ≥ 2.0 = "2+ sigma outsized bet"
+      = strong conviction signal. The renderer pre-flags these with `⚑ NOTABLE` and sorts
+      them to the top of the insider list so you spot them at a glance. Negative z = wallet
+      sized this position SMALLER than its usual — discount accordingly. Missing zscore
+      means the wallet didn't have enough trading history for UW to compute one.
+    * `pnl=±XX.X%` — running PnL on this market's position. Positive = wallet is winning
+      so far (early-entry validation; the trade thesis is holding). Negative = wallet has
+      drawn down but is still committed (lower-quality signal, but the position still
+      represents capital at risk).
+    * `n_pos=N` — concurrent positions across all Polymarket markets for this wallet. Low
+      (1-3) = concentrated conviction (treat as stronger signal); high (10+) = portfolio
+      diversifier (treat as weaker signal, the wallet may be running an algorithmic
+      strategy that doesn't reflect view-on-this-market).
+    * `days_in=N` — days since this wallet's FIRST trade on this specific market. Fresh
+      entries (≤7d) are more directional than aged positions; old positions (>30d) are
+      legacy commitments that may not reflect current view.
+  The `⚑ NOTABLE` marker collapses these into one bit — when you see it, the wallet's
+  invested_zscore crossed 2.0 and the line deserves more weight in your `uw_flow_note` and
+  reasoning. The header line tags the count: `(N, M notable ⚑)` means M of N insiders
+  cleared the threshold.
 Use flow as a cross-check on your synthesized probability — especially when the flow
 direction disagrees with the side your evidence favors. It's corroborating (or
 contradicting) flow data, not a price to anchor to. Absence of the block means UW has
@@ -152,9 +180,19 @@ When a UW flow block IS present, populate the `uw_flow_note` field with 2-4 sent
 together give the reader a concrete picture of the flow. Cover, roughly in this order:
   (a) which tags fired and their magnitude (e.g. "smart_money 3.2, contrarian_whales 3.4,
       insider_trades 0, momentum 2.0");
-  (b) direction of recent smart-money and contrarian-whale trades (taker=buyer means buy
-      pressure on YES; taker=seller means sell pressure on YES) — call it out explicitly;
-  (c) any notable insider positions (how many wallets, rough USD size, direction);
+  (b) direction of recent smart-money and whale trades (taker=buyer means buy pressure on
+      the named side; taker=seller means sell pressure on the named side) — call it out
+      explicitly. When `contrarian_whales` tag is high AND whale trades are visible, those
+      whales are fading consensus on the named side; when the tag is low, whales are with
+      consensus;
+  (c) notable insiders (the `⚑ NOTABLE` flag — invested_zscore ≥ 2). For each notable
+      wallet, name the zscore (outsized commitment magnitude), pnl% sign (winning vs
+      drawn-down on the position), and rough invested USD. A wallet at zscore=+3 with
+      pnl=+25% on a $40k position is a much stronger signal than a wallet at zscore=+2.1
+      with pnl=-5% on $1k. When there are NO notable insiders but there are non-notable
+      ones, still call out how many and rough total size — it's weaker signal but not zero.
+      Treat n_pos=1-3 wallets as concentrated conviction, n_pos=10+ wallets as portfolio
+      diversifiers (weaker signal — possibly algorithmic);
   (d) MCI value + delta when informative (high value with positive delta = conviction
       building; negative delta = unwinding);
   (e) whether the net flow direction agreed with or diverged from the side your
@@ -165,9 +203,11 @@ not for replacing reasoning — keep your main synthesis in `reasoning` as usual
 
 Example of a good note: "Smart_money 2.85 and momentum 3.10 on the Lakers side, with
 unusual_score 6.20 (notable). Recent smart-money trades skew taker=buyer — 4 buy fills to
-1 sell — net long Lakers. Two contrarian whales are taker=seller, fading the recent push.
-MCI value 72.4 with delta +12.1 — modest conviction building. Net flow direction sides
-with Lakers, corroborating the synthesis."
+1 sell — net long Lakers. Of 3 insiders, one is ⚑ NOTABLE: invested $42k at zscore=+2.97
+with pnl=+45% — outsized concentrated bet (n_pos=4) opened 2 days ago, currently winning.
+The other two insiders sit at smaller size and unremarkable zscores. MCI value 72.4 with
+delta +12.1 — modest conviction building. Net flow direction sides with Lakers,
+corroborating the synthesis."
 
 Structure the `reasoning` field (3-6 sentences) in this order:
 1. Which specialists you weighted most heavily and why (cite the lens names from your
