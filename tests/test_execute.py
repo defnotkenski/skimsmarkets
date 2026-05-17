@@ -541,11 +541,59 @@ def _t_classify() -> int:
     assert bucket == BUCKET_UNRATED and score is None, (bucket, score)
     n += 1
 
-    # No market implied → convergence term dropped, weights renormalize to
-    # 0.5 magnitude / 0.5 defensibility.
+    # No market implied AND no GBT prior → both convergence terms dropped,
+    # weights renormalize to magnitude / defensibility share only. Under
+    # the rebalanced post-GBT-convergence weights (M=0.40, D=0.25), the
+    # surviving 0.65 weight share normalizes to ~0.615 M / ~0.385 D.
+    from skimsmarkets.classify import W_MAGNITUDE, W_DEFENSIBILITY
     bucket, score = classify_risk(0.82, 0.72, None, predicted_winner_is_team_a=True)
-    assert score is not None and abs(score - (0.5 * 0.82 + 0.5 * 0.72)) < 1e-9, score
+    expected = (W_MAGNITUDE * 0.82 + W_DEFENSIBILITY * 0.72) / (
+        W_MAGNITUDE + W_DEFENSIBILITY
+    )
+    assert score is not None and abs(score - expected) < 1e-9, score
     assert bucket == BUCKET_LOCK, (bucket, score)
+    n += 2
+
+    # GBT convergence — when the director matches GBT closely on the picked
+    # side, the gbt_convergence term ~= 1.0 and lifts a borderline pick. A
+    # 0.65/0.60/+0.05_market pick that's also 0.0 from GBT lands LEAN (the
+    # GBT-convergence boost over the no-GBT case).
+    bucket_with_gbt, score_with_gbt = classify_risk(
+        0.65, 0.60, 0.05,
+        predicted_winner_is_team_a=True,
+        gap_to_gbt_signed=0.0,
+    )
+    bucket_without_gbt, score_without_gbt = classify_risk(
+        0.65, 0.60, 0.05,
+        predicted_winner_is_team_a=True,
+    )
+    # GBT-aligned pick should score STRICTLY higher than the same pick
+    # without a GBT cross-check — the convergence term contributes a
+    # positive value and the renormalization absorbs the dropped weight.
+    assert score_with_gbt is not None and score_without_gbt is not None
+    assert score_with_gbt > score_without_gbt, (
+        score_with_gbt, score_without_gbt,
+    )
+    n += 2
+
+    # GBT directional disagreement — director picks team_a at 0.55 but GBT
+    # says team_a wins at 0.30 (gap = +0.25). That's a directional
+    # disagreement on top of a large positive gap; the GBT convergence
+    # term should collapse and demote the score noticeably vs the same
+    # call with no GBT data.
+    _, score_gbt_disagree = classify_risk(
+        0.55, 0.65, 0.05,
+        predicted_winner_is_team_a=True,
+        gap_to_gbt_signed=0.25,
+    )
+    _, score_no_gbt = classify_risk(
+        0.55, 0.65, 0.05,
+        predicted_winner_is_team_a=True,
+    )
+    assert score_gbt_disagree is not None and score_no_gbt is not None
+    assert score_gbt_disagree < score_no_gbt, (
+        score_gbt_disagree, score_no_gbt,
+    )
     n += 2
 
     # team_b winner — gap_to_market_signed is team_a-anchored, so the anchor

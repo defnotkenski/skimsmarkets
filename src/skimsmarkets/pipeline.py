@@ -1438,23 +1438,10 @@ def _persist_run(result: RunResult) -> None:
                     )
                 else:
                     gap_to_market = None
-                # Deterministic risk classifier — combines magnitude
-                # (predicted probability), defensibility (judge), and
-                # convergence (gap to the market the LLMs never saw) into
-                # one of four full-spectrum buckets. Stored on `result` so
-                # `reporting.py` groups the leaderboard without recomputing
-                # the gap; also written to the JSONL row below.
-                risk_bucket, risk_score = classify_risk(
-                    p.predicted_yes_probability,
-                    da.defensibility_score if da is not None else None,
-                    gap_to_market,
-                    predicted_winner_is_team_a=predicted_winner_is_team_a,
-                    temperature=run_temperature,
-                )
-                result.risk_classifications[p.event_id] = (
-                    risk_bucket,
-                    risk_score,
-                )
+                # Pre-compute the gap-to-GBT first so the classifier can
+                # consume it alongside gap-to-market. Sim/GBT prior values
+                # are extracted here once; gap-to-sim is computed below
+                # for the JSONL payload (the classifier doesn't use it).
                 sim_p = (
                     tsim.p_team_a_wins if tsim is not None else None
                 )
@@ -1470,6 +1457,26 @@ def _persist_run(result: RunResult) -> None:
                     team_a_p_final - gbt_p
                     if (team_a_p_final is not None and gbt_p is not None)
                     else None
+                )
+                # Deterministic risk classifier — combines magnitude
+                # (predicted probability), defensibility (judge), and TWO
+                # convergence terms (gap to market the LLMs never saw,
+                # gap to GBT prior the director uses as baseline anchor)
+                # into one of four full-spectrum buckets. Stored on
+                # `result` so `reporting.py` groups the leaderboard
+                # without recomputing the gaps; also written to the JSONL
+                # row below.
+                risk_bucket, risk_score = classify_risk(
+                    p.predicted_yes_probability,
+                    da.defensibility_score if da is not None else None,
+                    gap_to_market,
+                    predicted_winner_is_team_a=predicted_winner_is_team_a,
+                    temperature=run_temperature,
+                    gap_to_gbt_signed=gap_to_gbt,
+                )
+                result.risk_classifications[p.event_id] = (
+                    risk_bucket,
+                    risk_score,
                 )
 
                 # Per-event token usage rollup
