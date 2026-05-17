@@ -272,7 +272,7 @@ KALSHI_DEFAULT_MAX_POSITION_CENTS = 5000
 # do I currently have at risk" is the metric most users actually
 # monitor, and the API field lets us check it directly against the
 # live account state.
-KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS = 10000
+KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS = 2000
 
 # --- Filter-flag defaults for `skims execute` ------------------------------
 # Empty tuple / None / False here = filter is OFF (every row passes).
