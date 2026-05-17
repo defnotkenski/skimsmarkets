@@ -943,6 +943,161 @@ def _t_uw_schema_decode() -> int:
     return n
 
 
+def _t_ev_per_dollar() -> int:
+    """`compute_ev_per_dollar` — asymmetric-payoff EV math.
+
+    Covers (a) the headline favorite-vs-underdog asymmetry (same 10pp
+    model edge → wildly different EV), (b) graceful None handling for
+    missing inputs and degenerate market prices, (c) the zero-edge
+    fair-market case.
+    """
+    from skimsmarkets.pipeline import compute_ev_per_dollar
+
+    # Favorite case: 60% model, 55% market → +9.2% EV per $1
+    fav = compute_ev_per_dollar(0.60, 0.55)
+    assert fav is not None and abs(fav - 0.0918) < 1e-3, f"fav EV: {fav}"
+    n = 1
+
+    # Underdog case: 30% model, 20% market → +50% EV per $1
+    # SAME 10pp edge as favorite case but 5x the EV — the asymmetric
+    # payoff effect anon's strategy exploits.
+    ug = compute_ev_per_dollar(0.30, 0.20)
+    assert ug is not None and abs(ug - 0.50) < 1e-3, f"ug EV: {ug}"
+    n += 1
+
+    # Fair-market case: model = market → EV = 0 (no edge either way)
+    fair = compute_ev_per_dollar(0.50, 0.50)
+    assert fair is not None and abs(fair) < 1e-9, f"fair EV: {fair}"
+    n += 1
+
+    # Negative-edge case: 40% model, 50% market → -20% EV
+    neg = compute_ev_per_dollar(0.40, 0.50)
+    assert neg is not None and neg < 0 and abs(neg + 0.20) < 1e-3, f"neg EV: {neg}"
+    n += 1
+
+    # None inputs → None outputs (silent degrade for missing data)
+    assert compute_ev_per_dollar(None, 0.5) is None
+    assert compute_ev_per_dollar(0.5, None) is None
+    assert compute_ev_per_dollar(None, None) is None
+    n += 3
+
+    # Degenerate market prices (0 / 1) → None (payoff undefined)
+    assert compute_ev_per_dollar(0.5, 0.0) is None
+    assert compute_ev_per_dollar(0.5, 1.0) is None
+    # Out-of-range probabilities → None (defensive against bad data)
+    assert compute_ev_per_dollar(1.5, 0.5) is None
+    assert compute_ev_per_dollar(-0.1, 0.5) is None
+    n += 4
+
+    return n
+
+
+def _t_uw_trader_profile() -> int:
+    """Trader-profile enrichment: parse + attachment + rendering.
+
+    Mirror the structure of the /api/users/{address} response shape so
+    a vendor field rename trips the test instead of silently degrading
+    the director's edge signal.
+    """
+    from skimsmarkets.unusual_whales.models import UWInsider, UWTraderProfile
+    from skimsmarkets.unusual_whales.rendering import _fmt_insider
+
+    # 1) Parse — full payload with all fields. Mirrors a real /users/<addr> hit.
+    payload_full = {
+        "user_address": "0xabcdef0123456789abcdef0123456789abcdef01",
+        "user_name": "zerosmart",
+        "total_trades": 16438,
+        "address_tags": [],
+        "score": {
+            "is_smart": True,
+            "smart_score": "11.0333",  # vendor returns floats as strings
+            "win_rate": "0.4671",
+            "sum_pnl": "875955.5434",
+            "num_markets": 152,
+        },
+    }
+    prof = UWTraderProfile.parse(payload_full["user_address"], payload_full)
+    assert prof is not None
+    assert prof.is_smart is True
+    assert prof.smart_score is not None and abs(prof.smart_score - 11.0333) < 1e-3
+    assert prof.win_rate is not None and abs(prof.win_rate - 0.4671) < 1e-3
+    assert prof.sum_pnl is not None and prof.sum_pnl > 875000
+    assert prof.num_markets == 152
+    assert prof.total_trades == 16438
+    assert prof.user_name == "zerosmart"
+    n = 7
+
+    # 2) Parse — sparse score (wallet with too little history). UW returns
+    # `score: null` or omits subfields; parser must tolerate.
+    payload_sparse = {
+        "user_address": "0x1111111111111111111111111111111111111111",
+        "total_trades": 0,
+        "score": None,
+    }
+    sparse = UWTraderProfile.parse(payload_sparse["user_address"], payload_sparse)
+    assert sparse is not None
+    assert sparse.is_smart is None  # absent score → None, not False
+    assert sparse.smart_score is None
+    assert sparse.win_rate is None
+    n += 4
+
+    # 3) Rendering — insider WITHOUT profile gets only the size-tier fields.
+    insider_no_profile = UWInsider(
+        user_address="0xaaaa000000000000000000000000000000000000",
+        total_invested_usd=10000.0,
+        invested_zscore=3.5,
+        pnl_percent=0.20,
+    )
+    line_no = _fmt_insider(insider_no_profile)
+    assert "smart=" not in line_no
+    assert "wr=" not in line_no
+    assert "★ SMART" not in line_no
+    assert "⚑ NOTABLE" in line_no  # z=3.5 is notable
+    n += 4
+
+    # 4) Rendering — insider WITH a smart profile gets the edge fields
+    # AND the ★ SMART marker, while preserving the ⚑ NOTABLE marker.
+    insider_smart = UWInsider(
+        user_address="0xbbbb000000000000000000000000000000000000",
+        total_invested_usd=15000.0,
+        invested_zscore=4.2,
+        pnl_percent=0.30,
+        profile=prof,  # the zerosmart profile from above
+    )
+    line_smart = _fmt_insider(insider_smart)
+    assert "smart=Y" in line_smart
+    assert "wr=47%" in line_smart  # 0.4671 → 47%
+    assert "lpnl=" in line_smart  # formatted via _fmt_money
+    assert "n_mkts=152" in line_smart
+    assert "★ SMART" in line_smart
+    assert "⚑ NOTABLE" in line_smart  # both markers can apply
+    n += 6
+
+    # 5) Rendering — non-smart profile gets edge fields but no SMART marker.
+    not_smart_prof = UWTraderProfile(
+        user_address="0xcccc000000000000000000000000000000000000",
+        is_smart=False,
+        smart_score=2.1,
+        win_rate=0.45,
+        sum_pnl=5000.0,
+        num_markets=12,
+        total_trades=50,
+    )
+    insider_not_smart = UWInsider(
+        user_address="0xcccc000000000000000000000000000000000000",
+        total_invested_usd=3000.0,
+        invested_zscore=2.5,
+        profile=not_smart_prof,
+    )
+    line_not_smart = _fmt_insider(insider_not_smart)
+    assert "smart=N" in line_not_smart
+    assert "★ SMART" not in line_not_smart
+    assert "⚑ NOTABLE" in line_not_smart  # still notable by size
+    n += 3
+
+    return n
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -970,6 +1125,8 @@ def main() -> int:
         ("retro scoring metrics", _t_metrics),
         ("temperature calibration", _t_calibration),
         ("uw hashdive schema decode", _t_uw_schema_decode),
+        ("uw trader profile enrichment", _t_uw_trader_profile),
+        ("ev per dollar math", _t_ev_per_dollar),
     ]
     failures = 0
     for name, fn in groups:

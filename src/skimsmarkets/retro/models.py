@@ -67,6 +67,32 @@ class PredictionRow(BaseModel):
     specialist_weights: dict[str, float] = Field(default_factory=dict)
     disagreements_flagged: list[str] = Field(default_factory=list)
     uw_flow_note: str | None = None
+    # UW insider-tier counts captured at decision time. Lets retro analysis
+    # ask "when SMART insiders were present, did the YES side win more
+    # often than when only NOTABLE-but-not-SMART insiders were present?"
+    # without requiring CURRENT UW state (which drifts as markets resolve).
+    # All three default to 0 — a row with `uw_insiders_total=0` either had
+    # no UW context attached or had a context with empty insider list; both
+    # are equivalent for retro purposes (no per-insider signal to grade).
+    # None-default means rows persisted BEFORE the snapshot field shipped
+    # can still decode without backfill; analysis script must treat None
+    # and 0 as "no usable snapshot" identically.
+    uw_insiders_total: int | None = None
+    uw_insiders_notable: int | None = None
+    uw_insiders_smart: int | None = None
+    # Expected value per $1 staked on the predicted winner side, computed
+    # from `predicted_winner_probability` and `polymarket_implied_probability`
+    # (both on the same picked-winner frame). Formula:
+    #   payoff_ratio = (1 - market_p) / market_p
+    #   ev_per_dollar = model_p * payoff_ratio - (1 - model_p)
+    # Positive = asymmetric edge (the bet pays more than its cost in
+    # expectation); negative = market is offering worse-than-fair odds for
+    # the predicted side. None when either probability is missing or
+    # market_p is at the degenerate edges (0 or 1) where payoff is
+    # undefined. Drives `scripts/ev_bucket_retro.py` hit-rate-by-EV-bucket
+    # analysis — tests whether high-EV underdog calls actually realize
+    # the implied dollar return.
+    ev_per_dollar: float | None = None
     defensibility_score: float | None = None
     defensibility_rationale: str | None = None
     defensibility_flags: list[str] = Field(default_factory=list)

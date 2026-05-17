@@ -138,6 +138,14 @@ class RunResult:
     defensibility_assessments: dict[str, DefensibilityAssessment] = field(
         default_factory=dict
     )
+    # UW insider-tier counts captured at decision time, keyed event_id →
+    # {"total": N, "notable": N, "smart": N}. Populated by
+    # `_collect_uw_insider_counts` right after `resolve_uw_context` so the
+    # counts exactly match what the director rendered. Events without a
+    # UW context (offshore, no coverage, fetch failure) are absent from
+    # the dict; `_get_uw_counts` returns Nones for missing keys. Drives
+    # `scripts/uw_enrichment_retro.py` hit-rate-by-tier analysis.
+    uw_insider_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     # Deterministic risk classification keyed event_id → (risk_bucket,
     # risk_score). Populated by `_persist_run` as it builds each JSONL row
     # — that's where the team_a-anchored gap to the market is computed, the
@@ -692,9 +700,30 @@ async def resolve_uw_context(
                 return
             yes_asset_id, _no_asset_id = snap.clob_token_ids
             ctx = await uw.get_market_detail(yes_asset_id)
-            if ctx is not None and ctx.has_actionable_signal():
-                for e in evs:
-                    e.uw_context = ctx
+            if ctx is None or not ctx.has_actionable_signal():
+                return
+            # Profile-enrich `is_notable()` insiders (z >= 2). The per-asset
+            # detail_agg gives us size-vs-baseline conviction (z) but not
+            # edge quality (is_smart, win_rate); fetch each notable wallet's
+            # trader profile to pair the two signals. Cache on the client
+            # short-circuits duplicate wallets across events in the slate.
+            # Profile fetch failures leave `insider.profile=None` — the
+            # renderer treats that as "no edge data" and renders only the
+            # size signal, which is current production behaviour.
+            notable = [
+                ins for ins in ctx.insiders
+                if ins.is_notable() and ins.user_address
+            ]
+            if notable:
+                profiles = await asyncio.gather(
+                    *(uw.get_trader_profile(ins.user_address) for ins in notable),
+                    return_exceptions=True,
+                )
+                for ins, prof in zip(notable, profiles):
+                    if not isinstance(prof, BaseException) and prof is not None:
+                        ins.profile = prof
+            for e in evs:
+                e.uw_context = ctx
 
     await asyncio.gather(*(_one(s, evs) for s, evs in by_slug.items()))
     attached = sum(1 for ev in events if ev.uw_context is not None)
@@ -702,6 +731,83 @@ async def resolve_uw_context(
         "attached unusual-whales context to %d/%d events",
         attached, len(events),
     )
+
+
+def _collect_uw_insider_counts(
+    events: list[PolymarketEvent],
+) -> dict[str, dict[str, int]]:
+    """Build {event_id: {total, notable, smart}} from attached UW contexts.
+
+    Called immediately after `resolve_uw_context` so the counts reflect
+    exactly what the director will render. Events without UW context are
+    omitted from the dict (not zero-filled) so retro analysis can
+    distinguish "no UW coverage" from "UW coverage with empty insider
+    list" — both render the same to the director but mean different
+    things upstream.
+    """
+    out: dict[str, dict[str, int]] = {}
+    for ev in events:
+        ctx = ev.uw_context
+        if ctx is None:
+            continue
+        total = len(ctx.insiders)
+        notable = sum(1 for i in ctx.insiders if i.is_notable())
+        smart = sum(
+            1 for i in ctx.insiders
+            if i.profile is not None and i.profile.is_smart is True
+        )
+        out[ev.id] = {"total": total, "notable": notable, "smart": smart}
+    return out
+
+
+def compute_ev_per_dollar(
+    model_p: float | None, market_p: float | None,
+) -> float | None:
+    """Expected value per $1 staked on the predicted side.
+
+    Math:
+      payoff_ratio = (1 - market_p) / market_p   # $ you win per $1 risked
+      ev_per_dollar = model_p * payoff_ratio - (1 - model_p)
+
+    Positive = the bet has asymmetric edge (pays more than fair); negative
+    = market offers worse-than-fair odds for the predicted side. Returns
+    None when either probability is missing OR market_p is at the
+    degenerate edges 0 / 1 (payoff is undefined). Both `model_p` and
+    `market_p` must be on the SAME side frame — for this codebase, that's
+    the predicted-winner frame (where `polymarket_implied_probability`
+    lives per the docstring at line 1411).
+
+    Exposed at module level (not private) so `scripts/ev_bucket_retro.py`
+    can reuse the formula when computing EV for older rows that predate
+    the persisted `ev_per_dollar` field.
+    """
+    if model_p is None or market_p is None:
+        return None
+    if not (0.0 < market_p < 1.0):
+        return None
+    if not (0.0 <= model_p <= 1.0):
+        return None
+    payoff_ratio = (1.0 - market_p) / market_p
+    return model_p * payoff_ratio - (1.0 - model_p)
+
+
+def _get_uw_counts(result: RunResult, event_id: str) -> dict[str, int | None]:
+    """Lookup helper for `_persist_run` — returns a dict ready to spread
+    into the prediction-row payload. Missing events get all-None values
+    so the JSONL row carries explicit nulls (distinguishable from "no
+    UW field at all" in older rows that predate the snapshot)."""
+    counts = result.uw_insider_counts.get(event_id)
+    if counts is None:
+        return {
+            "uw_insiders_total": None,
+            "uw_insiders_notable": None,
+            "uw_insiders_smart": None,
+        }
+    return {
+        "uw_insiders_total": counts.get("total"),
+        "uw_insiders_notable": counts.get("notable"),
+        "uw_insiders_smart": counts.get("smart"),
+    }
 
 
 async def enrich_tennis_stats(
@@ -1591,6 +1697,22 @@ def _persist_run(result: RunResult) -> None:
                     "specialist_weights": p.specialist_weights,
                     "disagreements_flagged": p.disagreements_flagged,
                     "uw_flow_note": p.uw_flow_note,
+                    # UW insider-tier counts at decision time, populated by
+                    # `_collect_uw_insider_counts` immediately after the UW
+                    # enrichment stage so the counts exactly match what the
+                    # director rendered from. All three None when no UW
+                    # context was attached (offshore market, no UW coverage,
+                    # fetch failure) — see `RunResult.uw_insider_counts`.
+                    **_get_uw_counts(result, p.event_id),
+                    # EV per $1 staked on predicted-winner side. Analytical
+                    # only — informs whether the picked side has asymmetric
+                    # edge given Polymarket pricing (independent of whether
+                    # Kalshi pricing matches at execution). None when either
+                    # the model or market probability is missing.
+                    "ev_per_dollar": compute_ev_per_dollar(
+                        p.predicted_yes_probability,
+                        p.polymarket_implied_probability,
+                    ),
                     # Per-event audit log — populated by the director when
                     # it set aside one of the lens-emitted shifts because
                     # the lens's notebook didn't support the magnitude.
@@ -2097,6 +2219,11 @@ async def run_pipeline(
                 uw_sem,
                 resolver=gamma_resolver,
             )
+            # Snapshot insider-tier counts right after enrichment so they
+            # exactly match what the director will render — any later
+            # mutation of `uw_context` would diverge the persisted counts
+            # from the LLM-visible reality.
+            result.uw_insider_counts = _collect_uw_insider_counts(events)
         # CLOB orderbook — top-of-book size, depth, full-book $ totals.
         # One HTTP per unique market slug; NO-side clones swap bid/ask
         # sides off the same YES-token book.

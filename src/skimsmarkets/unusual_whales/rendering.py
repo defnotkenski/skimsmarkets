@@ -49,13 +49,22 @@ def _fmt_insider(i: UWInsider) -> str:
     "outsized commitment" z-score, the wallet's running PnL on this
     market (`pnl`), the wallet's concurrent-positions count (`n_pos`,
     a diversification proxy), and recency-of-first-fill (`days_in`).
-    Notable wallets (`is_notable()` → invested_zscore ≥ 2) get an arrow
-    suffix so the director can spot them on the rendered slate without
-    re-parsing the number.
 
-    All new fields are conditionally included — older records or wallets
-    without enough history to compute z / PnL omit those sub-fields
-    rather than padding with "?" placeholders.
+    When the pipeline has attached a `UWTraderProfile` to this insider
+    (only happens for `is_notable()` wallets where the /api/users/{addr}
+    fetch succeeded), four trader-level edge fields also surface:
+    `smart=Y/N` (UW's binary informed-flow classifier), `wr=XX%` (lifetime
+    win rate), `lpnl=$X` (lifetime PnL across all markets), `n_mkts=N`
+    (lifetime markets traded). These let the director distinguish a wallet
+    that's notable-by-size-only from one that's also notable-by-edge.
+
+    Markers (suffix): `⚑ NOTABLE` (size signal, z ≥ 2), `★ SMART`
+    (edge signal, `is_smart=True`). Both can apply — those are the
+    highest-quality wallets in the rendered slate.
+
+    All fields are conditionally included — older records or wallets
+    without enough history to compute z / PnL / profile fields omit
+    those sub-fields rather than padding with "?" placeholders.
     """
     addr = i.user_address or "?"
     short = f"{addr[:8]}…{addr[-4:]}" if len(addr) >= 12 else addr
@@ -78,7 +87,24 @@ def _fmt_insider(i: UWInsider) -> str:
     # accumulated positions.
     if i.days_since_first_trade is not None:
         parts.append(f"days_in={i.days_since_first_trade}")
-    marker = "  ⚑ NOTABLE" if i.is_notable() else ""
+    # Trader-profile edge fields — present only when the pipeline ran
+    # `/api/users/{address}` enrichment on this notable wallet.
+    if i.profile is not None:
+        p = i.profile
+        if p.is_smart is not None:
+            parts.append(f"smart={'Y' if p.is_smart else 'N'}")
+        if p.win_rate is not None:
+            parts.append(f"wr={p.win_rate * 100:.0f}%")
+        if p.sum_pnl is not None:
+            parts.append(f"lpnl={_fmt_money(p.sum_pnl)}")
+        if p.num_markets is not None:
+            parts.append(f"n_mkts={p.num_markets}")
+    markers: list[str] = []
+    if i.is_notable():
+        markers.append("⚑ NOTABLE")
+    if i.profile is not None and i.profile.is_smart is True:
+        markers.append("★ SMART")
+    marker = "  " + "  ".join(markers) if markers else ""
     return f"    {short}  " + "  ".join(parts) + marker
 
 
@@ -155,19 +181,32 @@ def render_uw_block(ctx: UnusualWhalesContext) -> str:
         for t in ctx.whale_trades:
             lines.append(_fmt_trade(t))
     if ctx.insiders:
-        # Sort notable insiders to the top so the director sees the
-        # outsized-commitment wallets first. Within each group keep the
-        # API's native ordering (UW already ranks by invested USD
-        # descending). Header tags how many of the surfaced insiders
-        # are notable so the director can prioritize their reading.
-        sorted_insiders = sorted(
-            ctx.insiders, key=lambda x: (not x.is_notable(), 0),
-        )
+        # Sort by signal-quality tiers so the director sees the highest-
+        # quality wallets first: SMART+NOTABLE > NOTABLE only > everything
+        # else. SMART = `profile.is_smart=True` (proven edge across markets);
+        # NOTABLE = `invested_zscore >= 2` (outsized for this wallet). The
+        # two are orthogonal: a wallet can be SMART but not NOTABLE (smaller
+        # bet for them) or NOTABLE but not SMART (single-market specialist).
+        # Within each tier keep the API's invested-USD descending order.
+        def _priority(ins: UWInsider) -> tuple[bool, bool, int]:
+            is_smart = ins.profile is not None and ins.profile.is_smart is True
+            return (not is_smart, not ins.is_notable(), 0)
+
+        sorted_insiders = sorted(ctx.insiders, key=_priority)
         n_notable = sum(1 for i in ctx.insiders if i.is_notable())
+        n_smart = sum(
+            1 for i in ctx.insiders
+            if i.profile is not None and i.profile.is_smart is True
+        )
+        parts: list[str] = []
         if n_notable > 0:
+            parts.append(f"{n_notable} notable ⚑")
+        if n_smart > 0:
+            parts.append(f"{n_smart} smart ★")
+        if parts:
             header = (
                 f"  top insiders ({len(ctx.insiders)}, "
-                f"{n_notable} notable ⚑):"
+                f"{', '.join(parts)}):"
             )
         else:
             header = f"  top insiders ({len(ctx.insiders)}):"

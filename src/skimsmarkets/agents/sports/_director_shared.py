@@ -138,7 +138,11 @@ How to read it:
     * closing_soon: weight given to late urgency as expiration approaches.
 - MCI (Market Confidence Index): UW's proprietary composite on a 0–100 scale. `delta` is the
   recent change; large positive delta = conviction building, large negative = unwinding.
-- unusual_score: sum of weighted tag scores. Treat >5 as notable, >8 as material.
+- unusual_score: sum of weighted tag scores. The composite is structurally lopsided
+  (momentum + closing_soon weights dominate on near-resolved markets, outside this
+  pipeline's eligible range); within the events you see, individual fills (insiders,
+  whale trades, smart-money trades) are the load-bearing signal — the composite is
+  supporting context only.
 - smart-money / whale trade lists: recent fills. `taker=buyer` means someone hit the ask (BUY
   pressure on the named side); `taker=seller` means someone hit the bid (SELL pressure on the
   named side). Direction matters. Note `whale_trades` here = ALL whale-size fills on the
@@ -167,10 +171,35 @@ How to read it:
     * `days_in=N` — days since this wallet's FIRST trade on this specific market. Fresh
       entries (≤7d) are more directional than aged positions; old positions (>30d) are
       legacy commitments that may not reflect current view.
-  The `⚑ NOTABLE` marker collapses these into one bit — when you see it, the wallet's
-  invested_zscore crossed 2.0 and the line deserves more weight in your `uw_flow_note` and
-  reasoning. The header line tags the count: `(N, M notable ⚑)` means M of N insiders
-  cleared the threshold.
+  When the wallet cleared the notable bar (z ≥ 2), the pipeline ALSO fetches its trader
+  profile and appends four edge-quality fields. These answer "does this wallet have any
+  cross-market track record" — orthogonal to "is this bet big for them" (the z signal):
+    * `smart=Y/N` — UW's binary informed-flow classifier. Y = this wallet has demonstrated
+      consistent edge across markets; N = it has not. Roughly 3% of Polymarket holders
+      qualify. SMART wallets are the highest-quality signal; their conviction should
+      weight heavier than equal-sized bets from non-SMART wallets. The renderer adds a
+      `★ SMART` marker for is_smart=Y so you spot them at a glance.
+    * `wr=XX%` — lifetime win rate across all markets the wallet has traded. A SMART
+      wallet with wr=65% is a much stronger signal than one with wr=52%; below 50% means
+      they've been wrong more often than right (raw count, not risk-adjusted).
+    * `lpnl=$X` — lifetime PnL in USD across all markets. Big positive lpnl = profitable
+      trader regardless of win rate (they could be right less often but size bigger when
+      right). Negative lpnl = net loser; treat their notable position with caution even
+      if marked SMART.
+    * `n_mkts=N` — lifetime markets traded. High n_mkts (100+) = experienced trader; very
+      low n_mkts (<10) means edge metrics rest on thin sample and should be discounted.
+  These four fields are absent when (a) the wallet wasn't notable enough to profile-fetch,
+  (b) UW doesn't track the wallet, (c) the wallet is too new for a score, or (d) the
+  profile fetch failed. Absent fields = no edge data; weight purely on size + PnL.
+
+  Marker semantics:
+    `⚑ NOTABLE` = invested_zscore ≥ 2 (size signal — outsized for THIS wallet)
+    `★ SMART`   = is_smart=Y (edge signal — proven track record across markets)
+  Both can apply. Wallets with BOTH are the highest-quality signal on the slate; weight
+  them heaviest. NOTABLE-only wallets (no SMART marker) often turn out to be single-
+  market specialists betting big on a topic they care about — the size is real but the
+  edge isn't validated. The header line tags both counts: `(N, M notable ⚑, K smart ★)`
+  means M of N cleared the size bar and K of N cleared the edge bar.
 Use flow as a cross-check on your synthesized probability — especially when the flow
 direction disagrees with the side your evidence favors. It's corroborating (or
 contradicting) flow data, not a price to anchor to. Absence of the block means UW has
@@ -189,10 +218,13 @@ together give the reader a concrete picture of the flow. Cover, roughly in this 
       wallet, name the zscore (outsized commitment magnitude), pnl% sign (winning vs
       drawn-down on the position), and rough invested USD. A wallet at zscore=+3 with
       pnl=+25% on a $40k position is a much stronger signal than a wallet at zscore=+2.1
-      with pnl=-5% on $1k. When there are NO notable insiders but there are non-notable
-      ones, still call out how many and rough total size — it's weaker signal but not zero.
-      Treat n_pos=1-3 wallets as concentrated conviction, n_pos=10+ wallets as portfolio
-      diversifiers (weaker signal — possibly algorithmic);
+      with pnl=-5% on $1k. When the `★ SMART` marker is present, call it out explicitly —
+      a SMART wallet's notable bet is the highest-quality wallet-level signal in the
+      block; weigh it heavier than a NOTABLE-only wallet of similar size. When there are
+      NO notable insiders but there are non-notable ones, still call out how many and
+      rough total size — it's weaker signal but not zero. Treat n_pos=1-3 wallets as
+      concentrated conviction, n_pos=10+ wallets as portfolio diversifiers (weaker
+      signal — possibly algorithmic);
   (d) MCI value + delta when informative (high value with positive delta = conviction
       building; negative delta = unwinding);
   (e) whether the net flow direction agreed with or diverged from the side your

@@ -151,6 +151,74 @@ class UWTrade(BaseModel):
         return self.size * self.price
 
 
+class UWTraderProfile(BaseModel):
+    """Trader-level UW profile from `/api/users/{address}`.
+
+    Captures EDGE-quality signals (is_smart, win_rate, lifetime PnL)
+    that are SEPARATE from per-market SIZE signals like
+    `UWInsider.invested_zscore`. The two answer different questions
+    at the same granularity:
+      - z-score (on insider): "how outsized is this bet FOR THEM?"
+      - is_smart / win_rate (on profile): "do THEY have edge?"
+
+    A wallet can score high on one and low on the other — a
+    single-market specialist often has z>>2 but is_smart=False
+    because they have no cross-market track record. Joining both
+    fields lets the director discount notable-by-size insiders
+    that aren't classified as informed.
+
+    UW's `score` block is nested under the user record; this model
+    flattens it to top-level for ergonomics. All fields optional —
+    wallets with too little history return a sparse `score` block.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    user_address: str
+    user_name: str | None = None
+    is_smart: bool | None = None
+    smart_score: float | None = None
+    # win_rate is a decimal ratio (0.55 = 55%); pre-multiply by 100 at
+    # display time the same way `pnl_percent` is handled.
+    win_rate: float | None = None
+    sum_pnl: float | None = None  # USD lifetime
+    num_markets: int | None = None
+    total_trades: int | None = None
+    address_tags: list[str] = Field(default_factory=list)
+
+    @field_validator("smart_score", "win_rate", "sum_pnl", mode="before")
+    @classmethod
+    def _f(cls, v: Any) -> Any:
+        return _coerce_float(v)
+
+    @classmethod
+    def parse(cls, address: str, payload: dict[str, Any]) -> UWTraderProfile | None:
+        """Parse `/api/users/{address}` response → flat profile.
+
+        `score` is nested in the response. Wallets with no score (too
+        little history) get a `score: None` from UW; we tolerate that
+        by treating the nested dict as empty. Returns None only when
+        the payload is fundamentally unparseable — sparse scores are
+        OK and surface as None on individual fields.
+        """
+        try:
+            score_raw = payload.get("score")
+            score = score_raw if isinstance(score_raw, dict) else {}
+            return cls(
+                user_address=address,
+                user_name=payload.get("user_name"),
+                is_smart=score.get("is_smart"),
+                smart_score=score.get("smart_score"),
+                win_rate=score.get("win_rate"),
+                sum_pnl=score.get("sum_pnl"),
+                num_markets=score.get("num_markets"),
+                total_trades=payload.get("total_trades"),
+                address_tags=payload.get("address_tags") or [],
+            )
+        except Exception:
+            return None
+
+
 class UWInsider(BaseModel):
     """One insider position snapshot from `/assets/{id}/detail_agg.insiders[]`.
 
@@ -176,6 +244,13 @@ class UWInsider(BaseModel):
     invested_zscore: float | None = None
     n_positions: int | None = None
     days_since_first_trade: int | None = None
+    # Trader-level edge profile, fetched separately from `/api/users/{address}`
+    # and attached by the pipeline AFTER the detail_agg parse for insiders
+    # that pass `is_notable()` (z >= 2). Stays None when (a) wallet has no
+    # address (b) profile fetch failed (c) the address is too new for UW
+    # to have a score on. The detail_agg response itself never carries
+    # this field — it's a join enrichment.
+    profile: UWTraderProfile | None = None
 
     @field_validator("first_trade_at", mode="before")
     @classmethod
@@ -259,22 +334,23 @@ class UnusualWhalesContext(BaseModel):
     def has_actionable_signal(self) -> bool:
         """True iff this context carries flow signal worth surfacing.
 
-        Threshold logic matches the director prompt's "notable / material"
-        bar: `unusual_score >= 5.0` is the prompt-defined cutoff for a
-        notable composite signal. Below that, individual tag values are
-        baseline noise (UW returns ~0.30 for tags that haven't fired
-        rather than nulls), and pulling the UW block into the director's
-        context just earns a verbose "effectively no flow" `uw_flow_note`
-        while burning tokens.
-
-        Three things make a context actionable:
+        Two things make a context actionable:
           - Real fills (smart_trades / whale_trades) or top insiders.
             UW filters these server-side to wallets that actually
-            triggered a tag pipeline, so presence alone is a signal
-            regardless of composite score.
-          - `unusual_score >= 5.0` — the prompt's "notable" threshold.
+            triggered a tag pipeline, so presence alone is a signal.
           - MCI `delta` of meaningful magnitude (`abs(delta) >= 5.0`).
             Static MCI values without a delta carry no directional info.
+
+        A prior version also gated on `unusual_score >= 5.0`, mirroring
+        the director prompt's "notable" threshold. That branch was
+        removed 2026-05-17 after a 100-market cross-category probe
+        found zero markets in production's eligible range (favorite
+        mid < `MAX_IMPLIED_PROBABILITY = 0.60`) where unusual_score
+        crossed 5.0 without also having real fills. The composite
+        score is structurally lopsided: momentum + closing_soon
+        weights concentrate it above 0.60, where the upstream blowout
+        filter has already dropped the event. Inside production's
+        range, the real-fills branch subsumes the composite trigger.
 
         Liquidity / volume / individual tag values / static MCI do NOT
         count: they either duplicate the per-market microstructure block
@@ -282,8 +358,6 @@ class UnusualWhalesContext(BaseModel):
         (a momentum tag at 0.30 means "the price moved at all").
         """
         if self.smart_trades or self.whale_trades or self.insiders:
-            return True
-        if self.unusual_score is not None and self.unusual_score >= 5.0:
             return True
         if (
             self.mci is not None

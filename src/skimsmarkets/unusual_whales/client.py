@@ -26,6 +26,7 @@ from skimsmarkets.unusual_whales.models import (
     UWLiquidity,
     UWMci,
     UWTrade,
+    UWTraderProfile,
     tag_scores_from_list,
 )
 
@@ -81,6 +82,13 @@ class UnusualWhalesClient:
         self._api_key = (api_key or "").strip() or None
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        # Per-instance trader-profile cache. Wallet edge changes slowly
+        # (UW recomputes scores on settled markets), so within a single
+        # run we can safely reuse a profile across events that share an
+        # insider. Cached value is the full `UWTraderProfile | None`
+        # result — caching None too prevents repeated 404 hammering on
+        # addresses UW doesn't track.
+        self._profile_cache: dict[str, UWTraderProfile | None] = {}
 
     @property
     def enabled(self) -> bool:
@@ -183,6 +191,70 @@ class UnusualWhalesClient:
             return None
 
         return _context_from_detail(asset_id, payload)
+
+    async def get_trader_profile(self, address: str) -> UWTraderProfile | None:
+        """GET /users/{address} → `UWTraderProfile`.
+
+        Per-instance cache: a wallet that holds positions across N events
+        in the same slate only triggers ONE HTTP call. Cache value is the
+        full result (including None) so unknown addresses don't repeatedly
+        round-trip. Same retry/backoff posture as `get_market_detail`.
+
+        Used by the pipeline to enrich `is_notable()` insiders with edge
+        signals (is_smart, win_rate, lifetime PnL) — fields the per-asset
+        `/detail_agg` endpoint doesn't carry. Returns None on disabled
+        client, 404 (untracked wallet), or persistent HTTP failure.
+        """
+        if not self.enabled or self._client is None:
+            return None
+        if address in self._profile_cache:
+            return self._profile_cache[address]
+        url = f"{_BASE_URL}/users/{address}"
+
+        resp: httpx.Response | None = None
+        for attempt in range(_RETRY_ATTEMPTS):
+            try:
+                resp = await self._client.get(url)
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status == 404:
+                    log.debug("uw trader %s: 404 (untracked)", address)
+                    self._profile_cache[address] = None
+                    return None
+                if status == 429 and attempt + 1 < _RETRY_ATTEMPTS:
+                    wait = _parse_retry_after(
+                        e.response.headers.get("Retry-After")
+                    ) or _RETRY_BASE_S * (2 ** attempt)
+                    await asyncio.sleep(wait)
+                    continue
+                log.warning("uw trader %s: HTTP %s", address, status)
+                self._profile_cache[address] = None
+                return None
+            except Exception as e:  # noqa: BLE001
+                log.warning("uw trader %s: %s", address, type(e).__name__)
+                self._profile_cache[address] = None
+                return None
+
+        if resp is None:
+            self._profile_cache[address] = None
+            return None
+
+        try:
+            payload = resp.json()
+        except Exception as e:  # noqa: BLE001
+            log.warning("uw trader %s: non-json response (%s)", address, e)
+            self._profile_cache[address] = None
+            return None
+
+        if not isinstance(payload, dict):
+            self._profile_cache[address] = None
+            return None
+
+        profile = UWTraderProfile.parse(address, payload)
+        self._profile_cache[address] = profile
+        return profile
 
 
 def _context_from_detail(
