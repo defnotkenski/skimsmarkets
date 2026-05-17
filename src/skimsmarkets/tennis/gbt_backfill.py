@@ -17,7 +17,7 @@ small static lookup. Splitting them keeps each parquet's schema
 purpose-built and lets re-runs of the profile fetch be cheap when the
 match table is already populated.
 
-Reuses the production `_TokenBucket` (5 req/sec) from `matchstat.py`
+Reuses the production `_TokenBucket` (7 req/sec) from `matchstat.py`
 so the backfill respects the same vendor budget the live pipeline
 does — no separate quota policy to maintain. Reuses
 `_normalize_name` likewise so the backfill table cross-joins cleanly
@@ -97,6 +97,19 @@ async def _get_json(
                 log.warning("429 from %s — sleeping %.1fs", path, wait)
                 await asyncio.sleep(wait)
                 continue
+            # Non-429 4xx: persistent client error (403 Forbidden on a
+            # specific player+page, 404 missing resource). Retrying
+            # won't help — vendor decision is sticky. Fail fast so the
+            # caller's per-player try/except can skip and continue
+            # rather than burning 5 attempts × ~15s of wall time on a
+            # call that will never succeed. 5xx still falls through to
+            # the existing retry loop (transient server errors do
+            # recover).
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                raise RuntimeError(
+                    f"GET {path} → {r.status_code} {r.reason_phrase} "
+                    f"(non-retryable client error)"
+                )
             r.raise_for_status()
             body = r.json()
             # Body-level throttle: vendor sometimes returns HTTP 200 OK
@@ -333,10 +346,29 @@ async def _backfill_tour(
             "birthdate": birth,
             "plays": info.get("plays"),
         })
-        # Past matches (the bulk of the API budget).
-        rows = await _fetch_past_matches(
-            client, bucket, tour, pid, pages, page_size
-        )
+        # Past matches (the bulk of the API budget). Wrapped in
+        # try/except so a single player's failure (vendor 403 on a
+        # withdrawn-data profile, persistent 5xx, network hiccup
+        # exceeding retry budget) skips that player rather than
+        # killing the whole multi-hour backfill. The MatchStat past-
+        # matches endpoint occasionally returns 403 for specific
+        # player+page combinations (probed 2026-05-17 on pid=13674
+        # page 8 during a wide top-200 backfill); 5 retries × ~15s
+        # each does not recover those calls because the failure is
+        # persistent, not transient. Skipping costs us ~300 to 1000
+        # matches per failed player, which is preferable to losing
+        # 100,000+ matches from the in-memory accumulator when the
+        # process crashes before the parquet write.
+        try:
+            rows = await _fetch_past_matches(
+                client, bucket, tour, pid, pages, page_size
+            )
+        except Exception as e:  # noqa: BLE001 — defensive on vendor flake
+            log.warning(
+                "past-matches fetch failed for %s/%s: %s — skipping player",
+                tour, pid, e,
+            )
+            rows = []
         for r in rows:
             flat = _flatten_match(r, tour)
             if flat is not None:

@@ -203,8 +203,8 @@ _RETRY_BASE_S = 1.0
 # rate from latency. `_BURST_TOKENS` lets the first few calls fire
 # back-to-back for snappy startup; subsequent calls drip out at the
 # steady rate.
-_REQUESTS_PER_SECOND = 5.0
-_BURST_TOKENS = 5
+_REQUESTS_PER_SECOND = 7.0
+_BURST_TOKENS = 7
 
 
 def _normalize_name(name: str) -> str:
