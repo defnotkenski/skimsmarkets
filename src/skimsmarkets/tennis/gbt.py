@@ -112,7 +112,15 @@ class _ModelBundle:
         self.model_version = (
             f"sha-{hashlib.blake2b(MODEL_PATH.read_bytes(), digest_size=8).hexdigest()}"
         )
-        # Birthdate lookup. Profiles are tiny (~100 rows); load eagerly.
+        # Birthdate lookup. Profile rows are authoritative when
+        # birthdate is present; players without a profile fall back to
+        # synthesized birthdate = first_appearance - 19y (matching the
+        # training path in `build_training_table`). Without the synth
+        # fallback, slate-time predictions for any player not in the
+        # current top-50 land age-derived features as NaN, which
+        # systematically degrades the age_diff, age_to_30_diff, and
+        # age_x_elo_diff signal at predict time vs train time —
+        # train/serve drift the model would silently suffer from.
         self.birthdates = {}
         if PLAYER_PROFILES_PATH.exists():
             profiles_df = pd.read_parquet(PLAYER_PROFILES_PATH)
@@ -124,6 +132,32 @@ class _ModelBundle:
                     continue
                 if isinstance(bd, pd.Timestamp) and not pd.isna(bd):
                     self.birthdates[(str(tour), int(pid))] = bd.date()
+        # Synthesize for any unique (tour, player_id) in the match
+        # parquet that lacks a real birthdate. 19y = the training-path
+        # SYNTH_FIRST_APPEARANCE_AGE_YEARS — kept in lockstep so a
+        # missing profile doesn't fork train-vs-serve behaviour.
+        _SYNTH_FIRST_APPEARANCE_AGE_YEARS = 19
+        if not matches_df.empty:
+            first_match: dict[tuple[str, int], pd.Timestamp] = {}
+            for _, row in matches_df.iterrows():
+                md = pd.Timestamp(row["match_date"])
+                tour_v = row.get("tour")
+                if tour_v is None:
+                    continue
+                for pid_col in ("p1_id", "p2_id"):
+                    pid_v = row.get(pid_col)
+                    if pid_v is None or pd.isna(pid_v):
+                        continue
+                    key = (str(tour_v), int(pid_v))
+                    if key not in first_match or md < first_match[key]:
+                        first_match[key] = md
+            for key, md in first_match.items():
+                if key in self.birthdates:
+                    continue
+                synth_bd = (md - pd.DateOffset(
+                    years=_SYNTH_FIRST_APPEARANCE_AGE_YEARS,
+                )).date()
+                self.birthdates[key] = synth_bd
 
 
 _BUNDLE: _ModelBundle | None = None

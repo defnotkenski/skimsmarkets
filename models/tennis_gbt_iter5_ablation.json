@@ -1,0 +1,36 @@
+{
+  "run_at_utc": "2026-05-17T06:19:50.173800+00:00",
+  "train_cutoff": "2024-12-31",
+  "n_train": 122198,
+  "n_holdout": 34968,
+  "variants": {
+    "baseline_iter2_plus_km": {
+      "n_features": 48,
+      "brier": 0.21128063361237095,
+      "log_loss": 0.6101492735633547,
+      "auc": 0.7262810758351421,
+      "best_iter": 538
+    },
+    "drop_km": {
+      "n_features": 46,
+      "brier": 0.21128617985403728,
+      "log_loss": 0.610064167629111,
+      "auc": 0.7261347348932182,
+      "best_iter": 990
+    },
+    "drop_h2h_clutch": {
+      "n_features": 40,
+      "brier": 0.2112102361793107,
+      "log_loss": 0.6099480599407523,
+      "auc": 0.726402859239321,
+      "best_iter": 590
+    },
+    "drop_both": {
+      "n_features": 38,
+      "brier": 0.21136183906507403,
+      "log_loss": 0.6102137957361133,
+      "auc": 0.7259147933063329,
+      "best_iter": 853
+    }
+  }
+}

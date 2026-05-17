@@ -1,5 +1,5 @@
 {
-  "trained_at_utc": "2026-05-17T06:22:07.241593+00:00",
+  "trained_at_utc": "2026-05-16T07:19:46.201006+00:00",
   "train_cutoff": "2024-12-31",
   "train_n": 122198,
   "holdout_n": 34968,
@@ -11,9 +11,9 @@
       "loss_function": "Logloss",
       "eval_metric": "Logloss",
       "iterations": 3000,
-      "learning_rate": 0.02,
+      "learning_rate": 0.03,
       "depth": 6,
-      "l2_leaf_reg": 2.0,
+      "l2_leaf_reg": 4.0,
       "random_seed": 42,
       "use_best_model": true,
       "od_type": "Iter",
@@ -40,6 +40,14 @@
       "age_diff",
       "h2h_advantage",
       "n_h2h_priors",
+      "h2h_decider_advantage",
+      "n_h2h_decider_priors",
+      "h2h_tiebreak_advantage",
+      "n_h2h_tiebreak_priors",
+      "h2h_comeback_advantage",
+      "n_h2h_comeback_priors",
+      "h2h_close_match_advantage",
+      "n_h2h_close_match_priors",
       "rank_diff",
       "rank_points_diff",
       "elo_global_diff",
@@ -52,13 +60,6 @@
       "season_doy_cos",
       "career_ace_rate_diff",
       "career_df_rate_diff",
-      "career_total_points_won_pct_diff",
-      "last_5_winrate_diff",
-      "last_25_winrate_diff",
-      "age_to_30_diff",
-      "age_x_elo_diff",
-      "career_serve_point_win_pct_diff",
-      "career_hold_pct_diff",
       "surface",
       "tier",
       "best_of"
@@ -82,6 +83,14 @@
       "age_diff",
       "h2h_advantage",
       "n_h2h_priors",
+      "h2h_decider_advantage",
+      "n_h2h_decider_priors",
+      "h2h_tiebreak_advantage",
+      "n_h2h_tiebreak_priors",
+      "h2h_comeback_advantage",
+      "n_h2h_comeback_priors",
+      "h2h_close_match_advantage",
+      "n_h2h_close_match_priors",
       "rank_diff",
       "rank_points_diff",
       "elo_global_diff",
@@ -93,14 +102,7 @@
       "season_doy_sin",
       "season_doy_cos",
       "career_ace_rate_diff",
-      "career_df_rate_diff",
-      "career_total_points_won_pct_diff",
-      "last_5_winrate_diff",
-      "last_25_winrate_diff",
-      "age_to_30_diff",
-      "age_x_elo_diff",
-      "career_serve_point_win_pct_diff",
-      "career_hold_pct_diff"
+      "career_df_rate_diff"
     ],
     "categorical_feature_columns": [
       "surface",
@@ -129,230 +131,231 @@
         "n_rows": 768378
       }
     },
-    "code_commit_sha": "c37d352",
+    "code_commit_sha": "331c389",
     "trainer_module": "skimsmarkets.tennis.gbt_train"
   },
   "train": {
-    "brier": 0.21391937208744924,
-    "log_loss": 0.6153041645729957,
-    "auc": 0.717342711650837,
+    "brier": 0.21351117654214968,
+    "log_loss": 0.6143321880823156,
+    "auc": 0.7186767890327475,
     "base_rate_anchor_wins": 0.5
   },
   "holdout": {
-    "brier": 0.21111836642520457,
-    "log_loss": 0.6097063713647461,
-    "auc": 0.7266832934315054,
+    "brier": 0.21138446568653022,
+    "log_loss": 0.6102487680517612,
+    "auc": 0.7258212738059927,
     "base_rate_anchor_wins": 0.5,
     "reliability_deciles": [
       {
         "bin_low": 0.0,
         "bin_high": 0.1,
-        "n": 332,
-        "mean_predicted": 0.08118284692898171,
-        "mean_observed": 0.04216867469879518
+        "n": 388,
+        "mean_predicted": 0.0777826894156799,
+        "mean_observed": 0.06958762886597938
       },
       {
         "bin_low": 0.1,
         "bin_high": 0.2,
-        "n": 1863,
-        "mean_predicted": 0.15777560540627134,
-        "mean_observed": 0.1610305958132045
+        "n": 1812,
+        "mean_predicted": 0.15915755105254448,
+        "mean_observed": 0.16114790286975716
       },
       {
         "bin_low": 0.2,
         "bin_high": 0.30000000000000004,
-        "n": 3925,
-        "mean_predicted": 0.2536247310110786,
-        "mean_observed": 0.2519745222929936
+        "n": 3831,
+        "mean_predicted": 0.2539957421431241,
+        "mean_observed": 0.2547637692508483
       },
       {
         "bin_low": 0.30000000000000004,
         "bin_high": 0.4,
-        "n": 5269,
-        "mean_predicted": 0.35171501824201307,
-        "mean_observed": 0.34370848358322265
+        "n": 5348,
+        "mean_predicted": 0.35236295252462674,
+        "mean_observed": 0.3419970082273747
       },
       {
         "bin_low": 0.4,
         "bin_high": 0.5,
-        "n": 6115,
-        "mean_predicted": 0.45024427786749366,
-        "mean_observed": 0.4382665576451349
+        "n": 6072,
+        "mean_predicted": 0.449970281402394,
+        "mean_observed": 0.4407114624505929
       },
       {
         "bin_low": 0.5,
         "bin_high": 0.6000000000000001,
-        "n": 6085,
-        "mean_predicted": 0.549847855566655,
-        "mean_observed": 0.5648315529991783
+        "n": 6064,
+        "mean_predicted": 0.5494869493582303,
+        "mean_observed": 0.5618403693931399
       },
       {
         "bin_low": 0.6000000000000001,
         "bin_high": 0.7000000000000001,
-        "n": 5249,
-        "mean_predicted": 0.6477644396941317,
-        "mean_observed": 0.6547913888359688
+        "n": 5416,
+        "mean_predicted": 0.6471146471966678,
+        "mean_observed": 0.6571270310192023
       },
       {
         "bin_low": 0.7000000000000001,
         "bin_high": 0.8,
-        "n": 3920,
-        "mean_predicted": 0.7460958958342613,
-        "mean_observed": 0.7423469387755102
+        "n": 3841,
+        "mean_predicted": 0.7460263747843973,
+        "mean_observed": 0.7396511325175735
       },
       {
         "bin_low": 0.8,
         "bin_high": 0.9,
-        "n": 1879,
-        "mean_predicted": 0.8423053219459082,
-        "mean_observed": 0.8477913783927621
+        "n": 1818,
+        "mean_predicted": 0.8414344922707081,
+        "mean_observed": 0.834983498349835
       },
       {
         "bin_low": 0.9,
         "bin_high": 1.0,
-        "n": 331,
-        "mean_predicted": 0.9187697401142566,
-        "mean_observed": 0.945619335347432
+        "n": 378,
+        "mean_predicted": 0.9218112505588516,
+        "mean_observed": 0.9497354497354498
       }
     ],
     "per_tour": {
       "atp": {
         "n": 19724,
-        "brier": 0.215297009430785,
-        "log_loss": 0.6193464855650225,
+        "brier": 0.21531926488506511,
+        "log_loss": 0.6193717750338389,
         "base_rate_anchor_wins": 0.5
       },
       "wta": {
         "n": 15244,
-        "brier": 0.20571167824348918,
-        "log_loss": 0.597233161414192,
+        "brier": 0.2062932836219866,
+        "log_loss": 0.5984446359529354,
         "base_rate_anchor_wins": 0.5
       }
     },
     "per_tier": {
       "challenger": {
         "n": 16168,
-        "brier": 0.21171471670898592
+        "brier": 0.21228410521835694
       },
       "futures": {
         "n": 504,
-        "brier": 0.20428837149679702
+        "brier": 0.2068634604184381
       },
       "grand_slam": {
         "n": 3906,
-        "brier": 0.1943208187598021
+        "brier": 0.1940334990960563
       },
       "main_tour": {
         "n": 8026,
-        "brier": 0.2125483811636449
+        "brier": 0.2126519767618993
       },
       "masters": {
         "n": 5754,
-        "brier": 0.21958672657686734
+        "brier": 0.21950955690007293
       },
       "team_cup": {
         "n": 580,
-        "brier": 0.21421120674483796
+        "brier": 0.21344591804682264
       },
       "tour_finals": {
         "n": 30,
-        "brier": 0.12490694135935577
+        "brier": 0.12423876916412309
       }
     },
     "buckets": {
       "lock": {
         "threshold": 0.75,
-        "n": 7837,
-        "coverage": 0.22411919469229008,
-        "hit_rate": 0.8149802220237335
+        "n": 7772,
+        "coverage": 0.22226035232212307,
+        "hit_rate": 0.8171641791044776
       },
       "lock_or_lean": {
         "threshold": 0.6,
-        "n": 22768,
-        "coverage": 0.6511095859071151,
-        "hit_rate": 0.7259311314125088
+        "n": 22832,
+        "coverage": 0.6529398307023564,
+        "hit_rate": 0.7240714786264891
       }
     },
     "per_tour_buckets": {
       "atp": {
         "lock": {
           "threshold": 0.75,
-          "n": 3674,
-          "coverage": 0.18627053336037314,
-          "hit_rate": 0.8010342950462711
+          "n": 3733,
+          "coverage": 0.18926181301967146,
+          "hit_rate": 0.8004286096972943
         },
         "lock_or_lean": {
           "threshold": 0.6,
-          "n": 12299,
-          "coverage": 0.6235550598255932,
-          "hit_rate": 0.7177006260671599
+          "n": 12422,
+          "coverage": 0.6297911174204015,
+          "hit_rate": 0.7178393173402029
         }
       },
       "wta": {
         "lock": {
           "threshold": 0.75,
-          "n": 4163,
-          "coverage": 0.2730910522172658,
-          "hit_rate": 0.8272880134518377
+          "n": 4039,
+          "coverage": 0.2649567042770926,
+          "hit_rate": 0.8326318395642486
         },
         "lock_or_lean": {
           "threshold": 0.6,
-          "n": 10469,
-          "coverage": 0.6867620047231697,
-          "hit_rate": 0.7356003438723852
+          "n": 10410,
+          "coverage": 0.6828916294935713,
+          "hit_rate": 0.7315081652257445
         }
       }
     }
   },
   "feature_importance": {
-    "career_first_serve_in_pct_diff": 1.6411530432912111,
-    "career_first_serve_win_pct_diff": 1.856038977770113,
-    "career_second_serve_win_pct_diff": 1.0652219306003132,
-    "career_first_serve_return_win_pct_diff": 1.6146865348318709,
-    "career_second_serve_return_win_pct_diff": 3.001571008159213,
-    "career_bp_save_pct_diff": 0.9060955505864641,
-    "career_bp_convert_pct_diff": 1.1286114377737002,
-    "career_tiebreak_winrate_diff": 1.1780727617566167,
-    "career_decider_winrate_diff": 3.4183767350223557,
-    "career_comeback_winrate_diff": 0.8476702511063521,
-    "career_close_match_winrate_diff": 2.2792527612395195,
-    "surface_first_serve_win_pct_diff": 1.5434995292358975,
-    "surface_record_diff": 1.038193212488798,
-    "last_n_winrate_diff": 0.24314082197496956,
-    "days_since_diff": 2.9584562390706686,
-    "age_diff": 1.0620398231766939,
-    "h2h_advantage": 0.961153080474343,
-    "n_h2h_priors": 0.6034900760779139,
-    "rank_diff": 4.87780230883943,
-    "rank_points_diff": 5.242359583766313,
-    "elo_global_diff": 21.684733216757788,
-    "elo_surface_diff": 8.214427747108603,
-    "surface_last_n_winrate_diff": 0.4786186817573784,
-    "fatigue_matches_14d_diff": 1.3734175476097978,
-    "recent_opp_rank_diff": 9.090261193399416,
-    "recent_set_diff_diff": 0.6553895689498989,
-    "season_doy_sin": 0.9952486978513287,
-    "season_doy_cos": 1.3494367206735836,
-    "career_ace_rate_diff": 0.926053774993446,
-    "career_df_rate_diff": 1.1654231798818275,
-    "career_total_points_won_pct_diff": 1.6369341430770472,
-    "last_5_winrate_diff": 0.8099623973647743,
-    "last_25_winrate_diff": 4.660354346620676,
-    "age_to_30_diff": 1.3371177082615444,
-    "age_x_elo_diff": 1.269920396622141,
-    "career_serve_point_win_pct_diff": 2.2525317247632257,
-    "career_hold_pct_diff": 1.89021428976947,
-    "surface": 1.1265743435632551,
-    "tier": 1.1276071008009207,
-    "best_of": 0.4888875529311532
+    "career_first_serve_in_pct_diff": 2.980446744752802,
+    "career_first_serve_win_pct_diff": 3.3496717360716755,
+    "career_second_serve_win_pct_diff": 2.3791208134212445,
+    "career_first_serve_return_win_pct_diff": 2.609130117845935,
+    "career_second_serve_return_win_pct_diff": 3.6409749440432377,
+    "career_bp_save_pct_diff": 1.653718874529002,
+    "career_bp_convert_pct_diff": 1.709752632169906,
+    "career_tiebreak_winrate_diff": 1.56922116136084,
+    "career_decider_winrate_diff": 0.0,
+    "career_comeback_winrate_diff": 1.9166101350421278,
+    "career_close_match_winrate_diff": 3.6558253338874844,
+    "surface_first_serve_win_pct_diff": 2.4754845890906525,
+    "surface_record_diff": 1.634466652012419,
+    "last_n_winrate_diff": 0.9320303853714964,
+    "days_since_diff": 3.10858743444546,
+    "age_diff": 0.4234913743760045,
+    "h2h_advantage": 0.8167052599478779,
+    "n_h2h_priors": 0.2900219865511619,
+    "h2h_decider_advantage": 0.0,
+    "n_h2h_decider_priors": 0.0,
+    "h2h_tiebreak_advantage": 0.14130372824193455,
+    "n_h2h_tiebreak_priors": 0.2803988160827697,
+    "h2h_comeback_advantage": 0.4162040872658193,
+    "n_h2h_comeback_priors": 0.36861499296756817,
+    "h2h_close_match_advantage": 0.258537358557008,
+    "n_h2h_close_match_priors": 0.1292313477370815,
+    "rank_diff": 5.450328391906269,
+    "rank_points_diff": 5.057521632914083,
+    "elo_global_diff": 21.70694274674109,
+    "elo_surface_diff": 8.131564462765903,
+    "surface_last_n_winrate_diff": 1.2896962396294565,
+    "fatigue_matches_14d_diff": 1.5157133084767342,
+    "recent_opp_rank_diff": 9.38677306059634,
+    "recent_set_diff_diff": 0.9820456844796238,
+    "season_doy_sin": 1.631739051680611,
+    "season_doy_cos": 1.7901852029234262,
+    "career_ace_rate_diff": 1.8853601672240452,
+    "career_df_rate_diff": 1.5716057732752076,
+    "surface": 1.3037999814533303,
+    "tier": 1.001299313610242,
+    "best_of": 0.5558744765521119
   },
   "sim_compare": {
     "n_paired": 34968,
-    "gbt_brier": 0.21111836642520457,
-    "sim_brier": 0.22561487666580873,
-    "gbt_log_loss": 0.6097063713647461,
-    "sim_log_loss": 0.6423153134801851
+    "gbt_brier": 0.21138446568653022,
+    "sim_brier": 0.22564608076670098,
+    "gbt_log_loss": 0.6102487680517612,
+    "sim_log_loss": 0.6424014864037845
   },
-  "model_version": "sha-0a552df1a46a0bbe",
+  "model_version": "sha-5cbd94f64c537a24",
   "model_path": "models/tennis_gbt_spike.cbm"
 }

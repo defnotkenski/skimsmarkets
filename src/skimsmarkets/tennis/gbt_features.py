@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Any
 
@@ -99,6 +99,14 @@ ELO_INITIAL = 1500.0
 # is intentionally simpler than the rank-decayed variant — the GBT
 # can pick up the "high-K player" signal via the cold-start match
 # count if it matters.
+#
+# Note: 2026-05-16 retrained with Sackmann adaptive K = 250 / (matches
+# + offset) ^ 0.4 at offsets 5 and 200, both hurt Brier (+0.0006 and
+# +0.0001 respectively). The adaptive K caused Elo to absorb more
+# importance (~+9 pts) but the holdout Brier degraded, suggesting the
+# adaptive form trades signal for noise in our truncated-history
+# data (parquet starts ~2017; pre-2017 career invisible to the K
+# decay, so veterans get over-large early K spuriously). Kept fixed.
 ELO_K = 24.0
 
 # Per-surface recent-form window. Mirrors RECENT_FORM_WINDOW but
@@ -106,6 +114,17 @@ ELO_K = 24.0
 # but 2-8 on clay over the same span shows a sharp surface-specific
 # form signal that the all-surfaces last-N misses.
 SURFACE_RECENT_WINDOW = 10
+
+# Multi-scale form windows. Last-5 captures the very-recent slice
+# (more reactive to a hot streak / cold spell), last-25 captures
+# the wider "season-state" picture (an injury comeback that's still
+# 6-week-old in a player's last-10 but resolved in last-25). The
+# literature (Dryja 2025, Sackmann references) consistently shows
+# multi-scale form beats single-window EWMA on tabular GBTs because
+# the tree splitter can use the trio of windows to pick up
+# regime-shift patterns single-window features hide.
+SHORT_FORM_WINDOW = 5
+LONG_FORM_WINDOW = 25
 
 # Fatigue lookback — count matches played in this rolling window
 # ending at the match date. 14d picked because it captures both ends
@@ -297,6 +316,17 @@ class PlayerHistory:
     career_aces: float = 0.0
     career_double_faults: float = 0.0
 
+    # Total-points-won fraction — the single most predictive in-match
+    # stat: a player who wins >50% of total points wins the match
+    # ~85-90% of the time (well-known Klaassen-Magnus result). Stored
+    # as numerator/denominator so the recency-decay multiplier in
+    # `_decay_to` keeps the ratio meaningful across the rolling window.
+    # Numerator = points subject won in this match; denominator =
+    # total points played by both sides (subject TPW + opp TPW). The
+    # `_pct` snapshot returns the recency-weighted career TPW rate.
+    total_points_won_n: float = 0.0
+    total_points_won_d: float = 0.0
+
     # Career-aggregate clutch counters, recency-weighted on the same
     # HALF_LIFE_DAYS schedule as the rate counters above. Derived from
     # the per-row score string via `parse_score_details`. Each pair is
@@ -342,6 +372,14 @@ class PlayerHistory:
 
     # Recent-form ring buffer (newest at the right). bool wins.
     recent: deque[bool] = field(default_factory=lambda: deque(maxlen=RECENT_FORM_WINDOW))
+
+    # Long-window form deque for the multi-scale form signal.
+    # last_5 reads off the right slice of `recent` (size-10) so no
+    # extra deque needed for short. last_25 needs its own deque
+    # because RECENT_FORM_WINDOW=10 — short of 25.
+    recent_long: deque[bool] = field(
+        default_factory=lambda: deque(maxlen=LONG_FORM_WINDOW)
+    )
 
     # Per-surface recent-form ring buffers. Keyed by surface_key()
     # value; each holds the last SURFACE_RECENT_WINDOW results on that
@@ -450,6 +488,8 @@ class PlayerHistory:
         self.close_match_played *= factor
         self.career_aces *= factor
         self.career_double_faults *= factor
+        self.total_points_won_n *= factor
+        self.total_points_won_d *= factor
         # Surface-bucket counters too — the surface_winrate /
         # surface_first_serve_win_pct features should be
         # recency-weighted on the same schedule as the global rates.
@@ -510,6 +550,14 @@ class PlayerHistory:
         # the score didn't parse cleanly — the dominance deque skips
         # rather than imputing 0.
         subject_set_diff: int | None = None,
+        # Subject's total points won this match + opponent's TPW.
+        # We accumulate subject's TPW and `total_points_played` =
+        # subject + opp TPW so the career rate is true points-won /
+        # points-played (not a biased mean-of-per-match ratios).
+        # Either being None skips the contribution (older rows with
+        # missing box scores).
+        my_total_points_won: int | None = None,
+        opp_total_points_won: int | None = None,
     ) -> None:
         """Fold one prior match's contribution into the running totals.
 
@@ -563,6 +611,16 @@ class PlayerHistory:
         # comparable across players regardless of match length.
         self.career_aces += n(my_aces)
         self.career_double_faults += n(my_double_faults)
+
+        # Total-points-won fold-in. Skip when either side's TPW is
+        # missing — don't bias the rate by treating one side's count
+        # as the full match total. ~5% of rows lose this contribution
+        # in the current parquet (the same rows that drop serve box
+        # scores) — they still count toward `matches` for the cold-
+        # start gate.
+        if my_total_points_won is not None and opp_total_points_won is not None:
+            self.total_points_won_n += my_total_points_won
+            self.total_points_won_d += my_total_points_won + opp_total_points_won
 
         # Surface bucket — same fields as overall but scoped.
         bucket = self.by_surface.setdefault(surface, _SurfaceAggregate())
@@ -628,6 +686,7 @@ class PlayerHistory:
 
         # Recent / counts.
         self.recent.append(won)
+        self.recent_long.append(won)
         # Per-surface recent deque. Set up the bucket on first
         # appearance; the deque is bounded so we don't have to prune.
         surf_deque = self.surface_recent.get(surface)
@@ -640,7 +699,7 @@ class PlayerHistory:
             self.wins += 1
 
         # Elo updates — global plus the surface bucket. Both use the
-        # same K-factor; the surface bucket warm-starts from this
+        # same fixed K-factor; the surface bucket warm-starts from this
         # player's current global Elo on first appearance on the
         # surface (rather than the chess-default 1500), so a strong
         # player's grass debut doesn't reset their grass Elo to
@@ -742,6 +801,73 @@ class PlayerHistory:
     def career_tiebreak_winrate(self) -> float | None:
         return _safe_div(self.tiebreak_won, self.tiebreak_played)
 
+    def career_total_points_won_pct(self) -> float | None:
+        """Recency-weighted fraction of total points won across the
+        player's matches in the rolling window. The single most
+        predictive in-match stat (Klaassen-Magnus 2001): TPW% > 0.50
+        correlates with match-win probability at ~85-90%. Computed
+        from the per-match TPW counters folded in `add_match` above,
+        decayed on the shared HALF_LIFE_DAYS schedule.
+        """
+        return _safe_div(self.total_points_won_n, self.total_points_won_d)
+
+    def career_serve_point_win_pct(self) -> float | None:
+        """Recency-weighted P(point won when serving), derived from the
+        career first-in, first-win, second-win rates the existing serve
+        features track:
+
+            p = first_in × first_win + (1 − first_in) × second_win
+
+        This is the per-point serve probability that drives the
+        Klaassen-Magnus closed-form for hold% (see `career_hold_pct`
+        below). Returning the per-point scalar separately gives the
+        GBT a denoised version of the serve-strength signal that the
+        constituent rates carry — the trees can split on the joint
+        (first_in × first_win) combination directly rather than
+        having to learn the multiplicative interaction across depth.
+        Returns None when any component rate is missing.
+        """
+        first_in = self.career_first_serve_in_pct()
+        first_win = self.career_first_serve_win_pct()
+        second_win = self.career_second_serve_win_pct()
+        if first_in is None or first_win is None or second_win is None:
+            return None
+        return first_in * first_win + (1.0 - first_in) * second_win
+
+    def career_hold_pct(self) -> float | None:
+        """Recency-weighted P(server holds game) under the Klaassen-
+        Magnus closed form. From the per-point serve probability `p`:
+
+            P(hold) = p^4 × (1 + 4q + 10q²)
+                    + 20 × p^5 × q^3 / (p² + q²)            (q = 1 - p)
+
+        Decomposes hold-game probability into:
+          - p^4 × (1 + 4q + 10q²): paths winning at 4-0 / 4-1 / 4-2
+          - 20 × p^5 × q^3 / (p² + q²): deuce loop terminating with
+            two consecutive server-won points
+
+        This is a non-linear transform of (first_in, first_win,
+        second_win) that even depth-6 trees can only approximate via
+        many splits; providing the scalar directly lets the splitter
+        save depth budget for other interactions. None when any
+        constituent serve rate is missing.
+        """
+        p = self.career_serve_point_win_pct()
+        if p is None:
+            return None
+        q = 1.0 - p
+        # Win at 4-0/4-1/4-2 paths.
+        leading = p ** 4 * (1.0 + 4.0 * q + 10.0 * q ** 2)
+        # Deuce loop: reach deuce at 3-3 (C(6,3) p^3 q^3 = 20 p^3 q^3)
+        # then win the deuce sub-game with prob p^2 / (p^2 + q^2).
+        # Combined: 20 × p^5 × q^3 / (p^2 + q^2). Guard against p == q == 0
+        # (impossible post the serve-pct gate above but defensive).
+        denom = p * p + q * q
+        if denom <= 0.0:
+            return leading
+        deuce = 20.0 * p ** 5 * q ** 3 / denom
+        return leading + deuce
+
     def career_decider_winrate(self) -> float | None:
         return _safe_div(self.decider_won, self.decider_played)
 
@@ -771,6 +897,32 @@ class PlayerHistory:
         if not self.recent:
             return None
         return sum(self.recent) / len(self.recent)
+
+    def last_short_winrate(self) -> float | None:
+        """Win-rate over the last SHORT_FORM_WINDOW matches. Reads off
+        the right slice of the bounded `recent` deque (size 10), so the
+        last-5 read is always the most recent 5 entries; partial-pop
+        only happens at the very first matches when the player has
+        fewer than SHORT_FORM_WINDOW priors at all, in which case we
+        return None (caller materialises as NaN — catboost reads as
+        missing, not as 0.5).
+        """
+        if not self.recent:
+            return None
+        slice_ = list(self.recent)[-SHORT_FORM_WINDOW:]
+        if not slice_:
+            return None
+        return sum(slice_) / len(slice_)
+
+    def last_long_winrate(self) -> float | None:
+        """Win-rate over the last LONG_FORM_WINDOW matches. Reads off
+        the dedicated `recent_long` deque (size 25). None until the
+        player has at least one prior match logged — same convention
+        as `last_n_winrate`.
+        """
+        if not self.recent_long:
+            return None
+        return sum(self.recent_long) / len(self.recent_long)
 
     def surface_last_n_winrate(self, surface: str | None) -> float | None:
         """Recent-form winrate on the requested surface, computed off
@@ -984,8 +1136,23 @@ def _add_match_from_row(
     )
     if isinstance(score_raw, float) and pd.isna(score_raw):
         score_raw = None
-    best_of = _row_get_int(row, "best_of")
-    score_details = parse_score_details(score_raw, best_of, winner_side)
+    # MatchStat past-matches drops the `best_of` field — the column is
+    # 100% NaN in the parquet. Without inference, every `parse_score_details`
+    # call gets `best_of=None` and `went_to_decider` is locked to False,
+    # which 100%-NaN's `career_decider_winrate_diff` and the H2H decider
+    # features (verified empirically). We derive `best_of` from the parsed
+    # n_sets + tier using the same rules `infer_best_of` applies; then
+    # we rebuild `score_details` with a corrected `went_to_decider`.
+    raw_best_of = _row_get_int(row, "best_of")
+    tier_for_bo = tier_key(_row_get_int(row, "rank_id"))
+    score_details = parse_score_details(score_raw, raw_best_of, winner_side)
+    if score_details is not None and raw_best_of is None:
+        inferred_bo = infer_best_of(score_details.n_sets, tier_for_bo)
+        if score_details.went_to_decider != (score_details.n_sets == inferred_bo):
+            score_details = replace(
+                score_details,
+                went_to_decider=(score_details.n_sets == inferred_bo),
+            )
 
     # Pre-snapshot both players' Elos BEFORE either add_match call.
     # Critical for symmetry — if we read h2's Elo after h1.add_match
@@ -1018,8 +1185,9 @@ def _add_match_from_row(
     p1_set_diff: int | None = None
     p2_set_diff: int | None = None
     if score_details is not None:
-        tier = tier_key(_row_get_int(row, "rank_id"))
-        inferred_bo = infer_best_of(score_details.n_sets, tier)
+        # Reuse the hoisted tier_for_bo / inferred best_of from the
+        # went_to_decider correction above — same derivation, same value.
+        inferred_bo = infer_best_of(score_details.n_sets, tier_for_bo)
         winner_sets_won = inferred_bo // 2 + 1
         loser_sets_won = score_details.n_sets - winner_sets_won
         # Defensive: a malformed score that reports more sets than
@@ -1057,6 +1225,8 @@ def _add_match_from_row(
         opp_pre_match_elo_surface=h2_pre_elo_s,
         opp_rank_at_match=p2_rank_at_match,
         subject_set_diff=p1_set_diff,
+        my_total_points_won=_row_get_int(row, "p1_total_points_won"),
+        opp_total_points_won=_row_get_int(row, "p2_total_points_won"),
     )
     h2.add_match(
         match_date=on_date,
@@ -1084,6 +1254,8 @@ def _add_match_from_row(
         opp_pre_match_elo_surface=h1_pre_elo_s,
         opp_rank_at_match=p1_rank_at_match,
         subject_set_diff=p2_set_diff,
+        my_total_points_won=_row_get_int(row, "p2_total_points_won"),
+        opp_total_points_won=_row_get_int(row, "p1_total_points_won"),
     )
 
 
@@ -1166,21 +1338,17 @@ NUMERIC_FEATURE_COLUMNS: tuple[str, ...] = (
     # this change).
     "h2h_advantage",
     "n_h2h_priors",
-    # Matchup-conditioned clutch — derived from `_H2HRecord` sub-counts
-    # the parquet now carries (added 2026-05-15). Each advantage is
-    # centered at 0 like `h2h_advantage` so anchor-swap symmetry holds.
-    # Each pairs with its own sample-size count so the GBT can learn
-    # to discount thin-sample rates. Distinct from the career-aggregate
-    # clutch columns above — these say "deciders specifically vs THIS
-    # opponent" rather than "deciders generally."
-    "h2h_decider_advantage",
-    "n_h2h_decider_priors",
-    "h2h_tiebreak_advantage",
-    "n_h2h_tiebreak_priors",
-    "h2h_comeback_advantage",
-    "n_h2h_comeback_priors",
-    "h2h_close_match_advantage",
-    "n_h2h_close_match_priors",
+    # Matchup-conditioned clutch sub-counts (decider/tiebreak/comeback/
+    # close-match advantages + their n_priors counterparts) were added
+    # 2026-05-15 then PRUNED 2026-05-16 after an iter5 ablation showed
+    # they hurt the model — Brier 0.21121 (40 features without) vs
+    # 0.21128 (48 features with). All 8 features sat at <0.30
+    # importance (combined ~2% of total) and their thin-sample noise
+    # cost more than the matchup-specific signal they added. The main
+    # `h2h_advantage` + `n_h2h_priors` are retained (1.0+ combined
+    # importance) — the matchup signal lives there, the clutch
+    # subdivision was over-segmentation.
+    # See models/tennis_gbt_iter5_ablation.json for the comparison.
     # Point-in-time rankings — anchor minus opp under the symmetric
     # form. `rank_diff` uses opp − anchor because lower rank number =
     # stronger player; positive `rank_diff` therefore means anchor is
@@ -1249,6 +1417,51 @@ NUMERIC_FEATURE_COLUMNS: tuple[str, ...] = (
     # tree can exploit.
     "career_ace_rate_diff",
     "career_df_rate_diff",
+    # Total-points-won %, anchor − opp. The single most predictive
+    # post-match scalar (Klaassen-Magnus 2001: TPW > 0.50 → ~85-90%
+    # match-win rate). Career-aggregate with the same recency-decay
+    # schedule as the rate counters above, so a player whose TPW%
+    # collapsed in the last 6 months registers a sharp drop here.
+    "career_total_points_won_pct_diff",
+    # Multi-scale form windows. The existing `last_n_winrate_diff`
+    # uses RECENT_FORM_WINDOW=10 — too long to catch a 3-match cold
+    # spell, too short to read seasonal-state. The literature
+    # consensus (Dryja 2025 thesis, Sackmann tennis-Elo refs) is that
+    # multi-scale form (5 / 10 / 25) beats single-window EWMA for
+    # tabular GBTs because the splitter can pick up regime-shift
+    # patterns single-window features collapse. Diffs follow the same
+    # anchor-minus-opp orientation as `last_n_winrate_diff`.
+    "last_5_winrate_diff",
+    "last_25_winrate_diff",
+    # Age-to-30 difference. |age - 30| is a "distance from peak"
+    # signal — the inverted-U aging curve in tennis peaks around 26-30
+    # for both tours (Buhamra et al. 2025 ATP, Brier 0.151 on Slams
+    # with Age.30 + Age × Elo). The diff says "anchor is further from
+    # peak than opp" (positive value); a tree splitter on the joint
+    # (age_to_30_diff, elo_global_diff) plane can learn rookie-vs-
+    # veteran handicaps that linear age_diff misses (a 22yo vs 22yo
+    # match has age_diff=0 AND age_to_30_diff=0; a 22yo vs 33yo has
+    # age_diff=−11 but age_to_30_diff=−3, telling the model BOTH are
+    # off-peak).
+    "age_to_30_diff",
+    # Age × Elo interaction. Captures "veteran with high Elo retains
+    # value vs young high-Elo player who's still climbing" effects the
+    # main-effect features (age_diff, elo_global_diff) cannot express
+    # additively. Trees CAN learn interactions implicitly via deep
+    # splits, but giving them as an explicit feature lets the tree
+    # use shallow splits on the interaction and save depth budget for
+    # other signals. Sign convention: anchor's age*elo minus opp's.
+    "age_x_elo_diff",
+    # Klaassen-Magnus closed-form derivations from the per-point
+    # serve probability. `career_serve_point_win_pct_diff` is the
+    # smoothed per-point scalar (first_in×first_win + (1-first_in)
+    # ×second_win), `career_hold_pct_diff` is the game-level hold
+    # probability via the standard tennis-stat closed form. Both are
+    # nonlinear transforms of the existing serve-rate features —
+    # the GBT can approximate them via deep splits but giving the
+    # explicit scalars saves split-budget for other interactions.
+    "career_serve_point_win_pct_diff",
+    "career_hold_pct_diff",
 )
 
 CATEGORICAL_FEATURE_COLUMNS: tuple[str, ...] = ("surface", "tier", "best_of")
@@ -1479,6 +1692,59 @@ def compute_features(
         opponent_history.career_df_rate(),
     )
 
+    # Total-points-won diff — Klaassen-Magnus's "single best in-match
+    # stat" lifted into the prior. Reads off the points-won counter
+    # in `PlayerHistory` (folded per-match, recency-decayed on the
+    # shared HALF_LIFE_DAYS schedule).
+    feats["career_total_points_won_pct_diff"] = _diff_or_nan(
+        anchor_history.career_total_points_won_pct(),
+        opponent_history.career_total_points_won_pct(),
+    )
+
+    # Multi-scale form diffs (last-5 and last-25) — complement
+    # last_n_winrate_diff (last-10). Multi-scale form is a consistent
+    # winner in the 2023-2026 tennis-ML literature (Dryja 2025).
+    feats["last_5_winrate_diff"] = _diff_or_nan(
+        anchor_history.last_short_winrate(),
+        opponent_history.last_short_winrate(),
+    )
+    feats["last_25_winrate_diff"] = _diff_or_nan(
+        anchor_history.last_long_winrate(),
+        opponent_history.last_long_winrate(),
+    )
+
+    # Age-to-30 and Age × Elo. Both derived inline from values already
+    # computed above (a_age / o_age + the Elo readings). Buhamra et al.
+    # 2025 showed Age.30 + Age × Elo were the top non-Elo contributors
+    # on Grand Slam Brier (0.151 vs ~0.18 baseline). The trees can
+    # learn interactions implicitly, but explicit features let them
+    # use shallower splits and save depth budget.
+    a_to_30 = None if a_age is None else abs(a_age - 30.0)
+    o_to_30 = None if o_age is None else abs(o_age - 30.0)
+    feats["age_to_30_diff"] = _diff_or_nan(a_to_30, o_to_30)
+    a_age_elo = (
+        None if a_age is None else a_age * anchor_history.global_elo()
+    )
+    o_age_elo = (
+        None if o_age is None else o_age * opponent_history.global_elo()
+    )
+    feats["age_x_elo_diff"] = _diff_or_nan(a_age_elo, o_age_elo)
+
+    # KM-derived per-point and hold% scalars. Both diffs land NaN
+    # when either side's serve rates aren't all observed (rare
+    # post-cold-start). The per-point and hold% are produced by the
+    # same `PlayerHistory` accessor — so a future regression to the
+    # serve-rate features lights up here too, and the dependency is
+    # explicit.
+    feats["career_serve_point_win_pct_diff"] = _diff_or_nan(
+        anchor_history.career_serve_point_win_pct(),
+        opponent_history.career_serve_point_win_pct(),
+    )
+    feats["career_hold_pct_diff"] = _diff_or_nan(
+        anchor_history.career_hold_pct(),
+        opponent_history.career_hold_pct(),
+    )
+
     # Categoricals — never None; catboost can take a literal "unknown"
     # token but mixing None with strings breaks pandas → catboost
     # ingestion. Use string sentinels so the column dtype stays object.
@@ -1602,6 +1868,53 @@ def build_training_table(
         if isinstance(bd, pd.Timestamp) and not pd.isna(bd):
             bd_date = bd.date()
         profile_lookup[(str(tour), int(pid))] = {"birthdate": bd_date}
+
+    # Synthesize birthdates for players who have NO profile entry (or
+    # whose profile lacks `birthdate`) using their first appearance in
+    # match data. The MatchStat profiles endpoint only covers the
+    # current top ~50 per tour (~398 total) but our match table has
+    # ~8400 unique player IDs; without this, age_diff was 85% NaN.
+    #
+    # Tour-level pros generally start playing tour matches between 17
+    # and 22. We assume `first_appearance_age = 19` as a midpoint:
+    # earlier than the typical "turned pro" age (~17 in the existing
+    # turnedPro fallback) because not every player gets tour-level
+    # matches at 17, but later than the floor. Bias is ±2-3 years on
+    # individual players — coarser than a real birthdate but coherent
+    # enough that age_diff captures veteran-vs-newcomer matchups that
+    # were entirely invisible before. Per-pair noise mostly cancels in
+    # the diff feature; the systematic underestimate (real age is
+    # typically slightly older than 19 + years-since-first-match for
+    # the 22+ pros) shifts the whole distribution by a constant which
+    # the GBT treats as a baseline shift the trees will compensate for
+    # at split time.
+    _SYNTH_FIRST_APPEARANCE_AGE_YEARS = 19
+    if not matches_df.empty:
+        first_match: dict[tuple[str, int], pd.Timestamp] = {}
+        for _, row in matches_df.iterrows():
+            md = pd.Timestamp(row["match_date"])
+            tour_v = str(row["tour"]) if "tour" in row.index else None
+            if tour_v is None:
+                continue
+            for pid_col in ("p1_id", "p2_id"):
+                pid_v = _row_get_int(row, pid_col)
+                if pid_v is None:
+                    continue
+                key = (tour_v, int(pid_v))
+                if key not in first_match or md < first_match[key]:
+                    first_match[key] = md
+        for key, md in first_match.items():
+            existing = profile_lookup.get(key)
+            if existing is not None and existing.get("birthdate") is not None:
+                continue
+            synth_bd = (md - pd.DateOffset(
+                years=_SYNTH_FIRST_APPEARANCE_AGE_YEARS,
+            )).date()
+            if existing is None:
+                profile_lookup[key] = {"birthdate": synth_bd}
+            else:
+                # Profile present but birthdate missing — fill it.
+                existing["birthdate"] = synth_bd
 
     rank_lookup = _build_rank_lookup(rankings_df) if rankings_df is not None else {}
 

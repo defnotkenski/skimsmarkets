@@ -73,18 +73,26 @@ METRICS_PATH = Path("models/tennis_gbt_spike.metrics.json")
 # CatBoost hyperparameters. v3 settled on depth=6 — bumping to 8
 # (tested) made trees overfit faster without lifting holdout Brier
 # (depth=8 stopped at iteration 365 vs 540 for depth=6, identical
-# metrics). The iteration ceiling and early-stopping patience are
-# kept generous (3000 / 100) so future re-trains on a wider backfill
-# don't artificially cap; both defaults are no-ops when the model
-# converges sooner. Re-grade vs the previous artefact's metrics.json
+# metrics). 2026-05-16 hparam search (81-trial grid over depth × lr
+# × l2 × min_data_in_leaf, see `models/tennis_gbt_hparam_search.json`)
+# picked depth=6 lr=0.02 l2=2.0 as the winning combination — lr
+# nudged down from 0.03 (more iterations, more careful fit) and l2
+# halved from 4.0 (less regularization, the model wasn't overfitting
+# under the prior schedule). The grid also showed `min_data_in_leaf`
+# at None/30/100 all gave identical Brier — leaf size isn't binding
+# at our data scale, so we leave it at the catboost default.
+# Iteration ceiling and early-stopping patience are kept generous
+# (3000 / 100) so future re-trains on wider backfills don't
+# artificially cap; both defaults are no-ops when the model
+# converges sooner. Re-grade vs the previous artifact's metrics.json
 # after any change here.
 _CATBOOST_PARAMS: dict[str, Any] = {
     "loss_function": "Logloss",
     "eval_metric": "Logloss",
     "iterations": 3000,
-    "learning_rate": 0.03,
+    "learning_rate": 0.02,
     "depth": 6,
-    "l2_leaf_reg": 4.0,
+    "l2_leaf_reg": 2.0,
     "random_seed": 42,
     "use_best_model": True,
     "od_type": "Iter",
