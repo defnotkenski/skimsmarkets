@@ -19,7 +19,7 @@ float-valued field parses via `_coerce_float` for tolerance.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -189,6 +189,33 @@ class UWInsider(BaseModel):
     @classmethod
     def _f(cls, v: Any) -> Any:
         return _coerce_float(v)
+
+    # Notable-insider z-score threshold. The `invested_zscore` field
+    # measures how outsized THIS wallet's investment is vs its OWN
+    # trading-history baseline (not vs the whole population). A z of 2
+    # is the standard "2 sigma outlier" cutoff — empirically this
+    # catches wallets going materially out of their usual range while
+    # filtering out routine "I always bet ~$1k on tennis matches"
+    # wallets. Tuned to match the prompt's "notable" framing on tag
+    # weights (`unusual_score >= 5.0`), with the same property: small
+    # enough that real signal fires, large enough that baseline noise
+    # doesn't.
+    NOTABLE_ZSCORE_THRESHOLD: ClassVar[float] = 2.0
+
+    def is_notable(self) -> bool:
+        """True iff this insider sized their position unusually large
+        vs their own trading-history baseline (invested_zscore >= 2.0).
+
+        Captures the "outsized commitment" signal new in the Hashdive
+        API — old `api.unusualwhales.com` couldn't compute this because
+        the per-wallet baseline wasn't surfaced. Returns False when
+        invested_zscore is missing (older records or wallets without
+        enough history to compute a meaningful z).
+        """
+        return (
+            self.invested_zscore is not None
+            and self.invested_zscore >= self.NOTABLE_ZSCORE_THRESHOLD
+        )
 
 
 class UnusualWhalesContext(BaseModel):

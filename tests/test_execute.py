@@ -889,6 +889,22 @@ def _t_uw_schema_decode() -> int:
     assert ctx.has_actionable_signal() is True
     n += 1
 
+    # is_notable — invested_zscore >= 2.0 marks the position as
+    # outsized vs the wallet's own baseline. Fixture has one wallet
+    # at z=2.97 (notable) and one at z=0.77 (not notable). Verify the
+    # discrimination AND the ordering invariant the renderer relies on.
+    notable = [i for i in ctx.insiders if i.is_notable()]
+    assert len(notable) == 1, "fixture should have exactly one notable insider"
+    assert notable[0].invested_zscore is not None
+    assert notable[0].invested_zscore >= 2.0
+    not_notable = [i for i in ctx.insiders if not i.is_notable()]
+    assert len(not_notable) == 1
+    assert (
+        not_notable[0].invested_zscore is None
+        or not_notable[0].invested_zscore < 2.0
+    )
+    n += 4
+
     # Rendering — no crashes, contains the key field markers the
     # director prompt reads off. If a field rename breaks the render,
     # the director sees `?` placeholders and we want to catch that here.
@@ -898,6 +914,31 @@ def _t_uw_schema_decode() -> int:
     assert "tag weights:" in rendered
     assert "MCI:" in rendered
     n += 4
+
+    # Renderer surfaces the new Hashdive insider signal fields. The
+    # director uses these directly when deciding whether to lean into
+    # an insider play; missing them silently degrades the prompt
+    # quality without any error. Verify each appears in the rendered
+    # text so a regression on the renderer (e.g. dropping a field
+    # back to invested-only) trips the test.
+    assert "zscore=" in rendered
+    assert "pnl=" in rendered
+    assert "n_pos=" in rendered
+    assert "days_in=" in rendered
+    # Notable-insider callout: header tags the count, individual row
+    # gets a ⚑ marker. Both are how the director spots the outsized-
+    # commitment wallet at a glance.
+    assert "notable" in rendered.lower()
+    assert "⚑" in rendered
+    # Notable insider is sorted to the TOP — its address prefix should
+    # appear before the non-notable one's. Check by index in the
+    # rendered string.
+    notable_addr_prefix = notable[0].user_address[:8]
+    not_notable_addr_prefix = not_notable[0].user_address[:8]
+    assert rendered.index(notable_addr_prefix) < rendered.index(
+        not_notable_addr_prefix
+    ), "notable insider should sort above non-notable"
+    n += 7
 
     return n
 

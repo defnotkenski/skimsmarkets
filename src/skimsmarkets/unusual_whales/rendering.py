@@ -42,12 +42,44 @@ def _fmt_trade(t: UWTrade) -> str:
 
 
 def _fmt_insider(i: UWInsider) -> str:
+    """One-line insider position summary for the director prompt.
+
+    avg_price is deliberately omitted — the director is blind to market
+    price; what reaches them is position size (`invested`), the Hashdive
+    "outsized commitment" z-score, the wallet's running PnL on this
+    market (`pnl`), the wallet's concurrent-positions count (`n_pos`,
+    a diversification proxy), and recency-of-first-fill (`days_in`).
+    Notable wallets (`is_notable()` → invested_zscore ≥ 2) get an arrow
+    suffix so the director can spot them on the rendered slate without
+    re-parsing the number.
+
+    All new fields are conditionally included — older records or wallets
+    without enough history to compute z / PnL omit those sub-fields
+    rather than padding with "?" placeholders.
+    """
     addr = i.user_address or "?"
     short = f"{addr[:8]}…{addr[-4:]}" if len(addr) >= 12 else addr
-    inv = _fmt_money(i.total_invested_usd)
-    # avg_price omitted — the director is blind to the market price; the
-    # signal here is that a known-insider wallet holds a position and its size.
-    return f"    {short}  invested={inv}"
+    parts = [f"invested={_fmt_money(i.total_invested_usd)}"]
+    # Z-score: "outsized commitment vs own baseline". 2 decimals so the
+    # director can compare across wallets without truncation noise.
+    if i.invested_zscore is not None:
+        parts.append(f"zscore={i.invested_zscore:+.2f}")
+    # PnL %: positive = wallet is winning on this market so far. Format
+    # as a signed percentage with one decimal to keep the line compact.
+    if i.pnl_percent is not None:
+        parts.append(f"pnl={i.pnl_percent * 100:+.1f}%")
+    # Concurrent positions across all markets — a diversification
+    # proxy. A wallet with n_pos=1 has all-in conviction; n_pos=20 is
+    # spreading risk.
+    if i.n_positions is not None:
+        parts.append(f"n_pos={i.n_positions}")
+    # Days since this wallet's first trade ON THIS MARKET. Recency
+    # signal — fresh entries (≤7d) are more directional than old
+    # accumulated positions.
+    if i.days_since_first_trade is not None:
+        parts.append(f"days_in={i.days_since_first_trade}")
+    marker = "  ⚑ NOTABLE" if i.is_notable() else ""
+    return f"    {short}  " + "  ".join(parts) + marker
 
 
 def render_uw_block(ctx: UnusualWhalesContext) -> str:
@@ -123,8 +155,24 @@ def render_uw_block(ctx: UnusualWhalesContext) -> str:
         for t in ctx.whale_trades:
             lines.append(_fmt_trade(t))
     if ctx.insiders:
-        lines.append(f"  top insiders ({len(ctx.insiders)}):")
-        for i in ctx.insiders:
+        # Sort notable insiders to the top so the director sees the
+        # outsized-commitment wallets first. Within each group keep the
+        # API's native ordering (UW already ranks by invested USD
+        # descending). Header tags how many of the surfaced insiders
+        # are notable so the director can prioritize their reading.
+        sorted_insiders = sorted(
+            ctx.insiders, key=lambda x: (not x.is_notable(), 0),
+        )
+        n_notable = sum(1 for i in ctx.insiders if i.is_notable())
+        if n_notable > 0:
+            header = (
+                f"  top insiders ({len(ctx.insiders)}, "
+                f"{n_notable} notable ⚑):"
+            )
+        else:
+            header = f"  top insiders ({len(ctx.insiders)}):"
+        lines.append(header)
+        for i in sorted_insiders:
             lines.append(_fmt_insider(i))
 
     return "\n".join(lines)
