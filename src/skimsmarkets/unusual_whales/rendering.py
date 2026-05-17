@@ -21,31 +21,23 @@ def _fmt_money(v: float | None, prec: int = 0) -> str:
     return f"${v:,.{prec}f}"
 
 
-def _trade_shares_and_usdc(t: UWTrade) -> tuple[float | None, float | None]:
-    """Map a Polymarket fill to (shares, usdc_notional).
-
-    A Polymarket trade pairs a share quantity with a USDC quantity; which leg
-    landed on maker vs. taker depends on the maker's side (maker=seller means
-    maker gave shares and received USDC; maker=buyer means maker gave USDC
-    and received shares).
-    """
-    if t.maker_side == "seller":
-        return t.maker_amount_filled, t.taker_amount_filled
-    if t.maker_side == "buyer":
-        return t.taker_amount_filled, t.maker_amount_filled
-    return None, None
-
-
 def _fmt_trade(t: UWTrade) -> str:
-    shares, usdc = _trade_shares_and_usdc(t)
+    """Render one fill as a single line.
+
+    Hashdive UWTrade carries `size` (shares) and `price` (per-share USDC)
+    directly; we derive USDC notional via `t.usdc_notional` (the model
+    property does the size × price math). The active side (taker)
+    reveals directional pressure: taker=buyer means someone hit the
+    ask; taker=seller means someone hit the bid. The per-fill price
+    is deliberately omitted from the rendered line — the director is
+    blind to market price; flow direction and size are the signal,
+    not the level.
+    """
     when = t.executed_at.isoformat() if t.executed_at else "?"
-    # The active side (taker) is what reveals directional pressure: taker=buyer
-    # means someone hit the ask; taker=seller means someone hit the bid. The
-    # per-fill price is deliberately omitted — the director is blind to the
-    # market price; flow direction and size are the signal, not the level.
     side = t.taker_side or "?"
+    usdc = t.usdc_notional
     notional = _fmt_money(usdc, prec=2) if usdc is not None else "?"
-    share_s = f"{shares:,.0f}" if shares is not None else "?"
+    share_s = f"{t.size:,.0f}" if t.size is not None else "?"
     return f"    {when}  taker={side}  shares={share_s}  notional={notional}"
 
 
@@ -122,9 +114,13 @@ def render_uw_block(ctx: UnusualWhalesContext) -> str:
         lines.append(f"  recent smart-money trades ({len(ctx.smart_trades)}):")
         for t in ctx.smart_trades:
             lines.append(_fmt_trade(t))
-    if ctx.contrarian_whale_trades:
-        lines.append(f"  top contrarian whales ({len(ctx.contrarian_whale_trades)}):")
-        for t in ctx.contrarian_whale_trades:
+    if ctx.whale_trades:
+        # Hashdive (2026-05) returns ALL whale-size fills, not just the
+        # tag-classified "contrarian" subset the old API exposed. The
+        # contrarian-direction reading lives in `tag_scores.contrarian_whales`
+        # if a downstream reader wants to call out the directional split.
+        lines.append(f"  recent whale trades ({len(ctx.whale_trades)}):")
+        for t in ctx.whale_trades:
             lines.append(_fmt_trade(t))
     if ctx.insiders:
         lines.append(f"  top insiders ({len(ctx.insiders)}):")

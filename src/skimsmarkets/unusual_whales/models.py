@@ -1,8 +1,10 @@
 """Compact Pydantic schema for Unusual Whales per-asset context.
 
-The UW `/api/predictions/market/{asset_id}` detail endpoint returns a large
-payload (50 trades × 3 arrays, full outcome pair with daily price series,
-etc). We squash it into a small, render-friendly shape that:
+The Hashdive `/api/assets/{asset_id}/detail_agg` endpoint (2026-05 API,
+served from `phx.unusualwhales.com/hashdive/`) returns a large payload
+(50 trades × 3 arrays, full outcome pair with daily price series, MCI,
+liquidity snapshot, insider positions). We squash it into a small,
+render-friendly shape that:
 
 - keeps only the signals the director can actually use (tag weights, MCI,
   liquidity, handful of top trades, top insiders);
@@ -104,34 +106,63 @@ class UWMci(BaseModel):
 
 
 class UWTrade(BaseModel):
-    """One on-chain fill from UW's trades / smart_trades / contrarian_whale_trades.
+    """One on-chain fill from UW's trades / smart_trades / whale_trades.
 
-    A Polymarket fill comes in two legs: shares quantity and USDC quantity.
-    Which leg landed on maker vs taker depends on the side — we keep them
-    both raw and let the renderer surface whichever is more useful.
+    Hashdive shape (2026-05 API): `size` is the share quantity, `price`
+    is the per-share USDC price; USDC notional is the product. Earlier
+    `api.unusualwhales.com` shape paired maker/taker amounts in two
+    legs (`maker_amount_filled`, `taker_amount_filled`) which we used
+    to disambiguate via `maker_side`; the new shape is simpler.
+
+    `taker_address` and `transaction_hash` carried for completeness
+    (renderer doesn't surface them but downstream auditors might want
+    chain-level traceability without re-fetching).
     """
 
     model_config = ConfigDict(extra="ignore")
 
     executed_at: datetime | None = None
-    maker_side: str | None = None  # "buyer" or "seller"
+    maker_side: str | None = None  # "buyer" or "seller" (from maker POV)
     taker_side: str | None = None
-    maker_amount_filled: float | None = None
-    taker_amount_filled: float | None = None
+    # Hashdive trade shape: size (shares) + price (per-share USDC).
+    size: float | None = None
+    price: float | None = None
+    fee: float | None = None
+    taker_address: str | None = None
+    transaction_hash: str | None = None
 
     @field_validator("executed_at", mode="before")
     @classmethod
     def _dt(cls, v: Any) -> Any:
         return _coerce_dt(v)
 
-    @field_validator("maker_amount_filled", "taker_amount_filled", mode="before")
+    @field_validator("size", "price", "fee", mode="before")
     @classmethod
     def _f(cls, v: Any) -> Any:
         return _coerce_float(v)
 
+    @property
+    def usdc_notional(self) -> float | None:
+        """USDC value of the fill = size × price. None when either
+        leg is missing.
+        """
+        if self.size is None or self.price is None:
+            return None
+        return self.size * self.price
+
 
 class UWInsider(BaseModel):
-    """One insider position snapshot (from /market.insiders[] or top_insiders[])."""
+    """One insider position snapshot from `/assets/{id}/detail_agg.insiders[]`.
+
+    Hashdive adds four signal fields the prior API didn't ship:
+    `pnl_percent` (running PnL on the position), `invested_zscore`
+    (how outsized this wallet's investment is vs its own baseline),
+    `n_positions` (how many markets the wallet has open right now),
+    `days_since_first_trade` (recency of first fill on this market).
+    `invested_zscore` is the most directly actionable — a z-score
+    above ~2.0 means the wallet sized this bet unusually large
+    relative to its own trading history.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -139,13 +170,22 @@ class UWInsider(BaseModel):
     avg_price: float | None = None
     total_invested_usd: float | None = None
     first_trade_at: datetime | None = None
+    # Hashdive-only signal fields. All optional; older responses or
+    # markets without enough history will lack them.
+    pnl_percent: float | None = None
+    invested_zscore: float | None = None
+    n_positions: int | None = None
+    days_since_first_trade: int | None = None
 
     @field_validator("first_trade_at", mode="before")
     @classmethod
     def _dt(cls, v: Any) -> Any:
         return _coerce_dt(v)
 
-    @field_validator("avg_price", "total_invested_usd", mode="before")
+    @field_validator(
+        "avg_price", "total_invested_usd", "pnl_percent", "invested_zscore",
+        mode="before",
+    )
     @classmethod
     def _f(cls, v: Any) -> Any:
         return _coerce_float(v)
@@ -174,7 +214,14 @@ class UnusualWhalesContext(BaseModel):
     mci: UWMci | None = None
     liquidity: UWLiquidity | None = None
     smart_trades: list[UWTrade] = Field(default_factory=list)
-    contrarian_whale_trades: list[UWTrade] = Field(default_factory=list)
+    # Hashdive (2026-05) ships `whale_trades` — ALL whale-size fills,
+    # not just the tag-classified "contrarian" subset the old API
+    # exposed under `contrarian_whale_trades`. The contrarian angle
+    # is still available in `tag_scores.contrarian_whales` (a weighted
+    # score across recent whale flow); the raw trade list is now
+    # broader so the renderer + director see whale fills going WITH
+    # consensus too.
+    whale_trades: list[UWTrade] = Field(default_factory=list)
     insiders: list[UWInsider] = Field(default_factory=list)
 
     @field_validator("unusual_score", "volume", mode="before")
@@ -194,10 +241,10 @@ class UnusualWhalesContext(BaseModel):
         while burning tokens.
 
         Three things make a context actionable:
-          - Real fills (smart_trades / contrarian_whale_trades) or top
-            insiders. UW filters these server-side to wallets that
-            actually triggered a tag pipeline, so presence alone is a
-            signal regardless of composite score.
+          - Real fills (smart_trades / whale_trades) or top insiders.
+            UW filters these server-side to wallets that actually
+            triggered a tag pipeline, so presence alone is a signal
+            regardless of composite score.
           - `unusual_score >= 5.0` — the prompt's "notable" threshold.
           - MCI `delta` of meaningful magnitude (`abs(delta) >= 5.0`).
             Static MCI values without a delta carry no directional info.
@@ -207,7 +254,7 @@ class UnusualWhalesContext(BaseModel):
         we already render (liquidity, volume) or are sub-threshold noise
         (a momentum tag at 0.30 means "the price moved at all").
         """
-        if self.smart_trades or self.contrarian_whale_trades or self.insiders:
+        if self.smart_trades or self.whale_trades or self.insiders:
             return True
         if self.unusual_score is not None and self.unusual_score >= 5.0:
             return True

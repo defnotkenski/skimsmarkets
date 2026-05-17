@@ -31,12 +31,12 @@ from skimsmarkets.unusual_whales.models import (
 
 log = logging.getLogger(__name__)
 
-_BASE_URL = "https://api.unusualwhales.com/api/predictions"
+_BASE_URL = "https://phx.unusualwhales.com/hashdive/api"
 # Trades arrays come back with up to 50 entries; keep only the few most
 # recent per category to keep prompt context small. The feed is reverse
 # chronological so slicing from the head is the right move.
 _SMART_TRADE_LIMIT = 5
-_CONTRARIAN_TRADE_LIMIT = 5
+_WHALE_TRADE_LIMIT = 5
 _INSIDER_LIMIT = 3
 
 # Retry configuration for HTTP 429 (rate limited) responses. UW doesn't
@@ -113,16 +113,20 @@ class UnusualWhalesClient:
             self._client = None
 
     async def get_market_detail(self, asset_id: str) -> UnusualWhalesContext | None:
-        """GET /predictions/market/{asset_id} → compact `UnusualWhalesContext`.
+        """GET /assets/{asset_id}/detail_agg → compact `UnusualWhalesContext`.
 
+        Hits the Hashdive aggregated-detail endpoint (2026-05-17 API
+        migration from the prior `api.unusualwhales.com/api/predictions/
+        market/{id}` shape — same payload concept, different host/path).
         Retries up to `_RETRY_ATTEMPTS` times on HTTP 429 with exponential
         backoff (honoring `Retry-After` when present). Returns None if UW
         is disabled, the request fails after retries, or the response is
-        missing the expected `data` envelope.
+        not a JSON object (the new endpoint returns the asset record
+        directly, with no wrapper envelope — old code unwrapped `data`).
         """
         if not self.enabled or self._client is None:
             return None
-        url = f"{_BASE_URL}/market/{asset_id}"
+        url = f"{_BASE_URL}/assets/{asset_id}/detail_agg"
 
         resp: httpx.Response | None = None
         for attempt in range(_RETRY_ATTEMPTS):
@@ -170,12 +174,15 @@ class UnusualWhalesClient:
             log.warning("uw market %s: non-json response (%s)", asset_id, e)
             return None
 
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict):
-            log.debug("uw market %s: missing data envelope", asset_id)
+        # Hashdive `/detail_agg` returns the asset record at the top
+        # level (no `data` envelope). Earlier `api.unusualwhales.com`
+        # shape wrapped it in `{data: {...}}`; we used to unwrap here.
+        if not isinstance(payload, dict):
+            log.debug("uw asset %s: unexpected payload shape %s",
+                      asset_id, type(payload).__name__)
             return None
 
-        return _context_from_detail(asset_id, data)
+        return _context_from_detail(asset_id, payload)
 
 
 def _context_from_detail(
@@ -204,8 +211,13 @@ def _context_from_detail(
                 else None
             ),
             smart_trades=_trades(data.get("smart_trades"), _SMART_TRADE_LIMIT),
-            contrarian_whale_trades=_trades(
-                data.get("contrarian_whale_trades"), _CONTRARIAN_TRADE_LIMIT
+            # Hashdive renamed `contrarian_whale_trades` (the old
+            # tag-classified subset) to plain `whale_trades` (all
+            # whale-size fills, irrespective of consensus direction).
+            # The "contrarian" angle is preserved in
+            # `tag_scores.contrarian_whales` if a caller still wants it.
+            whale_trades=_trades(
+                data.get("whale_trades"), _WHALE_TRADE_LIMIT,
             ),
             insiders=_insiders(data.get("insiders"), _INSIDER_LIMIT),
         )
@@ -232,9 +244,17 @@ def _outcome_label(data: dict[str, Any]) -> str | None:
 
 
 def _best_unusual_score(data: dict[str, Any]) -> Any:
-    """Detail endpoint doesn't always surface `unusual_score` at top level;
-    fall back to summing weighted tag_scores, which is how UW computes it."""
-    direct = data.get("unusual_score")
+    """Pull the composite unusual-activity score off the asset record.
+
+    Hashdive surfaces it as `tags_score` at the top level (the old
+    `api.unusualwhales.com` shape called the same value `unusual_score`).
+    Both keys are checked for forward/back compat. Falls back to summing
+    `weighted` across `tag_scores[]` when the top-level field is absent
+    — that's how UW computes the composite under the hood.
+    """
+    direct = data.get("tags_score")
+    if direct is None:
+        direct = data.get("unusual_score")
     if direct is not None:
         return direct
     scores = data.get("tag_scores")
