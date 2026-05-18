@@ -101,6 +101,18 @@ class PredictionRow(BaseModel):
     # the judge produced no defensibility score (bucket `Unrated`).
     risk_bucket: str | None = None
     risk_score: float | None = None
+    # Deterministic EV classifier output — parallel to `risk_bucket` for
+    # the dual-mode design (see `classify_ev` in classify.py). Both
+    # bucketings are populated on every row regardless of which one
+    # `skims execute --mode` filters by at trade time. Buckets: Prime /
+    # Edge / Thin / Negative / Unrated. `ev_score` is the raw EV-per-
+    # dollar value the bucket was cut from — identical in value to
+    # `ev_per_dollar` above but kept as a separate field so future
+    # bucket-threshold tuning doesn't have to rewrite the per-row
+    # analytical artifact. Both None on rows persisted before dual-mode
+    # shipped.
+    ev_bucket: str | None = None
+    ev_score: float | None = None
     # Calibration audit (see `calibration.py`). `calibration_temperature`
     # is the scalar applied to the classifier's magnitude term this run;
     # `calibrated_winner_probability` is what that term actually saw. Both

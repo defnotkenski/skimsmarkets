@@ -192,7 +192,7 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
             ),
             progress=progress,
         )
-    print_run_summary(result, console=_CONSOLE)
+    print_run_summary(result, sort_by=args.sort_by, console=_CONSOLE)
     return 0
 
 
@@ -432,6 +432,40 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         else cfg.MAX_IMPLIED_PROBABILITY
     )
 
+    # EV-sizing knobs (opt-in). Each falls through to its config default;
+    # leaving `--bankroll-cents` unset keeps the legacy uniform-sizing path
+    # untouched so existing cron invocations don't silently switch over.
+    bankroll_cents = (
+        args.bankroll_cents if args.bankroll_cents is not None
+        else cfg.KALSHI_DEFAULT_BANKROLL_CENTS
+    )
+    min_ev_threshold = (
+        args.min_ev_threshold if args.min_ev_threshold is not None
+        else cfg.KALSHI_DEFAULT_MIN_EV_THRESHOLD
+    )
+
+    # Dual-mode dispatch (2026-05-17). `confidence` = legacy risk-bucket
+    # filter; `ev` = ev-bucket filter. Mutually exclusive at the CLI layer
+    # — whichever mode the operator picks, ONE of `risk_buckets` /
+    # `ev_buckets` is populated and the other goes to None. `filter_rows`
+    # itself supports both simultaneously (AND), but the mode flag keeps
+    # operator semantics clean: "I'm trading on confidence today" XOR "I'm
+    # trading on EV today". Each bucket-dimension flag still falls through
+    # to its respective config default for its mode.
+    mode = args.mode or cfg.KALSHI_DEFAULT_TRADE_MODE
+    if mode == "ev":
+        ev_buckets = (
+            args.ev_bucket if args.ev_bucket is not None
+            else list(cfg.KALSHI_DEFAULT_EV_BUCKETS)
+        )
+        # In ev mode, the risk-bucket filter is OFF — user's explicit choice
+        # to grade trades by EV instead. (Other filters — confidence tier,
+        # defensibility, etc. — stay active in both modes.)
+        risk_buckets_active = None
+    else:  # "confidence" (default)
+        ev_buckets = None
+        risk_buckets_active = risk_buckets
+
     opts = ExecuteOptions(
         run_id=run_id,
         dry_run=not args.live,
@@ -442,9 +476,15 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
         min_defensibility=min_defensibility,
         no_negative_edge=no_negative_edge,
         sports=sports,
-        risk_buckets=risk_buckets,
+        risk_buckets=risk_buckets_active,
+        ev_buckets=ev_buckets,
+        mode=mode,
         min_market_implied_prob=min_market_implied_prob,
         max_implied_probability=max_implied_probability,
+        bankroll_cents=bankroll_cents,
+        kelly_multiplier=args.kelly_multiplier,
+        kelly_max_fraction=cfg.KALSHI_KELLY_MAX_FRACTION,
+        min_ev_threshold=min_ev_threshold,
     )
     config = cfg.Config.from_env(require_llm=False)
     async with ExecuteDisplay(console=_CONSOLE) as display:
@@ -725,6 +765,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "down. No-op when no key is configured (already running the stub)."
         ),
     )
+    p_rank.add_argument(
+        "--sort-by",
+        choices=("risk", "ev"),
+        default="risk",
+        metavar="DIMENSION",
+        help=(
+            "Leaderboard sort dimension. `risk` (default) sorts by the "
+            "risk-bucket classifier (Lock → Avoid). `ev` sorts by the EV-"
+            "bucket classifier (Prime → Negative). Both bucketings are "
+            "always shown as columns regardless; this only changes the "
+            "sort order. Useful for slate scanning: `--sort-by ev` "
+            "surfaces the asymmetric-payoff opportunities at the top."
+        ),
+    )
 
     sub.add_parser(
         "fetch",
@@ -807,6 +861,57 @@ def _build_parser() -> argparse.ArgumentParser:
             f"{cfg.KALSHI_DEFAULT_MAX_OPEN_EXPOSURE_CENTS}."
         ),
     )
+    # EV-sizing knobs (opt-in). When `--bankroll-cents` is set the trader
+    # switches from uniform `--bet-size-cents` per trade to fractional
+    # Kelly sized off the LIVE Kalshi yes_ask. `--min-ev-threshold` skips
+    # rows whose live EV-per-$1 sits below the floor. Both flags fall
+    # through to their config defaults (None = inactive) when omitted, so
+    # legacy invocations are unaffected by upgrading.
+    p_execute.add_argument(
+        "--bankroll-cents",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Account bankroll in cents for fractional-Kelly sizing. "
+            "When set, each trade is sized to "
+            "`int(bankroll * min(f_star * kelly_multiplier, "
+            f"{cfg.KALSHI_KELLY_MAX_FRACTION}))` against the live Kalshi "
+            "yes_ask, capped from above by `--bet-size-cents` and "
+            "`--max-position-cents` as belt-and-suspenders. Falls through "
+            "to `KALSHI_DEFAULT_BANKROLL_CENTS` in config.py "
+            f"({cfg.KALSHI_DEFAULT_BANKROLL_CENTS}); leave both unset to "
+            "keep the legacy uniform-sizing path."
+        ),
+    )
+    p_execute.add_argument(
+        "--kelly-multiplier",
+        type=float,
+        default=cfg.KALSHI_KELLY_MULTIPLIER,
+        metavar="F",
+        help=(
+            "Fractional-Kelly discount applied to the full-Kelly f_star "
+            "(noise damper — full Kelly assumes perfectly calibrated "
+            f"probabilities). Default {cfg.KALSHI_KELLY_MULTIPLIER} "
+            "(quarter-Kelly). Only takes effect when `--bankroll-cents` "
+            "is also set."
+        ),
+    )
+    p_execute.add_argument(
+        "--min-ev-threshold",
+        type=float,
+        default=None,
+        metavar="EV",
+        help=(
+            "Skip any matched row whose live-line EV-per-$1 (computed "
+            "from Kalshi yes_ask + predicted_yes_probability) is below "
+            "this floor. Independent of Kelly mode — uniform-sizing "
+            "users can also gate on EV. Falls through to "
+            "`KALSHI_DEFAULT_MIN_EV_THRESHOLD` in config.py "
+            f"({cfg.KALSHI_DEFAULT_MIN_EV_THRESHOLD}); None disables "
+            "the gate."
+        ),
+    )
     # Filter flags use `default=None` so we can distinguish "user
     # didn't pass it" (fall through to KALSHI_DEFAULT_* in config.py)
     # from "user passed it explicitly" (override config). Without this
@@ -866,6 +971,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_execute.add_argument(
+        "--mode",
+        choices=("confidence", "ev"),
+        default=None,
+        metavar="MODE",
+        help=(
+            "Bucket-dimension filter at trade time. `confidence` (default) "
+            "uses the risk-bucket classifier (`--risk-bucket`); `ev` swaps "
+            "to the EV-bucket classifier (`--ev-bucket`). Other filters "
+            "(confidence tier, defensibility, sport, market-implied) "
+            "stay active in both modes. Falls through to "
+            f"`KALSHI_DEFAULT_TRADE_MODE` ({cfg.KALSHI_DEFAULT_TRADE_MODE}) "
+            "in config.py when omitted."
+        ),
+    )
+    p_execute.add_argument(
         "--risk-bucket",
         action="append",
         choices=("Lock", "Lean", "Coin-flip", "Avoid"),
@@ -874,9 +994,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Keep only predictions in these risk buckets (from the "
             "deterministic classifier — see `classify.py`). Repeatable. "
-            "Rows without a bucket (classifier failure / Unrated) fail "
-            "this gate. Falls through to `KALSHI_DEFAULT_RISK_BUCKETS` "
-            "in config.py when omitted; default keeps Lock + Lean."
+            "Active in `--mode confidence` (default). Rows without a "
+            "bucket (classifier failure / Unrated) fail this gate. "
+            "Falls through to `KALSHI_DEFAULT_RISK_BUCKETS` in config.py "
+            "when omitted; default keeps Lock + Lean."
+        ),
+    )
+    p_execute.add_argument(
+        "--ev-bucket",
+        action="append",
+        choices=("Prime", "Edge", "Thin", "Negative"),
+        default=None,
+        metavar="BUCKET",
+        help=(
+            "Keep only predictions in these EV buckets (from "
+            "`classify_ev` — Prime ≥ 0.30, Edge 0.15-0.30, Thin 0-0.15, "
+            "Negative < 0). Repeatable. Active in `--mode ev`. Rows with "
+            "uncomputable EV (or older runs predating dual-mode) fail "
+            "this gate. Falls through to `KALSHI_DEFAULT_EV_BUCKETS` in "
+            "config.py when omitted; default keeps Prime + Edge."
         ),
     )
     p_execute.add_argument(

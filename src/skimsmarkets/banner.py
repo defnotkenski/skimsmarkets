@@ -1,4 +1,9 @@
-"""SKIMS CLI banner — the ANSI Shadow wordmark shown atop an interactive run.
+"""NOCTA CLI banner — the ANSI Shadow wordmark shown atop an interactive run.
+
+NOCTA is the system's user-facing wordmark (post the 2026-05-17 dual-mode
+shift — the brand reflects the new direction; the underlying CLI command
+and package name stay `skims` / `skimsmarkets` to avoid breaking cron
+invocations and import paths).
 
 TTY-gated (see `print_banner`): never prints when stdout/stderr is piped or
 captured, so it stays out of `skims positions`' parseable output and the
@@ -14,25 +19,30 @@ from pathlib import Path
 
 from rich.console import Console
 
-# "SKIMS" in the figlet "ANSI Shadow" font.
+# "NOCTA" in the figlet "ANSI Shadow" font (regenerate via
+# `uvx pyfiglet -f ansi_shadow NOCTA` if the wordmark needs updating).
 _WORDMARK: tuple[str, ...] = (
-    "███████╗██╗  ██╗██╗ ███╗   ███╗███████╗",
-    "██╔════╝██║ ██╔╝██║ ████╗ ████║██╔════╝",
-    "███████╗█████╔╝ ██║ ██╔████╔██║███████╗",
-    "╚════██║██╔═██╗ ██║ ██║╚██╔╝██║╚════██║",
-    "███████║██║  ██╗██║ ██║ ╚═╝ ██║███████║",
-    "╚══════╝╚═╝  ╚═╝╚═╝ ╚═╝     ╚═╝╚══════╝",
+    "███╗   ██╗ ██████╗  ██████╗████████╗ █████╗ ",
+    "████╗  ██║██╔═══██╗██╔════╝╚══██╔══╝██╔══██╗",
+    "██╔██╗ ██║██║   ██║██║        ██║   ███████║",
+    "██║╚██╗██║██║   ██║██║        ██║   ██╔══██║",
+    "██║ ╚████║╚██████╔╝╚██████╗   ██║   ██║  ██║",
+    "╚═╝  ╚═══╝ ╚═════╝  ╚═════╝   ╚═╝   ╚═╝  ╚═╝",
 )
 
-# Per-row "ember" gradient — warm gold → clay → deep rust. Truecolor hex;
-# Rich downgrades gracefully on 256/16-colour terminals.
-_EMBER: tuple[str, ...] = (
-    "#e8b563",
-    "#e29c5e",
-    "#dc8359",
-    "#cf6e50",
-    "#ba5c41",
-    "#a54a32",
+# Per-row "DAWN" gradient — peach top fading through clay → slate at the
+# baseline. Replaced the original ember sweep 2026-05-17 alongside the
+# rebrand to Nocta; DAWN reads as sunrise to a system that's about to
+# start a trading window, matching the brand mood better than the
+# strictly-sunset ember palette. Truecolor hex; Rich downgrades
+# gracefully on 256/16-colour terminals.
+_DAWN: tuple[str, ...] = (
+    "#f5d4b8",
+    "#eebfa4",
+    "#e0a890",
+    "#c89580",
+    "#a88378",
+    "#807070",
 )
 
 # Dim slate palette for the cosmetic stars bracketing the wordmark. `·` is
@@ -74,12 +84,33 @@ _RIGHT_STARS: tuple[str, ...] = (
     "     ",                       # row 5
 )
 
-# Ember gold for the live status values; matches the top wordmark row.
-_STATUS_ACCENT = "#e8b563"
+# Mode-themed status accent for live status values (run id, mode tag).
+# Confidence mode = frost blue; EV mode = ember gold. Picked at render
+# time via `_status_accent_for_mode` so the same banner code serves both.
+# The wordmark stays on the neutral DAWN gradient regardless — only the
+# status pill carries the mode color, keeping mode visualization where it
+# matters (current-state at-a-glance) without flipping the brand identity.
+_STATUS_ACCENT_CONFIDENCE = "#7fa1ce"   # frost blue
+_STATUS_ACCENT_EV = "#e8b563"           # ember gold
+
+
+def _status_accent_for_mode(mode: str) -> str:
+    """Resolve the status-pill accent color from the configured trade mode."""
+    return _STATUS_ACCENT_EV if mode == "ev" else _STATUS_ACCENT_CONFIDENCE
+
+# Indent for body text (subtitle + status branch) so it left-aligns with the
+# first glyph of the wordmark rather than with the outer star constellation.
+# Derived as: 2 (the shared `  ` base indent applied to every line) + 5 (the
+# fixed visible-column width of `_LEFT_STARS[i]`, which sits between the
+# base indent and the wordmark glyph on each wordmark row). Hard-coded as a
+# literal rather than computed at runtime because the star-column width is
+# itself hard-coded into `_LEFT_STARS`; if you change the star column, bump
+# this too.
+_WORDMARK_INDENT = "       "  # 7 spaces
 
 
 def print_banner(console: Console, command: str) -> None:
-    """Print the SKIMS banner through `console`, padded with a blank line
+    """Print the NOCTA banner through `console`, padded with a blank line
     above and below so it stands clear of the surrounding output.
 
     No-op unless `console` is an interactive terminal — that keeps the art
@@ -91,13 +122,14 @@ def print_banner(console: Console, command: str) -> None:
         return
     console.print()
     console.print(_STAR_LINE_TOP, highlight=False)
-    for i, (line, color) in enumerate(zip(_WORDMARK, _EMBER)):
+    for i, (line, color) in enumerate(zip(_WORDMARK, _DAWN)):
         # Wordmark contains only box-drawing glyphs — no `[`/`]` — so we can
         # safely interpolate it into a markup row alongside the side stars.
         row = f"  {_LEFT_STARS[i]}[{color}]{line}[/]{_RIGHT_STARS[i]}"
         console.print(row, highlight=False)
     console.print(
-        f"  risk-graded sports markets · {command} · v{version('skimsmarkets')}",
+        f"{_WORDMARK_INDENT}dual-mode sports markets · {command} · "
+        f"v{version('skimsmarkets')}",
         style="dim italic",
         markup=False,
         highlight=False,
@@ -106,9 +138,15 @@ def print_banner(console: Console, command: str) -> None:
     if status is not None:
         # Hanging branch: a `│` riser drops from the subtitle, then `╰─`
         # elbows out to the status. Skipped entirely when no runs exist on
-        # disk so a fresh install doesn't show a dangling branch.
-        console.print(f"  [{_STAR_DIM}]│[/]", highlight=False)
-        console.print(f"  [{_STAR_DIM}]╰─[/] {status}", highlight=False)
+        # disk so a fresh install doesn't show a dangling branch. Both lines
+        # share the wordmark indent so the branch hangs from the subtitle
+        # column rather than from the outer star line.
+        console.print(
+            f"{_WORDMARK_INDENT}[{_STAR_DIM}]│[/]", highlight=False,
+        )
+        console.print(
+            f"{_WORDMARK_INDENT}[{_STAR_DIM}]╰─[/] {status}", highlight=False,
+        )
     console.print(_STAR_LINE_BOTTOM, highlight=False)
     console.print()
 
@@ -116,60 +154,35 @@ def print_banner(console: Console, command: str) -> None:
 def _status_line() -> str | None:
     """Build the status content shown under the hanging branch.
 
-    Reads `logs/runs/` only — no network. Returns None when there are no
-    runs on disk yet (fresh install). Any unexpected error degrades to
-    None so the banner can never crash a command.
+    Reads `logs/runs/` + `config.KALSHI_DEFAULT_TRADE_MODE` only — no
+    network, no JSONL parsing. Returns None when there are no runs on
+    disk yet (fresh install). Any unexpected error degrades to None so
+    the banner can never crash a command.
+
+    Pill shape: `latest run <id> (<age>)   ·   mode <X>`. Accent color
+    is picked from the mode — frost blue for confidence, ember gold for
+    ev — so the operator's first glance at the banner answers "which
+    mode is the cron set up for today?" through color alone. Bucket
+    breakdown was dropped 2026-05-17; mode tag is the load-bearing fact.
     """
     try:
-        # Lazy import: keeps the banner-module import path light and avoids
-        # dragging Pydantic / pipeline imports into `--help` flows.
-        from collections import Counter
-
-        from skimsmarkets.classify import BUCKET_ORDER, BUCKET_UNRATED
-        from skimsmarkets.retro.jsonl import iter_predictions, list_run_files
+        # Lazy imports: keep the banner-module import path light and
+        # avoid dragging config / Pydantic into `--help` flows.
+        from skimsmarkets import config as cfg
+        from skimsmarkets.retro.jsonl import list_run_files
 
         runs = list_run_files()
         if not runs:
             return None
         latest = runs[0]
         age = _format_age(latest)
-
-        # Risk-bucket breakdown of the latest run — surfaces what's
-        # actionable now (how many Locks vs Leans vs Coin-flips landed)
-        # instead of just an event count + sport (sport is redundant
-        # when the user always passes `--sport`).
-        buckets: Counter[str] = Counter()
-        total = 0
-        for pred in iter_predictions(latest):
-            total += 1
-            if pred.risk_bucket:
-                buckets[pred.risk_bucket] += 1
-
-        # Build pill from non-zero buckets in canonical Lock → ... → Avoid
-        # order. `Unrated` (judge-failure sentinel) is suppressed unless
-        # it's the ONLY thing present, in which case the user should
-        # know the judge failed slate-wide.
-        ordered_parts: list[str] = []
-        rated_total = 0
-        for bucket in BUCKET_ORDER:
-            n = buckets.get(bucket, 0)
-            if bucket == BUCKET_UNRATED:
-                continue
-            rated_total += n
-            if n:
-                ordered_parts.append(f"{n} {bucket}")
-        if not ordered_parts:
-            # No rated predictions — fall back to plain count so a
-            # judge-failed or pre-classifier run still shows something.
-            pill = f"{total} predictions"
-        else:
-            pill = " [dim]·[/] ".join(
-                f"[{_STATUS_ACCENT}]{p}[/]" for p in ordered_parts
-            )
+        mode = cfg.KALSHI_DEFAULT_TRADE_MODE
+        accent = _status_accent_for_mode(mode)
 
         return (
-            f"[dim]latest run[/] [{_STATUS_ACCENT}]{latest.stem}[/] "
-            f"[dim]({age})[/]   [dim]·[/]   {pill}"
+            f"[dim]latest run[/] [{accent}]{latest.stem}[/] "
+            f"[dim]({age})[/]   [dim]·[/]   "
+            f"[dim]mode[/] [bold {accent}]{mode}[/]"
         )
     except Exception:  # noqa: BLE001 — banner must never raise
         return None

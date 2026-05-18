@@ -311,6 +311,22 @@ KALSHI_DEFAULT_SPORTS: tuple[str, ...] = ()
 # (classifier failure) always fail this gate when it's active.
 KALSHI_DEFAULT_RISK_BUCKETS: tuple[str, ...] = ("Lock", "Lean")
 
+# EV-bucket allowlist for `--mode ev`. Values come from `classify.py`:
+# "Prime" (EV ≥ 0.30), "Edge" (0.15 ≤ EV < 0.30), "Thin" (0 ≤ EV < 0.15),
+# "Negative" (EV < 0). Default (Prime, Edge) mirrors the `min_ev_threshold
+# = 0.15` philosophy — keep only buckets at or above the conservative gate.
+# Rows with `ev_bucket=None` (older runs predating dual-mode, or
+# uncomputable EV) always fail this gate when active.
+KALSHI_DEFAULT_EV_BUCKETS: tuple[str, ...] = ("Prime", "Edge")
+
+# Trade mode for `skims execute`. "confidence" keeps the current behaviour
+# (risk-bucket filter, optional Kelly via `--bankroll-cents`). "ev" swaps
+# the bucket-dimension filter to ev_bucket. Other filter dimensions
+# (confidence tier, defensibility, sport, negative-edge, market-implied)
+# stay active in both modes. Default kept as "confidence" so the
+# scheduled cron is unchanged until the operator opts in via `--mode ev`.
+KALSHI_DEFAULT_TRADE_MODE: str = "confidence"
+
 # Minimum market implied probability for the predicted winner — the
 # market's own probability on the side the model picked. Default 0.50
 # means "market and model must agree on who wins"; anything below would
@@ -319,6 +335,39 @@ KALSHI_DEFAULT_RISK_BUCKETS: tuple[str, ...] = ("Lock", "Lean")
 # is barely above coin-flip; set to None to disable. Rows with missing
 # implied probability always fail this gate when it's active.
 KALSHI_DEFAULT_MIN_MARKET_IMPLIED_PROB: float | None = 0.50
+
+# --- EV-sizing knobs for `skims execute` (opt-in) --------------------------
+# Setting `KALSHI_DEFAULT_BANKROLL_CENTS` to anything other than None flips
+# the trader from uniform sizing to fractional Kelly by default for every
+# invocation — see `kelly_bet_size` in `execute/trader.py` and the design
+# notes in the `project_ev_strategy.md` memory. Left None here so the
+# scheduled cron keeps placing the legacy uniform bet until the operator
+# opts in by passing `--bankroll-cents N` (or by flipping this constant).
+KALSHI_DEFAULT_BANKROLL_CENTS: int | None = None
+
+# Quarter-Kelly — the standard discount applied to a full-Kelly fraction
+# when probability estimates are noisy. Halves the long-run growth rate of
+# a perfectly calibrated bettor but cuts drawdown variance to ~1/16 (Kelly
+# variance scales with the square of the fraction). 0.25 is the agreed
+# conservative default; raising it amplifies BOTH realized PnL and
+# realized drawdown, so don't bump without an explicit ask.
+KALSHI_KELLY_MULTIPLIER: float = 0.25
+
+# Hard cap on the per-trade Kelly fraction — applies AFTER the multiplier.
+# Acts as a circuit breaker against a single high-EV underdog call eating
+# an outsized chunk of the bankroll. 0.02 (2%) means even the spiciest
+# +200% EV call gets sized at 2% of bankroll. Intentionally NOT exposed
+# as a CLI flag (the cap is a safety rail, not a tuning knob); flip this
+# constant if you understand the implications.
+KALSHI_KELLY_MAX_FRACTION: float = 0.02
+
+# Live-EV gate — skip rows whose EV-per-$1 (computed against the LIVE
+# Kalshi yes_ask, not the rank-time Polymarket implied) sits below this
+# floor. None disables the gate; 0.15 is the agreed conservative floor
+# that (a) concentrates capital on high-EV opportunities and (b) guards
+# against selective miscalibration in the underdog tail (where the model
+# might be overconfident and EV-sizing would amplify the worst case).
+KALSHI_DEFAULT_MIN_EV_THRESHOLD: float | None = None
 
 
 @dataclass(frozen=True)

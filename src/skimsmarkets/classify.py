@@ -23,6 +23,7 @@ calibration.
 from __future__ import annotations
 
 from skimsmarkets.calibration import apply_temperature
+from skimsmarkets.ev import compute_ev_per_dollar
 
 # --- tunables (first-guess; tune against retro backtest data) --------------
 
@@ -104,6 +105,51 @@ def bucket_rank(bucket: str) -> int:
         return BUCKET_ORDER.index(bucket)
     except ValueError:
         return len(BUCKET_ORDER)
+
+
+# --- EV bucket labels (dual-mode counterpart of the risk buckets) ----------
+# A second, independent classification of every event by its expected-value-
+# per-dollar (model probability vs market price). Runs in parallel with the
+# risk classifier; both labels are persisted on every row regardless of which
+# bucketing the operator chose for trade-time filtering (`--mode confidence`
+# vs `--mode ev`). The thresholds mirror the bins used by
+# `scripts/ev_bucket_retro.py` but collapse the top end (30-50% + 50%+ → one
+# `Prime` band) so the bucket count matches the risk classifier's 4 + Unrated
+# shape — keeps `--ev-bucket` flag ergonomics parallel to `--risk-bucket`.
+
+EV_BUCKET_PRIME = "Prime"      # EV ≥ 0.30 — high-EV underdog territory
+EV_BUCKET_EDGE = "Edge"        # 0.15 ≤ EV < 0.30 — meets the conservative gate
+EV_BUCKET_THIN = "Thin"        # 0 ≤ EV < 0.15 — positive but below threshold
+EV_BUCKET_NEGATIVE = "Negative"  # EV < 0 — market disagrees with the model
+EV_BUCKET_UNRATED = "Unrated"  # No EV (missing inputs or degenerate market_p)
+
+EV_BUCKET_ORDER: tuple[str, ...] = (
+    EV_BUCKET_PRIME,
+    EV_BUCKET_EDGE,
+    EV_BUCKET_THIN,
+    EV_BUCKET_NEGATIVE,
+    EV_BUCKET_UNRATED,
+)
+
+# Band cuts on the EV-per-dollar number (units: dollars-per-dollar staked).
+# 0.30 and 0.15 mirror the rank-time gate philosophy in the EV strategy memo
+# (15% is the agreed conservative `min_ev_threshold`); 0.30 lifts off
+# "Edge" into "Prime" where the asymmetric-payoff thesis is strongest.
+EV_THRESHOLD_PRIME = 0.30
+EV_THRESHOLD_EDGE = 0.15
+EV_THRESHOLD_THIN = 0.0
+
+
+def ev_bucket_rank(bucket: str) -> int:
+    """Ordinal for sorting by EV bucket — 0 = Prime (best), higher = worse.
+
+    Unknown labels sort after every known bucket. Mirrors `bucket_rank`'s
+    contract so reporting code can swap between the two with a callable.
+    """
+    try:
+        return EV_BUCKET_ORDER.index(bucket)
+    except ValueError:
+        return len(EV_BUCKET_ORDER)
 
 
 def _clip01(x: float) -> float:
@@ -241,3 +287,40 @@ def classify_risk(
     else:
         bucket = BUCKET_AVOID
     return bucket, risk_score
+
+
+def classify_ev(
+    predicted_winner_probability: float | None,
+    market_implied_probability: float | None,
+) -> tuple[str, float | None]:
+    """Grade one event into an `(ev_bucket, ev_score)` pair.
+
+    Parallel to `classify_risk` but graded on a wholly different dimension —
+    expected-dollar-return rather than model trustworthiness. Both
+    classifications run for every event; the operator's `--mode` flag
+    picks which one drives trade-time filtering. Captures the dual-mode
+    architectural decision from the EV strategy memo: the system is BOTH
+    a confidence ranker AND an EV finder, switchable per run.
+
+    Both probability inputs must be on the SAME side frame — the
+    predicted-winner frame (where `polymarket_implied_probability` lives
+    per the pipeline contract). `ev_score` is the raw EV-per-dollar
+    number that the bucket was cut from, so reporting can show the
+    granular value alongside the discrete label.
+
+    Returns `("Unrated", None)` when EV is uncomputable (either input
+    missing or `market_implied_probability` at a degenerate 0 / 1 edge).
+    Never raises.
+    """
+    ev = compute_ev_per_dollar(
+        predicted_winner_probability, market_implied_probability,
+    )
+    if ev is None:
+        return EV_BUCKET_UNRATED, None
+    if ev >= EV_THRESHOLD_PRIME:
+        return EV_BUCKET_PRIME, ev
+    if ev >= EV_THRESHOLD_EDGE:
+        return EV_BUCKET_EDGE, ev
+    if ev >= EV_THRESHOLD_THIN:
+        return EV_BUCKET_THIN, ev
+    return EV_BUCKET_NEGATIVE, ev

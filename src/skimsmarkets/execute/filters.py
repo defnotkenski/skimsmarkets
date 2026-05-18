@@ -23,6 +23,7 @@ def filter_rows(
     no_negative_edge: bool = False,
     sports: list[str] | None = None,
     risk_buckets: list[str] | None = None,
+    ev_buckets: list[str] | None = None,
     min_market_implied_prob: float | None = None,
 ) -> Iterator[PredictionRow]:
     """Yield rows that pass every active filter.
@@ -42,7 +43,14 @@ def filter_rows(
     - `risk_buckets`: keep rows whose `risk_bucket` is in the set.
       Rows with `risk_bucket=None` (Unrated / classifier failure) →
       DROP when the filter is active; same safety stance as
-      `min_defensibility`.
+      `min_defensibility`. Active in `--mode confidence` (default).
+    - `ev_buckets`: keep rows whose `ev_bucket` is in the set.
+      Rows with `ev_bucket=None` (older runs predating the dual-mode
+      classifier, or rows where EV was uncomputable) → DROP when
+      active. Active in `--mode ev`. Mutually exclusive with
+      `risk_buckets` in practice — the CLI dispatch zeroes one based
+      on `--mode`, but both filters compose as AND here for
+      orthogonality (callers passing both get the intersection).
     - `min_market_implied_prob`: drop rows whose
       `polymarket_implied_probability` (market's prob for the
       predicted winner) is below the cutoff. Default 0.50 catches
@@ -57,6 +65,9 @@ def filter_rows(
     )
     bucket_set: frozenset[str] | None = (
         frozenset(risk_buckets) if risk_buckets else None
+    )
+    ev_bucket_set: frozenset[str] | None = (
+        frozenset(ev_buckets) if ev_buckets else None
     )
     for row in rows:
         if conf_set is not None and row.confidence not in conf_set:
@@ -77,6 +88,9 @@ def filter_rows(
                 continue
         if bucket_set is not None:
             if row.risk_bucket is None or row.risk_bucket not in bucket_set:
+                continue
+        if ev_bucket_set is not None:
+            if row.ev_bucket is None or row.ev_bucket not in ev_bucket_set:
                 continue
         if min_market_implied_prob is not None:
             if (

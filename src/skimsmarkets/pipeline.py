@@ -34,7 +34,8 @@ from skimsmarkets.agents.sports.tennis.deterministic_notebook import (
     is_tennis_event_rich_coverage,
 )
 from skimsmarkets.calibration import apply_temperature, load_temperature
-from skimsmarkets.classify import classify_risk
+from skimsmarkets.classify import classify_ev, classify_risk
+from skimsmarkets.ev import compute_ev_per_dollar
 from skimsmarkets.progress import ProgressReporter
 from skimsmarkets.polymarket.enrichment import (
     enrich_clob_book,
@@ -153,6 +154,15 @@ class RunResult:
     # leaderboard by bucket without recomputing the gap. `risk_score` is
     # None (bucket `Unrated`) when the judge produced no defensibility score.
     risk_classifications: dict[str, tuple[str, float | None]] = field(
+        default_factory=dict
+    )
+    # Parallel EV classification keyed event_id → (ev_bucket, ev_score).
+    # Computed in `_persist_run` alongside the risk classifier so the
+    # dual-mode reporting / sorting (`--sort-by ev`) and the executor's
+    # `--mode ev` filter both have a per-event label without recomputing.
+    # `ev_score` is None (bucket `Unrated`) when EV is uncomputable (model
+    # or market probability missing, or market price at a degenerate edge).
+    ev_classifications: dict[str, tuple[str, float | None]] = field(
         default_factory=dict
     )
     # Per-stage wall-clock timings (seconds), populated by `run_pipeline`
@@ -758,37 +768,6 @@ def _collect_uw_insider_counts(
         )
         out[ev.id] = {"total": total, "notable": notable, "smart": smart}
     return out
-
-
-def compute_ev_per_dollar(
-    model_p: float | None, market_p: float | None,
-) -> float | None:
-    """Expected value per $1 staked on the predicted side.
-
-    Math:
-      payoff_ratio = (1 - market_p) / market_p   # $ you win per $1 risked
-      ev_per_dollar = model_p * payoff_ratio - (1 - model_p)
-
-    Positive = the bet has asymmetric edge (pays more than fair); negative
-    = market offers worse-than-fair odds for the predicted side. Returns
-    None when either probability is missing OR market_p is at the
-    degenerate edges 0 / 1 (payoff is undefined). Both `model_p` and
-    `market_p` must be on the SAME side frame — for this codebase, that's
-    the predicted-winner frame (where `polymarket_implied_probability`
-    lives per the docstring at line 1411).
-
-    Exposed at module level (not private) so `scripts/ev_bucket_retro.py`
-    can reuse the formula when computing EV for older rows that predate
-    the persisted `ev_per_dollar` field.
-    """
-    if model_p is None or market_p is None:
-        return None
-    if not (0.0 < market_p < 1.0):
-        return None
-    if not (0.0 <= model_p <= 1.0):
-        return None
-    payoff_ratio = (1.0 - market_p) / market_p
-    return model_p * payoff_ratio - (1.0 - model_p)
 
 
 def _get_uw_counts(result: RunResult, event_id: str) -> dict[str, int | None]:
@@ -1584,6 +1563,20 @@ def _persist_run(result: RunResult) -> None:
                     risk_bucket,
                     risk_score,
                 )
+                # Parallel EV classification — both bucketings run on every
+                # event regardless of which the operator filters by at trade
+                # time. Uses the rank-time Polymarket implied probability;
+                # `skims execute --mode ev` re-grades the row against the
+                # LIVE Kalshi ask via `compute_ev_per_dollar` (the persisted
+                # bucket is the rank-time snapshot for sorting / reporting).
+                ev_bucket, ev_score = classify_ev(
+                    p.predicted_yes_probability,
+                    p.polymarket_implied_probability,
+                )
+                result.ev_classifications[p.event_id] = (
+                    ev_bucket,
+                    ev_score,
+                )
 
                 # Per-event token usage rollup
                 event_token_usage = result.token_usage.get(p.event_id, [])
@@ -1741,6 +1734,15 @@ def _persist_run(result: RunResult) -> None:
                     # `classify.py`.
                     "risk_bucket": risk_bucket,
                     "risk_score": risk_score,
+                    # Parallel EV classification (see `classify_ev` in
+                    # classify.py). Buckets: Prime / Edge / Thin / Negative
+                    # / Unrated. Computed off the rank-time Polymarket
+                    # implied probability; `skims execute --mode ev` uses
+                    # this for slate-side filtering, and the trader's
+                    # `--min-ev-threshold` re-grades against the live
+                    # Kalshi ask for trade-time gating.
+                    "ev_bucket": ev_bucket,
+                    "ev_score": ev_score,
                     # Calibration audit — `calibration_temperature` is the
                     # scalar applied to the magnitude term this run (1.0 when
                     # no artefact is committed); `calibrated_winner_probability`

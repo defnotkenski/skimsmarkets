@@ -27,15 +27,24 @@ from skimsmarkets.classify import (  # noqa: E402
     BUCKET_LOCK,
     BUCKET_ORDER,
     BUCKET_UNRATED,
+    EV_BUCKET_EDGE,
+    EV_BUCKET_NEGATIVE,
+    EV_BUCKET_ORDER,
+    EV_BUCKET_PRIME,
+    EV_BUCKET_THIN,
+    EV_BUCKET_UNRATED,
     THRESHOLD_COINFLIP,
     THRESHOLD_LEAN,
     THRESHOLD_LOCK,
     bucket_rank,
+    classify_ev,
     classify_risk,
+    ev_bucket_rank,
 )
 from skimsmarkets.execute.filters import filter_rows  # noqa: E402
 from skimsmarkets.execute.trader import (  # noqa: E402
     _implied_at_or_above_max,
+    kelly_bet_size,
     sum_exposure_cents,
 )
 from skimsmarkets.kalshi.matcher import (  # noqa: E402
@@ -70,6 +79,7 @@ def _row(
     negative_edge: bool | None = False,
     sport_type: str | None = "tennis",
     risk_bucket: str | None = "Lock",
+    ev_bucket: str | None = None,
     polymarket_implied_probability: float | None = 0.60,
 ) -> PredictionRow:
     """Minimal PredictionRow for matcher / filter tests."""
@@ -87,6 +97,7 @@ def _row(
         "negative_edge": negative_edge,
         "sport_type": sport_type,
         "risk_bucket": risk_bucket,
+        "ev_bucket": ev_bucket,
         "polymarket_implied_probability": polymarket_implied_probability,
     })
 
@@ -951,7 +962,7 @@ def _t_ev_per_dollar() -> int:
     missing inputs and degenerate market prices, (c) the zero-edge
     fair-market case.
     """
-    from skimsmarkets.pipeline import compute_ev_per_dollar
+    from skimsmarkets.ev import compute_ev_per_dollar
 
     # Favorite case: 60% model, 55% market → +9.2% EV per $1
     fav = compute_ev_per_dollar(0.60, 0.55)
@@ -988,6 +999,231 @@ def _t_ev_per_dollar() -> int:
     assert compute_ev_per_dollar(1.5, 0.5) is None
     assert compute_ev_per_dollar(-0.1, 0.5) is None
     n += 4
+
+    return n
+
+
+def _t_kelly_bet_size() -> int:
+    """`kelly_bet_size` — fractional-Kelly math + safety-rail caps.
+
+    Covers (a) the headline asymmetric payoff (same model edge sizes
+    much larger on underdogs), (b) the `max_fraction` ceiling kicking in
+    when raw Kelly would exceed the cap, (c) the no-edge / negative-edge
+    skip path, (d) degenerate input handling that mirrors
+    `compute_ev_per_dollar`.
+    """
+    # Favorite case: 60% model, 55% market, bankroll $1000, quarter-Kelly.
+    # b = 0.45/0.55 ≈ 0.8182, f_star = (b*0.60 - 0.40)/b = 0.1111.
+    # raw_fraction = 0.1111 * 0.25 ≈ 0.02778. max_fraction caps it at 0.02.
+    # bet = int(100000 * 0.02) = 2000 cents.
+    fav = kelly_bet_size(
+        model_p=0.60, market_p=0.55, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    )
+    assert fav == 2000, f"favorite case capped at max_fraction: {fav}"
+    n = 1
+
+    # Same favorite case with the cap lifted (max_fraction=1.0):
+    # fraction = 0.02778 → bet = int(100000 * 0.02778) = 2777 cents (int
+    # truncates toward zero — conservative under-bet on fractional cents).
+    fav_uncapped = kelly_bet_size(
+        model_p=0.60, market_p=0.55, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=1.0,
+    )
+    assert fav_uncapped == 2777, f"favorite case uncapped: {fav_uncapped}"
+    n += 1
+
+    # Underdog case: 30% model, 20% market — same 10pp edge as favorite
+    # but Kelly sizes MUCH larger (asymmetric payoff). f_star = (4.0*0.30
+    # - 0.70)/4.0 = 0.125. fraction = min(0.125 * 0.25, 0.02) = 0.02
+    # (also capped). Bet matches the favorite because max_fraction binds.
+    ug = kelly_bet_size(
+        model_p=0.30, market_p=0.20, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    )
+    assert ug == 2000, f"underdog case capped at max_fraction: {ug}"
+    n += 1
+
+    # Underdog case uncapped — to see Kelly's actual sizing preference:
+    # fraction = 0.125 * 0.25 = 0.03125 → bet = 3125. Higher than the
+    # uncapped favorite (2777), confirming the asymmetric-payoff intuition
+    # the EV strategy memo is built on.
+    ug_uncapped = kelly_bet_size(
+        model_p=0.30, market_p=0.20, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=1.0,
+    )
+    assert ug_uncapped == 3125, f"underdog uncapped: {ug_uncapped}"
+    assert ug_uncapped > fav_uncapped, "underdog should size > favorite"
+    n += 2
+
+    # No-edge case: model = market → f_star = 0 → bet = 0.
+    no_edge = kelly_bet_size(
+        model_p=0.50, market_p=0.50, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    )
+    assert no_edge == 0, f"no-edge skip: {no_edge}"
+    n += 1
+
+    # Negative-edge case: model < market → f_star < 0 → bet = 0 (skip).
+    neg_edge = kelly_bet_size(
+        model_p=0.40, market_p=0.50, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    )
+    assert neg_edge == 0, f"negative-edge skip: {neg_edge}"
+    n += 1
+
+    # Multiplier scaling: half-Kelly vs quarter-Kelly on same edge.
+    half = kelly_bet_size(
+        model_p=0.60, market_p=0.55, bankroll_cents=100_000,
+        kelly_multiplier=0.50, max_fraction=1.0,
+    )
+    quarter = kelly_bet_size(
+        model_p=0.60, market_p=0.55, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=1.0,
+    )
+    assert half == 2 * quarter or abs(half - 2 * quarter) <= 1, (
+        f"half-Kelly should be ~2x quarter-Kelly: {half} vs {quarter}"
+    )
+    n += 1
+
+    # Degenerate inputs — mirror compute_ev_per_dollar's safety net.
+    assert kelly_bet_size(
+        model_p=None, market_p=0.55, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    assert kelly_bet_size(
+        model_p=0.60, market_p=None, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    # market_p at degenerate edges (0 / 1) — payoff undefined.
+    assert kelly_bet_size(
+        model_p=0.60, market_p=0.0, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    assert kelly_bet_size(
+        model_p=0.60, market_p=1.0, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    # Out-of-range model_p — defensive against bad data.
+    assert kelly_bet_size(
+        model_p=1.5, market_p=0.55, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    assert kelly_bet_size(
+        model_p=-0.1, market_p=0.55, bankroll_cents=100_000,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    # Zero / negative bankroll — nothing to bet with.
+    assert kelly_bet_size(
+        model_p=0.60, market_p=0.55, bankroll_cents=0,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    assert kelly_bet_size(
+        model_p=0.60, market_p=0.55, bankroll_cents=-100,
+        kelly_multiplier=0.25, max_fraction=0.02,
+    ) == 0
+    n += 8
+
+    return n
+
+
+def _t_classify_ev() -> int:
+    """`classify_ev` — bucket cuts on EV-per-dollar + Unrated handling.
+
+    Mirrors `_t_ev_per_dollar`'s structure but tests the discrete bucket
+    output rather than the continuous EV value. Verifies (a) every bucket
+    band returns the right label, (b) the granular score comes back
+    alongside the bucket, (c) degenerate inputs route to Unrated.
+    """
+    # Prime: EV ≥ 0.30. Underdog case 30%/20% → EV = 0.50, well above 0.30.
+    bucket, score = classify_ev(0.30, 0.20)
+    assert bucket == EV_BUCKET_PRIME, f"prime bucket: {bucket}"
+    assert score is not None and abs(score - 0.50) < 1e-3, f"prime score: {score}"
+    n = 2
+
+    # Edge: 0.15 ≤ EV < 0.30. Boundary case 60%/55% → EV ≈ 0.111... wait
+    # that's < 0.15. Need higher edge: 65%/55% → b=0.818, EV = 0.65*0.818-0.35
+    # = 0.532-0.35 = 0.182. In Edge band.
+    bucket, score = classify_ev(0.65, 0.55)
+    assert bucket == EV_BUCKET_EDGE, f"edge bucket: {bucket}"
+    assert score is not None and 0.15 <= score < 0.30, f"edge score: {score}"
+    n += 2
+
+    # Thin: 0 ≤ EV < 0.15. 60%/55% gives EV ≈ 0.091, in Thin band.
+    bucket, score = classify_ev(0.60, 0.55)
+    assert bucket == EV_BUCKET_THIN, f"thin bucket: {bucket}"
+    assert score is not None and 0.0 <= score < 0.15, f"thin score: {score}"
+    n += 2
+
+    # Negative: EV < 0. Model less bullish than market → negative-edge case.
+    bucket, score = classify_ev(0.40, 0.50)
+    assert bucket == EV_BUCKET_NEGATIVE, f"negative bucket: {bucket}"
+    assert score is not None and score < 0, f"negative score: {score}"
+    n += 2
+
+    # Unrated: degenerate / missing inputs. Should match the same set as
+    # `compute_ev_per_dollar` returning None.
+    assert classify_ev(None, 0.5) == (EV_BUCKET_UNRATED, None)
+    assert classify_ev(0.5, None) == (EV_BUCKET_UNRATED, None)
+    assert classify_ev(0.5, 0.0) == (EV_BUCKET_UNRATED, None)
+    assert classify_ev(0.5, 1.0) == (EV_BUCKET_UNRATED, None)
+    assert classify_ev(1.5, 0.5) == (EV_BUCKET_UNRATED, None)
+    n += 5
+
+    # ev_bucket_rank ordering — Prime best (0), Unrated worst, unknown
+    # sorts last. Mirrors `bucket_rank` contract so reporting code can
+    # swap the callable.
+    assert ev_bucket_rank(EV_BUCKET_PRIME) == 0
+    assert ev_bucket_rank(EV_BUCKET_NEGATIVE) == 3
+    assert ev_bucket_rank(EV_BUCKET_UNRATED) == len(EV_BUCKET_ORDER) - 1
+    assert ev_bucket_rank("not-a-bucket") == len(EV_BUCKET_ORDER)
+    n += 4
+
+    return n
+
+
+def _t_filter_ev_bucket() -> int:
+    """`filter_rows(ev_buckets=...)` — parallel to the risk-bucket filter.
+
+    Asserts (a) explicit allowlist drops out-of-set rows, (b) rows with
+    `ev_bucket=None` (older rows pre-dual-mode, or uncomputable EV)
+    always fail when filter is active, (c) inactive filter passes
+    everything.
+    """
+    rows = [
+        _row(predicted_winner="A", ev_bucket=EV_BUCKET_PRIME),
+        _row(predicted_winner="B", ev_bucket=EV_BUCKET_EDGE),
+        _row(predicted_winner="C", ev_bucket=EV_BUCKET_THIN),
+        _row(predicted_winner="D", ev_bucket=EV_BUCKET_NEGATIVE),
+        _row(predicted_winner="E", ev_bucket=None),  # older row / uncomputable
+    ]
+
+    # Default tradeable set (Prime + Edge) keeps the top two.
+    kept = list(filter_rows(rows, ev_buckets=["Prime", "Edge"]))
+    assert {r.predicted_winner for r in kept} == {"A", "B"}, (
+        f"ev_bucket filter kept: {[r.predicted_winner for r in kept]}"
+    )
+    n = 1
+
+    # Single-bucket filter — only Prime.
+    kept = list(filter_rows(rows, ev_buckets=["Prime"]))
+    assert [r.predicted_winner for r in kept] == ["A"]
+    n += 1
+
+    # ev_bucket=None always fails when the filter is active (safety
+    # stance — can't grade without a bucket, drop rather than admit).
+    kept = list(filter_rows(rows, ev_buckets=["Prime", "Edge", "Thin", "Negative"]))
+    assert "E" not in {r.predicted_winner for r in kept}, (
+        "ev_bucket=None should fail when filter is active"
+    )
+    n += 1
+
+    # Inactive (None / empty) → every row passes including ev_bucket=None.
+    kept = list(filter_rows(rows, ev_buckets=None))
+    assert len(kept) == 5
+    kept = list(filter_rows(rows, ev_buckets=[]))
+    assert len(kept) == 5
+    n += 2
 
     return n
 
@@ -1127,6 +1363,9 @@ def main() -> int:
         ("uw hashdive schema decode", _t_uw_schema_decode),
         ("uw trader profile enrichment", _t_uw_trader_profile),
         ("ev per dollar math", _t_ev_per_dollar),
+        ("kelly bet size math", _t_kelly_bet_size),
+        ("classify_ev buckets", _t_classify_ev),
+        ("filter_rows ev_bucket", _t_filter_ev_bucket),
     ]
     failures = 0
     for name, fn in groups:

@@ -38,6 +38,7 @@ from skimsmarkets.kalshi.models import (
     OrderRequest,
     OrderResponse,
 )
+from skimsmarkets.ev import compute_ev_per_dollar
 from skimsmarkets.retro.jsonl import (
     iter_predictions,
     run_path_for_id,
@@ -62,6 +63,17 @@ class ExecuteOptions:
     no_negative_edge: bool = False
     sports: list[str] | None = None
     risk_buckets: list[str] | None = None
+    # Parallel slate-side filter for `--mode ev`. CLI dispatch zeroes
+    # `risk_buckets` and populates `ev_buckets` when mode=ev (and vice-
+    # versa) so the operator picks exactly one bucket-dimension filter
+    # per run. `filter_rows` itself ANDs both if a caller passes both —
+    # the mutual-exclusion semantic is a CLI-layer convention, not a
+    # type-system guarantee, to keep the filter primitive orthogonal.
+    ev_buckets: list[str] | None = None
+    # Informational — surfaces in logs / future routing. The actual
+    # bucket-dimension filter switch is driven by which of
+    # `risk_buckets` / `ev_buckets` is non-None.
+    mode: Literal["confidence", "ev"] = "confidence"
     min_market_implied_prob: float | None = None
     # Skip a matched trade when the *current* Kalshi YES ask is at or above
     # this implied-probability ceiling. The rank-time slate filter only saw
@@ -69,6 +81,23 @@ class ExecuteOptions:
     # past the threshold. None = gate inactive (the CLI resolves it to
     # `cfg.MAX_IMPLIED_PROBABILITY`, the same constant the rank slate uses).
     max_implied_probability: float | None = None
+    # EV-sizing knobs (opt-in). `bankroll_cents=None` keeps the legacy
+    # uniform-sizing path; setting a positive value flips the trader into
+    # fractional-Kelly sizing where the per-trade ceiling is
+    # `int(bankroll_cents * min(f_star * kelly_multiplier, kelly_max_fraction))`
+    # — see `kelly_bet_size`. The Kelly fraction is computed off the LIVE
+    # Kalshi yes_ask (the price we'll actually pay), not the rank-time
+    # Polymarket implied. `kelly_max_fraction` is intentionally a config
+    # constant rather than a CLI flag — the 2% cap is a safety rail, not a
+    # tuning knob.
+    bankroll_cents: int | None = None
+    kelly_multiplier: float = 0.25
+    kelly_max_fraction: float = 0.02
+    # When set, skip any matched row whose live-line EV-per-dollar (computed
+    # from Kalshi yes_ask + predicted_yes_probability) is below this floor.
+    # Independent of Kelly mode — uniform-sizing users can also gate on EV.
+    # None = gate inactive (every matched row passes).
+    min_ev_threshold: float | None = None
 
 
 @dataclass
@@ -129,6 +158,7 @@ async def run_execute(
         no_negative_edge=opts.no_negative_edge,
         sports=opts.sports,
         risk_buckets=opts.risk_buckets,
+        ev_buckets=opts.ev_buckets,
         min_market_implied_prob=opts.min_market_implied_prob,
     ))
     summary.passed_filters = len(filtered)
@@ -235,12 +265,73 @@ def _validate(opts: ExecuteOptions, config: Config) -> None:
             "A single trade can't be larger than the entire portfolio "
             "exposure cap — either lower the bet or raise the cap."
         )
+    if opts.bankroll_cents is not None and opts.bankroll_cents <= 0:
+        raise RuntimeError(
+            f"--bankroll-cents must be positive when set, got "
+            f"{opts.bankroll_cents}."
+        )
+    if not (0.0 < opts.kelly_multiplier <= 1.0):
+        raise RuntimeError(
+            f"--kelly-multiplier must be in (0, 1], got "
+            f"{opts.kelly_multiplier}."
+        )
+    if not (0.0 < opts.kelly_max_fraction <= 1.0):
+        raise RuntimeError(
+            f"kelly_max_fraction must be in (0, 1], got "
+            f"{opts.kelly_max_fraction}."
+        )
+    if opts.min_ev_threshold is not None and opts.min_ev_threshold < 0:
+        raise RuntimeError(
+            f"--min-ev-threshold must be non-negative, got "
+            f"{opts.min_ev_threshold}."
+        )
     if opts.sports:
         invalid = [s for s in opts.sports if s.lower() != "tennis"]
         if invalid:
             raise RuntimeError(
                 f"--sport: only `tennis` is supported in v1, got: {invalid}"
             )
+
+
+def kelly_bet_size(
+    *,
+    model_p: float | None,
+    market_p: float | None,
+    bankroll_cents: int,
+    kelly_multiplier: float,
+    max_fraction: float,
+) -> int:
+    """Fractional-Kelly bet size in cents — 0 when no edge or invalid inputs.
+
+    Standard Kelly:
+      b = (1 - market_p) / market_p          # net odds per $1 risked
+      f_star = (b * p - q) / b               # full Kelly fraction (q = 1 - p)
+      fraction = min(f_star * kelly_multiplier, max_fraction)
+      bet = int(bankroll_cents * fraction)
+
+    Returns 0 (the trader treats this as a skip) when:
+      - either probability is None or out of [0, 1]
+      - market_p is at the degenerate edges 0 / 1 (payoff undefined)
+      - f_star <= 0 (model agrees with or trails the market — no edge)
+      - bankroll_cents <= 0
+
+    `int()` truncates (round-down) rather than rounding, so the resulting
+    size is a conservative under-bet on fractional cents.
+    """
+    if model_p is None or market_p is None:
+        return 0
+    if not (0.0 <= model_p <= 1.0):
+        return 0
+    if not (0.0 < market_p < 1.0):
+        return 0
+    if bankroll_cents <= 0:
+        return 0
+    b = (1.0 - market_p) / market_p
+    f_star = (b * model_p - (1.0 - model_p)) / b
+    if f_star <= 0:
+        return 0
+    fraction = min(f_star * kelly_multiplier, max_fraction)
+    return int(bankroll_cents * fraction)
 
 
 async def _prefetch_open_exposure(
@@ -366,8 +457,24 @@ async def _process_row(
     Pure-ish: only side effect is the Kalshi POST (only on `--live` +
     matched + within caps + not already executed). All other branches
     return a fully-formed audit row without touching the network.
+
+    Per-trade sizing pipeline:
+      1. matcher → live Kalshi yes_ask
+      2. implied-prob ceiling gate (skip if drifted past threshold)
+      3. EV gate (skip if live-line EV below `min_ev_threshold`)
+      4. compute per-trade size — Kelly if `bankroll_cents` is set,
+         else uniform `opts.bet_size_cents` (legacy path)
+      5. exposure-cap reconciliation — pro-rate to fit headroom in Kelly
+         mode, refuse in uniform mode (preserves legacy behavior)
+
+    Skipped rows record `bet_size_cents` differently per branch — pre-
+    sizing skips carry `opts.bet_size_cents` (the would-have-been ceiling)
+    so the audit row's meaning is consistent with uniform-mode runs;
+    post-sizing skips carry the actually computed Kelly size so the
+    operator can see what the trader had concluded before the cap or
+    other gate intervened.
     """
-    base = _audit_base(row, opts)
+    base = _audit_base(row, opts, bet_size_cents=opts.bet_size_cents)
     # Intra-run idempotency check BEFORE the matcher — even cheaper:
     # no need to scan Kalshi events for a row we're going to skip.
     if row.event_id in already_done:
@@ -399,24 +506,106 @@ async def _process_row(
             base, outcome, reason="implied_at_or_above_max", market=market,
         )
 
-    # Portfolio exposure cap: open Kalshi exposure (read once at run
-    # start) + this run's accumulated fills + this trade's ceiling. We
-    # use the per-trade ceiling (`bet_size_cents`) rather than the
-    # expected ask so the gate is monotone — a partial fill that ends
-    # up cheaper than expected won't retroactively let a later trade
-    # slip through. The pre-fetched `open_exposure_cents` is a snapshot;
-    # the `this_run_pending_cents` accumulator covers fills placed since.
-    projected = (
-        open_exposure_cents + this_run_pending_cents + opts.bet_size_cents
-    )
-    if projected > opts.max_open_exposure_cents:
-        log.info(
-            "execute: %s would breach exposure cap (projected=%d, cap=%d) — skip",
-            market.ticker, projected, opts.max_open_exposure_cents,
+    # EV gate (active when --min-ev-threshold is set). The persisted
+    # `row.ev_per_dollar` was computed off the rank-time Polymarket
+    # probability; we recompute here against the LIVE Kalshi yes_ask so
+    # the gate reflects the actual line we'd take. Skips when EV is
+    # uncomputable (degenerate inputs) or below the floor.
+    if opts.min_ev_threshold is not None:
+        live_ev = compute_ev_per_dollar(
+            row.predicted_yes_probability, yes_ask,
         )
-        return _skip_row(
-            base, outcome, reason="exposure_cap_exceeded", market=market,
+        if live_ev is None or live_ev < opts.min_ev_threshold:
+            log.info(
+                "execute: %s live EV %s below threshold %.3f — skip",
+                market.ticker,
+                f"{live_ev:.3f}" if live_ev is not None else "None",
+                opts.min_ev_threshold,
+            )
+            return _skip_row(
+                base, outcome, reason="ev_below_threshold", market=market,
+            )
+
+    # Per-trade sizing. Kelly mode (when --bankroll-cents is set) sizes
+    # off the LIVE Kalshi yes_ask — the price we'll actually pay — rather
+    # than the rank-time Polymarket implied. `opts.bet_size_cents` and
+    # `opts.max_position_cents` cap the Kelly result from above as
+    # belt-and-suspenders ceilings.
+    if opts.bankroll_cents is not None:
+        kelly_size = kelly_bet_size(
+            model_p=row.predicted_yes_probability,
+            market_p=yes_ask,
+            bankroll_cents=opts.bankroll_cents,
+            kelly_multiplier=opts.kelly_multiplier,
+            max_fraction=opts.kelly_max_fraction,
         )
+        if kelly_size <= 0:
+            # No positive Kelly fraction — model agrees with / trails the
+            # market on this row's live line, OR inputs were degenerate.
+            # In practice the EV gate above already catches the no-edge
+            # case when active; this branch fires for `--bankroll-cents`
+            # without `--min-ev-threshold`.
+            log.info(
+                "execute: %s Kelly size 0 (no edge at live ask %.3f) — skip",
+                market.ticker, yes_ask,
+            )
+            return _skip_row(
+                _audit_base(row, opts, bet_size_cents=0),
+                outcome, reason="kelly_zero_size", market=market,
+            )
+        bet_size_cents = min(
+            kelly_size, opts.bet_size_cents, opts.max_position_cents,
+        )
+    else:
+        bet_size_cents = opts.bet_size_cents
+
+    # Re-stamp base now that we know the actual per-trade size for this row;
+    # downstream audit branches read from `base` for the final TradeRow shape.
+    base = _audit_base(row, opts, bet_size_cents=bet_size_cents)
+
+    # Portfolio exposure cap. Uniform mode preserves the legacy
+    # all-or-nothing behaviour (refuse the row if the ceiling won't fit).
+    # Kelly mode pro-rates instead — a partial bet within headroom is
+    # strictly better than skipping, because Kelly already over-shrinks
+    # vs the un-capped optimum.
+    if opts.bankroll_cents is not None:
+        headroom = opts.max_open_exposure_cents - (
+            open_exposure_cents + this_run_pending_cents
+        )
+        if headroom <= 0:
+            log.info(
+                "execute: %s exposure cap exhausted "
+                "(open=%d + pending=%d ≥ cap=%d) — skip",
+                market.ticker, open_exposure_cents, this_run_pending_cents,
+                opts.max_open_exposure_cents,
+            )
+            return _skip_row(
+                _audit_base(row, opts, bet_size_cents=0),
+                outcome, reason="exposure_cap_exhausted", market=market,
+            )
+        if headroom < bet_size_cents:
+            log.info(
+                "execute: %s pro-rating Kelly size %d → %d cents to fit headroom",
+                market.ticker, bet_size_cents, headroom,
+            )
+            bet_size_cents = headroom
+            base = _audit_base(row, opts, bet_size_cents=bet_size_cents)
+    else:
+        # We use the per-trade ceiling (`bet_size_cents`) rather than the
+        # expected ask so the gate is monotone — a partial fill that ends
+        # up cheaper than expected won't retroactively let a later trade
+        # slip through.
+        projected = (
+            open_exposure_cents + this_run_pending_cents + bet_size_cents
+        )
+        if projected > opts.max_open_exposure_cents:
+            log.info(
+                "execute: %s would breach exposure cap (projected=%d, cap=%d) — skip",
+                market.ticker, projected, opts.max_open_exposure_cents,
+            )
+            return _skip_row(
+                base, outcome, reason="exposure_cap_exceeded", market=market,
+            )
 
     if opts.dry_run:
         return TradeRow(
@@ -446,7 +635,7 @@ async def _process_row(
     # floor-div, not ceil: keeps `count × yes_price ≤ bet_size_cents` as
     # a hard worst-case ceiling. At ask=46 + 5¢ buffer = 51, bet=2500,
     # count=49 → max spend 49 × 51 = 2499 ≤ 2500.
-    count = max(1, opts.bet_size_cents // yes_price_cents)
+    count = max(1, bet_size_cents // yes_price_cents)
     order_req = OrderRequest(
         ticker=market.ticker,
         action="buy",
@@ -507,8 +696,16 @@ async def _process_row(
     )
 
 
-def _audit_base(row: PredictionRow, opts: ExecuteOptions) -> dict[str, Any]:
-    """Field shared by every audit row regardless of outcome path."""
+def _audit_base(
+    row: PredictionRow, opts: ExecuteOptions, *, bet_size_cents: int,
+) -> dict[str, Any]:
+    """Fields shared by every audit row regardless of outcome path.
+
+    `bet_size_cents` is passed in (rather than read from `opts`) so the
+    Kelly path can record the per-row sized amount on the audit row —
+    the legacy uniform path always passes `opts.bet_size_cents`, so
+    semantics are unchanged when Kelly mode is off.
+    """
     return {
         "record_type": "trade",
         "run_id": opts.run_id,
@@ -523,7 +720,7 @@ def _audit_base(row: PredictionRow, opts: ExecuteOptions) -> dict[str, Any]:
         "defensibility_score": row.defensibility_score,
         "negative_edge": row.negative_edge,
         "side": "yes",
-        "bet_size_cents": opts.bet_size_cents,
+        "bet_size_cents": bet_size_cents,
         "dry_run": opts.dry_run,
     }
 

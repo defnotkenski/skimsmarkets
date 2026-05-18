@@ -17,7 +17,13 @@ from skimsmarkets.classify import (
     BUCKET_LEAN,
     BUCKET_LOCK,
     BUCKET_UNRATED,
+    EV_BUCKET_EDGE,
+    EV_BUCKET_NEGATIVE,
+    EV_BUCKET_PRIME,
+    EV_BUCKET_THIN,
+    EV_BUCKET_UNRATED,
     bucket_rank,
+    ev_bucket_rank,
 )
 from skimsmarkets.pipeline import RunResult
 from skimsmarkets.polymarket.models import PolymarketEvent, PolymarketMarket
@@ -63,6 +69,19 @@ def _risk_style(bucket: str) -> str:
     }.get(bucket, "")
 
 
+def _ev_style(bucket: str) -> str:
+    """Color map for EV buckets. Parallel to `_risk_style` so the EV column
+    reads visually consistent with Risk — best=green-bold, worst=red, etc.
+    """
+    return {
+        EV_BUCKET_PRIME: f"bold {_MINT}",
+        EV_BUCKET_EDGE: _MINT,
+        EV_BUCKET_THIN: _PEACH,
+        EV_BUCKET_NEGATIVE: _ROSE,
+        EV_BUCKET_UNRATED: _DIM,
+    }.get(bucket, "")
+
+
 def _defensibility_stars(score: float) -> str:
     """Render a [0,1] defensibility score as a 5-slot bar. Bucket
     boundaries are 0.85 / 0.65 / 0.45 / 0.25 — chosen so a typical 0.74
@@ -85,6 +104,40 @@ def _defensibility_stars(score: float) -> str:
         filled = 2
     else:
         filled = 1
+    return "█" * filled + "░" * (5 - filled)
+
+
+def _ev_bar(ev: float | None) -> str:
+    """Render an EV-per-dollar value as a 5-slot bar — parallel to
+    `_defensibility_stars` so the two quality dimensions read with the
+    same visual language in the leaderboard.
+
+    Cuts align with the rank-time EV classifier in `classify.py` so the
+    bar boundaries match the bucket boundaries the operator already
+    knows from the discrete label:
+      - ≥ 0.50:  5 blocks (deep Prime — asymmetric-payoff sweet spot)
+      - ≥ 0.30:  4 blocks (Prime entry per `EV_THRESHOLD_PRIME`)
+      - ≥ 0.15:  3 blocks (Edge — meets the conservative gate)
+      - ≥ 0.05:  2 blocks (low Thin)
+      - ≥ 0:     1 block  (barely positive)
+      - < 0:     0 blocks (Negative bucket — empty)
+    Returns an all-empty bar for `None` so the column width stays
+    constant on rows where EV is uncomputable.
+    """
+    if ev is None:
+        return "░" * 5
+    if ev >= 0.50:
+        filled = 5
+    elif ev >= 0.30:
+        filled = 4
+    elif ev >= 0.15:
+        filled = 3
+    elif ev >= 0.05:
+        filled = 2
+    elif ev >= 0:
+        filled = 1
+    else:
+        filled = 0
     return "█" * filled + "░" * (5 - filled)
 
 
@@ -281,7 +334,7 @@ def print_events_table(
 
 
 def print_run_summary(
-    result: RunResult, *, console: Console | None = None,
+    result: RunResult, *, sort_by: str = "risk", console: Console | None = None,
 ) -> None:
     # Accept a shared Console (set up in `cli._CONSOLE`) so the rule,
     # leaderboard, and summary panel print through the same Live-aware
@@ -300,34 +353,41 @@ def print_run_summary(
     # the rule as the visual headline.
 
     if result.predictions:
-        # Leaderboard primary sort: risk bucket (Lock → Lean → Coin-flip →
-        # Avoid → Unrated). Within a bucket, judge `defensibility_score`
-        # descending, then predicted probability descending. Events with no
-        # risk classification (e.g. a directly-constructed RunResult in a
-        # test) fall back to the Unrated bucket; events with no judge score
-        # use the -1.0 defensibility sentinel so they lose every tiebreak.
-        # When the whole judge call failed, every event is Unrated and the
-        # sort collapses to predicted-probability order — the legacy
-        # fallback behavior.
-        def _sort_key(p: MarketPrediction) -> tuple[int, float, float]:
+        # Leaderboard primary sort dispatched by `sort_by`:
+        #   "risk" (default): risk bucket → defensibility → predicted prob
+        #   "ev": ev bucket → ev score → predicted prob
+        # Within a bucket, second-tier sort uses the matching dimension's
+        # score so ties break sensibly. Events with no classification fall
+        # back to the bucket's "Unrated" sentinel; events with no score
+        # use -1.0 so they lose every tiebreak. Negation on bucket rank +
+        # reverse=True puts the best bucket first.
+        def _sort_key_risk(p: MarketPrediction) -> tuple[int, float, float]:
             rc = result.risk_classifications.get(p.event_id)
             bucket = rc[0] if rc is not None else BUCKET_UNRATED
             da = result.defensibility_assessments.get(p.event_id)
             score = da.defensibility_score if da is not None else -1.0
-            # Negate the rank so the best bucket (Lock, rank 0) sorts first
-            # under reverse=True.
             return (-bucket_rank(bucket), score, p.predicted_yes_probability)
 
-        ranked = sorted(result.predictions, key=_sort_key, reverse=True)
+        def _sort_key_ev(p: MarketPrediction) -> tuple[int, float, float]:
+            ec = result.ev_classifications.get(p.event_id)
+            bucket = ec[0] if ec is not None else EV_BUCKET_UNRATED
+            score = ec[1] if ec is not None and ec[1] is not None else -1.0
+            return (-ev_bucket_rank(bucket), score, p.predicted_yes_probability)
+
+        sort_fn = _sort_key_ev if sort_by == "ev" else _sort_key_risk
+        ranked = sorted(result.predictions, key=sort_fn, reverse=True)
         any_classified = bool(result.risk_classifications)
         any_judged = bool(result.defensibility_assessments)
-        title_text = (
-            "Risk-graded slate (Lock → Avoid)"
-            if any_classified
-            else "Defensibility leaderboard (most defensible case first)"
-            if any_judged
-            else "Confidence leaderboard (highest predicted probability first)"
-        )
+        if sort_by == "ev":
+            title_text = "EV-graded slate (Prime → Negative)"
+        elif any_classified:
+            title_text = "Risk-graded slate (Lock → Avoid)"
+        elif any_judged:
+            title_text = "Defensibility leaderboard (most defensible case first)"
+        else:
+            title_text = (
+                "Confidence leaderboard (highest predicted probability first)"
+            )
 
         leaderboard = Table(
             title=f"[{_CREAM}]{title_text}[/]",
@@ -345,6 +405,12 @@ def print_run_summary(
         leaderboard.add_column("Case", justify="center")
         leaderboard.add_column("Pred", justify="right")
         leaderboard.add_column("Poly impl", justify="right")
+        # EV column shows the bucket label (colored) and the granular EV
+        # value in parentheses — the bucket is the glance-read, the number
+        # is for when the bucket boundaries don't tell you what you need.
+        # Both come from `result.ev_classifications` (populated in
+        # `_persist_run` alongside `risk_classifications`).
+        leaderboard.add_column("EV", justify="center")
         leaderboard.add_column("Conf", justify="center")
 
         for rank, p in enumerate(ranked, start=1):
@@ -364,6 +430,22 @@ def print_run_summary(
             rc = result.risk_classifications.get(p.event_id)
             risk_bucket = rc[0] if rc is not None else BUCKET_UNRATED
             risk_cell = f"[{_risk_style(risk_bucket)}]{risk_bucket}[/]"
+            ec = result.ev_classifications.get(p.event_id)
+            ev_bucket = ec[0] if ec is not None else EV_BUCKET_UNRATED
+            ev_score = ec[1] if ec is not None else None
+            # `Bucket █████ +0.42` — the discrete bucket label, an inline
+            # 5-block bar (mirrors the Case column's defensibility bars
+            # for visual consistency), and the granular signed value.
+            # Rows with uncomputable EV fall back to the bucket label
+            # only (no bar / no number).
+            if ev_score is not None:
+                ev_cell = (
+                    f"[{_ev_style(ev_bucket)}]"
+                    f"{ev_bucket} {_ev_bar(ev_score)} {ev_score:+.2f}"
+                    f"[/]"
+                )
+            else:
+                ev_cell = f"[{_ev_style(ev_bucket)}]{ev_bucket}[/]"
             leaderboard.add_row(
                 str(rank),
                 event_display,
@@ -372,6 +454,7 @@ def print_run_summary(
                 case_cell,
                 f"{p.predicted_yes_probability:.3f}",
                 poly_impl_str,
+                ev_cell,
                 f"[{_confidence_style(p.confidence)}]{p.confidence}[/]",
             )
         console.print(leaderboard)

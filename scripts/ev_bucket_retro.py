@@ -32,7 +32,7 @@ from collections import defaultdict
 from pathlib import Path
 from statistics import mean
 
-from skimsmarkets.pipeline import compute_ev_per_dollar
+from skimsmarkets.ev import compute_ev_per_dollar
 from skimsmarkets.retro.jsonl import (
     iter_predictions,
     list_run_files,
