@@ -9,10 +9,13 @@ in v1), **plus an opt-in Kalshi trader (`skims execute`) that consumes
 the ranker's JSONL**. The two halves are deliberately separated:
 
 - **Ranker** (`skims rank` and everything under `pipeline.py`,
-  `agents/`, lens providers) is **not** an edge finder. No buy/pass
-  gates, no edge thresholds, no position sizes. The LLMs produce a
-  market-blind probability estimate; deterministic post-processing then
-  grades the slate into risk buckets. Trade decisions don't live here.
+  `agents/`, lens providers) makes no trade decisions — no order
+  placement, no position sizing, no exposure management. LLM stages
+  are market-blind (see below); deterministic post-processing joins
+  market price back in and classifies the slate into bucketings (risk
+  today; EV bucketing planned alongside under the dual-mode design —
+  see `project_ev_strategy.md` in memory). Buckets are inputs the
+  executor consumes; they are not trades.
 - **Executor** (`skims execute` under `src/skimsmarkets/execute/`,
   Kalshi adapter under `src/skimsmarkets/kalshi/`) is the opt-in,
   deterministic trade layer. Reads `logs/runs/<run_id>.jsonl`,
@@ -45,7 +48,7 @@ gamma /events  →  CLOB book + price-history enrichment
                →  per-sport lens chains (provider fetcher → Claude reasoner, parallel)
                →  Claude director per event (synthesises lens reports)
                →  Claude judge over the slate (defensibility score)
-               →  deterministic post-processing (risk classification, ranking, JSONL persistence)
+               →  deterministic post-processing (classification, ranking, JSONL persistence)
 ```
 
 LLMs only in the agent layer; everything else is deterministic.
