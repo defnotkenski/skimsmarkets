@@ -198,7 +198,15 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
             progress=progress,
             mode=args.mode,
         )
-    print_run_summary(result, sort_by=args.sort_by, console=_CONSOLE)
+    # Mode-aware default for sort dimension: ev / tail modes scan for
+    # EV-bucket picks at trade time, so the leaderboard's primary axis
+    # should match. Confidence mode (or no mode) keeps risk-bucket sort.
+    # Explicit `--sort-by` wins over this default.
+    effective_mode = args.mode or cfg.KALSHI_DEFAULT_TRADE_MODE
+    sort_by = args.sort_by or (
+        "ev" if effective_mode in ("ev", "tail") else "risk"
+    )
+    print_run_summary(result, sort_by=sort_by, console=_CONSOLE)
     return 0
 
 
@@ -797,15 +805,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rank.add_argument(
         "--sort-by",
         choices=("risk", "ev"),
-        default="risk",
+        default=None,
         metavar="DIMENSION",
         help=(
-            "Leaderboard sort dimension. `risk` (default) sorts by the "
-            "risk-bucket classifier (Lock → Avoid). `ev` sorts by the EV-"
-            "bucket classifier (Prime → Negative). Both bucketings are "
-            "always shown as columns regardless; this only changes the "
-            "sort order. Useful for slate scanning: `--sort-by ev` "
-            "surfaces the asymmetric-payoff opportunities at the top."
+            "Leaderboard sort dimension. `risk` sorts by the risk-bucket "
+            "classifier (Lock → Avoid). `ev` sorts by the EV-bucket "
+            "classifier (Prime → Negative). Both bucketings are always "
+            "shown as columns regardless; this only changes the sort "
+            "order. Default is MODE-AWARE: `--mode confidence` (or no "
+            "mode) defaults to `risk`; `--mode ev` and `--mode tail` "
+            "default to `ev` because their picks land in the EV-bucket "
+            "filter at trade time, so EV-sorted scanning matches the "
+            "operator's intent. Pass `--sort-by risk` explicitly to "
+            "override the mode-aware default."
         ),
     )
     p_rank.add_argument(

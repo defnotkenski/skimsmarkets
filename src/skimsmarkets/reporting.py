@@ -55,10 +55,6 @@ def _rel_time(ts: datetime | None) -> str:
     return f"{minutes}m"
 
 
-def _confidence_style(c: str) -> str:
-    return {"high": _MINT, "medium": _PEACH, "low": _ROSE}.get(c, "")
-
-
 def _risk_style(bucket: str) -> str:
     return {
         BUCKET_LOCK: f"bold {_MINT}",
@@ -414,7 +410,11 @@ def print_run_summary(
         # Both come from `result.ev_classifications` (populated in
         # `_persist_run` alongside `risk_classifications`).
         leaderboard.add_column("EV", justify="center")
-        leaderboard.add_column("Conf", justify="center")
+        # Conf (LLM-emitted qualitative robustness tier) was dropped from
+        # the display 2026-05-17 — redundant with Risk + Case + Pred for
+        # trade-decision purposes, and the executor doesn't filter on it.
+        # The field still persists on PredictionRow for retro `jq`
+        # inspection.
 
         for rank, p in enumerate(ranked, start=1):
             event_display = p.event_title or p.event_id
@@ -458,7 +458,6 @@ def print_run_summary(
                 f"{p.predicted_yes_probability:.3f}",
                 poly_impl_str,
                 ev_cell,
-                f"[{_confidence_style(p.confidence)}]{p.confidence}[/]",
             )
         console.print(leaderboard)
 
