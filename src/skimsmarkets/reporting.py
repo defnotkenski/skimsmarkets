@@ -299,9 +299,12 @@ def print_events_table(
         side_label = (m.yes_sub_title or "—")[:30]
         # Append the team's W/L record inline ("Cavaliers (28-6)") rather
         # than adding a column — keeps the table width manageable and
-        # ties the record to the side it belongs to.
-        if m.team_record:
-            side_label += f" ({m.team_record})"
+        # ties the record to the side it belongs to. `meaningful_team_
+        # record` filters gamma's "0-0" / "0-0-0" placeholders so tennis
+        # player names don't get a useless "(0-0)" suffix every row.
+        record = m.meaningful_team_record
+        if record:
+            side_label += f" ({record})"
         if m.is_no_side:
             side_label += " [NO]"
         # Read the canonical `open_interest_dollars` field. The legacy

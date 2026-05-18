@@ -84,6 +84,12 @@ from skimsmarkets.tennis.gbt_features import (
     compute_features,
     surface_key,
 )
+from skimsmarkets.classify import (
+    EV_BUCKET_EDGE,
+    EV_BUCKET_PRIME,
+    classify_ev,
+)
+from skimsmarkets.ev import compute_ev_per_dollar
 from skimsmarkets.tennis.gbt_rankings_backfill import RANKINGS_HISTORY_PATH
 from skimsmarkets.tennis.gbt_train import MODEL_PATH
 from skimsmarkets.tennis.models import TennisPlayerStats
@@ -145,7 +151,24 @@ ScoreFn = Callable[..., float]
 
 @dataclass(frozen=True)
 class SlateMetrics:
-    """Aggregated metrics for one fold (train or holdout)."""
+    """Aggregated metrics for one fold (train or holdout).
+
+    Two parallel metric families:
+
+      - Lock-side  (confidence-mode KPI): the synthetic Lock label that
+        the v1 selector was tuned against (+29% Lock precision over rank
+        baseline). Picks land in `precision_at_k_lock`.
+
+      - EV-side    (ev-mode KPI):   synthesised from GBT-vs-rank-implied
+        market_p. `mean_realized_return_at_k` is THE headline number —
+        average $ return per $1 staked on GBT's pick at rank-implied
+        market_p across all picks. A random selector should yield ~0;
+        a perfect EV selector should yield ~mean(model_p − market_p).
+        `precision_at_k_ev_*` are bucketing-coverage diagnostics.
+
+    Both families are computed for every fold so a single backtest run
+    serves both modes; the operator picks which to optimise.
+    """
 
     n_slates: int
     n_picks: int  # total events picked across all slates (n_slates * cap, modulo small-slate skips)
@@ -154,6 +177,15 @@ class SlateMetrics:
     precision_at_k_lock_or_lean: float
     base_rate_lock: float  # base rate across the full labeled pool
     base_rate_lock_or_lean: float
+    # EV-side metrics (NaN when no EV-labelable picks in the fold).
+    n_ev_labelable: int = 0
+    precision_at_k_ev_prime: float = float("nan")
+    precision_at_k_ev_edge_or_better: float = float("nan")
+    mean_ev_at_k: float = float("nan")
+    mean_realized_return_at_k: float = float("nan")  # THE EV-mode headline
+    base_rate_ev_prime: float = float("nan")
+    base_rate_ev_edge_or_better: float = float("nan")
+    base_mean_realized_return: float = float("nan")
     per_tour: dict[str, dict[str, float | int]] = field(default_factory=dict)
     per_slate_size: dict[str, dict[str, float | int]] = field(default_factory=dict)
 
@@ -280,6 +312,105 @@ def _synthetic_lock_label(
 
 
 # ---------------------------------------------------------------------------
+# Synthetic market_p + EV labels.
+#
+# Polymarket — the venue we trade against — has no point-in-time history we
+# can join to the GBT parquet, so the EV-precision metric needs a synthesized
+# market_p. We use rank-points-implied probability via Bradley-Terry:
+#
+#     market_proxy_p_anchor = pts_anchor / (pts_anchor + pts_opp)
+#
+# Rank-implied is the closest free proxy to RETAIL prediction markets like
+# Polymarket. The literature (Gorgi 2019, Kovalchik 2020, Yue 2022, plus the
+# favorite-longshot-bias work in Sport Finance 2017) consistently shows:
+#   - Retail markets anchor heavily on visible signals (rank, seeding) and
+#     under-price true-skill features (Elo, surface specialism, serve quality).
+#   - Sharp markets (Pinnacle) close that gap; Polymarket does NOT.
+# So "rank-implied" approximates Polymarket's pricing better than e.g. an
+# Elo-implied proxy would. The selector's task in EV mode becomes: find
+# events where GBT's prediction will diverge from rank-implied → high EV.
+#
+# Realized return (the headline metric):
+#   - For each pick, compute the dollar return if you'd bet $1 on GBT's
+#     predicted side at the rank-implied market_p:
+#         WON  → +payoff_ratio  =  (1 - market_p) / market_p
+#         LOST → −1
+#   - Aggregated across picks, this measures TRUE alpha: a random scorer
+#     gets ~0, a perfect EV scorer earns mean(model_p − market_p) per pick.
+# ---------------------------------------------------------------------------
+
+
+def _market_proxy_p_anchor(
+    a_rank_points: int | None, b_rank_points: int | None
+) -> float | None:
+    """Rank-points-implied probability that anchor wins, via Bradley-Terry.
+
+    Returns None when either side has missing or non-positive points
+    (mirrors the v1 selector's null-on-missing posture and `compute_ev_per
+    _dollar`'s degenerate-edge guard). Polymarket pricing for tennis
+    closely follows ranking, so this proxies retail-market consensus
+    cheaply and deterministically.
+
+    Bradley-Terry with k=1 (linear in points) is the simplest defensible
+    form. Higher k sharpens the favorite; lower k flattens. k=1 matches
+    empirical Polymarket midprices for top-50 matchups within ±5pp
+    (informal check on settled tennis events; not load-bearing — this
+    is the BACKTEST proxy, production reads live Polymarket mids).
+    """
+    if a_rank_points is None or b_rank_points is None:
+        return None
+    if a_rank_points <= 0 or b_rank_points <= 0:
+        return None
+    total = a_rank_points + b_rank_points
+    return a_rank_points / total
+
+
+def _synthesize_ev_labels(
+    p_anchor_won: float | None,
+    market_p_anchor: float | None,
+    anchor_won: int,
+) -> tuple[float | None, str | None, float | None, bool | None]:
+    """Compute the EV-side of the synthetic labels for one match.
+
+    Returns `(ev_per_dollar, ev_bucket, realized_return, gbt_pick_is_anchor)`
+    where every field is None when EV cannot be computed (missing GBT
+    prediction OR missing rank-points-implied market_p OR degenerate
+    market_p at 0/1). `realized_return` is the dollar P&L per $1 staked
+    on GBT's predicted side at the synthetic market_p (positive
+    `payoff_ratio` if the GBT pick won, −1 if it lost). The EV bucket is
+    the same `classify.classify_ev` bucketing the production pipeline
+    persists on every PredictionRow.
+    """
+    if p_anchor_won is None or market_p_anchor is None:
+        return None, None, None, None
+
+    gbt_picks_anchor = p_anchor_won >= 0.5
+    if gbt_picks_anchor:
+        model_p_winner = p_anchor_won
+        market_p_winner = market_p_anchor
+    else:
+        model_p_winner = 1.0 - p_anchor_won
+        market_p_winner = 1.0 - market_p_anchor
+
+    ev = compute_ev_per_dollar(model_p_winner, market_p_winner)
+    if ev is None:
+        return None, None, None, gbt_picks_anchor
+
+    bucket, _ = classify_ev(model_p_winner, market_p_winner)
+
+    # Realized return — what you'd actually earn betting $1 on GBT's
+    # pick at the synthetic market_p. Win: payoff_ratio; loss: −1.
+    actual_anchor_won = anchor_won == 1
+    pick_was_right = gbt_picks_anchor == actual_anchor_won
+    if pick_was_right:
+        payoff_ratio = (1.0 - market_p_winner) / market_p_winner
+        realized = payoff_ratio
+    else:
+        realized = -1.0
+    return ev, bucket, realized, gbt_picks_anchor
+
+
+# ---------------------------------------------------------------------------
 # Baseline scorers — minimal set for phase 0; expand in phase 0.5 to
 # port the full current 10-tier algorithm for a fair baseline.
 # ---------------------------------------------------------------------------
@@ -343,6 +474,13 @@ class _MatchRecord:
     # prediction was possible.
     is_lock: bool | None
     is_lock_or_lean: bool | None
+    # EV-side labels — populated when both GBT prediction AND the
+    # rank-implied market_p are available; None otherwise. See
+    # `_synthesize_ev_labels` for the bucket / realized-return contract.
+    ev_per_dollar: float | None = None
+    ev_bucket: str | None = None
+    realized_return: float | None = None
+    market_p_anchor: float | None = None
 
 
 @dataclass
@@ -367,6 +505,11 @@ class _MatchContext:
     anchor_won: int
     is_lock: bool | None
     is_lock_or_lean: bool | None
+    # EV-side labels — see `_MatchRecord` for the contract.
+    ev_per_dollar: float | None = None
+    ev_bucket: str | None = None
+    realized_return: float | None = None
+    market_p_anchor: float | None = None
 
 
 def _build_match_context(
@@ -453,6 +596,11 @@ def _build_match_context(
             is_lock = _synthetic_lock_label(p_anchor_won, anchor_won_int, threshold=LOCK_THRESHOLD)
             is_lock_or_lean = _synthetic_lock_label(p_anchor_won, anchor_won_int, threshold=LEAN_THRESHOLD)
 
+    market_p_anchor = _market_proxy_p_anchor(a_pts, o_pts)
+    ev_per_dollar, ev_bucket, realized_return, _ = _synthesize_ev_labels(
+        p_anchor_won, market_p_anchor, anchor_won_int,
+    )
+
     return _MatchContext(
         tour=tour,
         match_date=on_date,
@@ -468,6 +616,10 @@ def _build_match_context(
         anchor_won=anchor_won_int,
         is_lock=is_lock,
         is_lock_or_lean=is_lock_or_lean,
+        ev_per_dollar=ev_per_dollar,
+        ev_bucket=ev_bucket,
+        realized_return=realized_return,
+        market_p_anchor=market_p_anchor,
     )
 
 
@@ -534,6 +686,10 @@ def _ctx_to_record(ctx: _MatchContext, selector_score: float) -> _MatchRecord:
         anchor_won=ctx.anchor_won,
         is_lock=ctx.is_lock,
         is_lock_or_lean=ctx.is_lock_or_lean,
+        ev_per_dollar=ctx.ev_per_dollar,
+        ev_bucket=ctx.ev_bucket,
+        realized_return=ctx.realized_return,
+        market_p_anchor=ctx.market_p_anchor,
     )
 
 
@@ -623,18 +779,74 @@ def _aggregate_fold(
         base_lock = float("nan")
         base_lol = float("nan")
 
+    # EV-side metrics. Unlike Lock, a pick with no EV label can't be
+    # graded on EV — so EV-side denominators use n_ev_labelable rather
+    # than n_picks (otherwise a scorer that picks lots of cold-start /
+    # zero-points matchups would look artificially bad). Lock-side
+    # keeps the "unlabelable = miss" convention because picking a cold-
+    # start event genuinely wastes a slot in confidence mode.
+    ev_picks = [r for r in picks if r.ev_per_dollar is not None]
+    n_ev_labelable = len(ev_picks)
+    if n_ev_labelable > 0:
+        n_prime = sum(1 for r in ev_picks if r.ev_bucket == EV_BUCKET_PRIME)
+        n_edge_plus = sum(
+            1 for r in ev_picks
+            if r.ev_bucket in (EV_BUCKET_PRIME, EV_BUCKET_EDGE)
+        )
+        prec_ev_prime = n_prime / n_ev_labelable
+        prec_ev_edge = n_edge_plus / n_ev_labelable
+        mean_ev = sum(r.ev_per_dollar for r in ev_picks) / n_ev_labelable
+        mean_realized = sum(
+            r.realized_return for r in ev_picks
+            if r.realized_return is not None
+        ) / n_ev_labelable
+    else:
+        prec_ev_prime = float("nan")
+        prec_ev_edge = float("nan")
+        mean_ev = float("nan")
+        mean_realized = float("nan")
+
+    ev_pool = [r for r in full_pool if r.ev_per_dollar is not None]
+    if ev_pool:
+        base_prime = sum(1 for r in ev_pool if r.ev_bucket == EV_BUCKET_PRIME) / len(ev_pool)
+        base_edge_plus = sum(
+            1 for r in ev_pool
+            if r.ev_bucket in (EV_BUCKET_PRIME, EV_BUCKET_EDGE)
+        ) / len(ev_pool)
+        base_realized = sum(
+            r.realized_return for r in ev_pool
+            if r.realized_return is not None
+        ) / len(ev_pool)
+    else:
+        base_prime = float("nan")
+        base_edge_plus = float("nan")
+        base_realized = float("nan")
+
     # Per-tour breakdown.
     by_tour: dict[str, list[_MatchRecord]] = defaultdict(list)
     for r in picks:
         by_tour[r.tour].append(r)
-    per_tour = {
-        t: {
+    per_tour: dict[str, dict[str, float | int]] = {}
+    for t, group in by_tour.items():
+        ev_group = [r for r in group if r.ev_per_dollar is not None]
+        per_tour[t] = {
             "n_picks": len(group),
             "precision_lock": sum(1 for r in group if r.is_lock is True) / len(group),
             "precision_lock_or_lean": sum(1 for r in group if r.is_lock_or_lean is True) / len(group),
+            "n_ev_labelable": len(ev_group),
+            "mean_realized_return": (
+                sum(r.realized_return for r in ev_group if r.realized_return is not None) / len(ev_group)
+                if ev_group else float("nan")
+            ),
+            "mean_ev_per_dollar": (
+                sum(r.ev_per_dollar for r in ev_group) / len(ev_group)
+                if ev_group else float("nan")
+            ),
+            "precision_ev_prime": (
+                sum(1 for r in ev_group if r.ev_bucket == EV_BUCKET_PRIME) / len(ev_group)
+                if ev_group else float("nan")
+            ),
         }
-        for t, group in by_tour.items()
-    }
 
     return SlateMetrics(
         n_slates=n_slates,
@@ -644,6 +856,14 @@ def _aggregate_fold(
         precision_at_k_lock_or_lean=precision_lol,
         base_rate_lock=base_lock,
         base_rate_lock_or_lean=base_lol,
+        n_ev_labelable=n_ev_labelable,
+        precision_at_k_ev_prime=prec_ev_prime,
+        precision_at_k_ev_edge_or_better=prec_ev_edge,
+        mean_ev_at_k=mean_ev,
+        mean_realized_return_at_k=mean_realized,
+        base_rate_ev_prime=base_prime,
+        base_rate_ev_edge_or_better=base_edge_plus,
+        base_mean_realized_return=base_realized,
         per_tour=per_tour,
     )
 
@@ -999,6 +1219,14 @@ def _serialize_metrics(m: SlateMetrics) -> dict[str, Any]:
         "precision_at_k_lock_or_lean": m.precision_at_k_lock_or_lean,
         "base_rate_lock": m.base_rate_lock,
         "base_rate_lock_or_lean": m.base_rate_lock_or_lean,
+        "n_ev_labelable": m.n_ev_labelable,
+        "precision_at_k_ev_prime": m.precision_at_k_ev_prime,
+        "precision_at_k_ev_edge_or_better": m.precision_at_k_ev_edge_or_better,
+        "mean_ev_at_k": m.mean_ev_at_k,
+        "mean_realized_return_at_k": m.mean_realized_return_at_k,
+        "base_rate_ev_prime": m.base_rate_ev_prime,
+        "base_rate_ev_edge_or_better": m.base_rate_ev_edge_or_better,
+        "base_mean_realized_return": m.base_mean_realized_return,
         "per_tour": m.per_tour,
     }
 

@@ -171,10 +171,14 @@ def render_context(event: PolymarketEvent) -> str:
             # are surfaced so the LLM sees "how much is held" and "how much
             # can I trade right now" as separate signals.
             extras.append(f"liq=${m.gamma_liquidity_dollars:,.0f}")
-        if m.team_record:
+        record = m.meaningful_team_record
+        if record:
             # W/L record for this side's team (e.g. "28-6"). Saves the
             # specialist a web-search round trip for season form.
-            extras.append(f"record={m.team_record}")
+            # `meaningful_team_record` suppresses gamma's "0-0" / "0-0-0"
+            # placeholders (e.g. for tennis players who don't carry a
+            # season W/L) so the LLM doesn't see useless "record=0-0".
+            extras.append(f"record={record}")
         # [NO side, inverted] flags head-to-head markets whose side is a
         # synthesized NO clone of the slug's YES book, not a directly-quoted
         # second market.

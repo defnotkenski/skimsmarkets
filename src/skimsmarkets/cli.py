@@ -158,6 +158,11 @@ def _slate_opts_from_args(args: argparse.Namespace) -> SlateOptions:
             if args.max_prob is not None
             else cfg.MAX_IMPLIED_PROBABILITY
         ),
+        min_favorite_probability=(
+            args.min_favorite_prob
+            if args.min_favorite_prob is not None
+            else cfg.MIN_FAVORITE_PROBABILITY
+        ),
         min_open_interest_dollars=(
             args.min_oi
             if args.min_oi is not None
@@ -191,6 +196,7 @@ async def _cmd_rank(args: argparse.Namespace) -> int:
                 else cfg.REQUIRE_RICH_STATS
             ),
             progress=progress,
+            mode=args.mode,
         )
     print_run_summary(result, sort_by=args.sort_by, console=_CONSOLE)
     return 0
@@ -243,6 +249,7 @@ async def _cmd_fetch(args: argparse.Namespace) -> int:
             events,
             max_events=cfg.MAX_SLATE_EVENTS,
             tennis_provider=tennis_provider,
+            mode=args.mode,
         )
     print_events_table(
         events, opts.leagues,
@@ -453,14 +460,21 @@ async def _cmd_execute(args: argparse.Namespace) -> int:
     # trading on EV today". Each bucket-dimension flag still falls through
     # to its respective config default for its mode.
     mode = args.mode or cfg.KALSHI_DEFAULT_TRADE_MODE
-    if mode == "ev":
+    if mode in ("ev", "tail"):
+        # Both ev-side modes filter by ev_bucket. The operational
+        # difference between `ev` and `tail` is recommended CLI flag
+        # combinations (tail wants Prime-only + min_market_implied=0
+        # + small bet sizes for high variance), NOT a different
+        # trade-layer dispatch. Selector mode produces the right
+        # event pool; the executor just respects the user-supplied
+        # bucket filter + market-implied gate.
         ev_buckets = (
             args.ev_bucket if args.ev_bucket is not None
             else list(cfg.KALSHI_DEFAULT_EV_BUCKETS)
         )
-        # In ev mode, the risk-bucket filter is OFF — user's explicit choice
-        # to grade trades by EV instead. (Other filters — confidence tier,
-        # defensibility, etc. — stay active in both modes.)
+        # Risk-bucket filter OFF — user's explicit choice to grade
+        # trades by EV. Other filters (confidence tier, defensibility,
+        # etc.) stay active in all modes.
         risk_buckets_active = None
     else:  # "confidence" (default)
         ev_buckets = None
@@ -697,6 +711,21 @@ def _build_slate_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--min-favorite-prob",
+        type=float,
+        default=None,
+        metavar="PROB",
+        help=(
+            "Inverse of `--max-prob`: drops events whose favorite is "
+            "priced BELOW this on the YES mid. Primary use case is "
+            "`--mode tail`, where competitive 0.55/0.45 events can't "
+            "produce Prime EV through the asymmetric-payoff path and "
+            "just waste LLM tokens. Recommended tail-mode value: 0.75. "
+            "Off by default; the floor is disabled unless this flag is "
+            "passed (or `MIN_FAVORITE_PROBABILITY` is set in config.py)."
+        ),
+    )
+    p.add_argument(
         "--min-oi",
         type=float,
         default=None,
@@ -779,11 +808,49 @@ def _build_parser() -> argparse.ArgumentParser:
             "surfaces the asymmetric-payoff opportunities at the top."
         ),
     )
+    p_rank.add_argument(
+        "--mode",
+        choices=("confidence", "ev", "tail"),
+        default=None,
+        metavar="MODE",
+        help=(
+            "Pre-LLM selector mode for this run. Three modes: "
+            "`confidence` (default) picks rank-imbalance events (Lock-"
+            "bucket precision tuned); `ev` picks model-vs-market "
+            "disagreement events (moderate-EV; realized $-return tuned); "
+            "`tail` picks deep-underdog asymmetric-payoff candidates "
+            "(EV scorer minus the competitive-floor penalty). The "
+            "bucketing classifier downstream emits BOTH risk and EV "
+            "labels regardless of this flag; --mode only changes which "
+            "events get LLM-evaluated. Falls through to "
+            f"`KALSHI_DEFAULT_TRADE_MODE` ({cfg.KALSHI_DEFAULT_TRADE_MODE}) "
+            "when omitted. Tail mode is selector-only — for live tail "
+            "bets pair with `--max-prob 0.95 --min-favorite-prob 0.75` "
+            "here (the floor flag stops the LLM from burning tokens on "
+            "competitive events that can't produce Prime EV) and "
+            "`execute --mode tail --min-market-implied 0.0 --min-ev "
+            "0.30 --bet-size-cents 100`."
+        ),
+    )
 
-    sub.add_parser(
+    p_fetch = sub.add_parser(
         "fetch",
         parents=[slate],
         help="Print the slate as a table without invoking any LLM (zero cost).",
+    )
+    p_fetch.add_argument(
+        "--mode",
+        choices=("confidence", "ev", "tail"),
+        default=None,
+        metavar="MODE",
+        help=(
+            "Pre-LLM selector mode mirror of `rank --mode`. Display-only "
+            "command, so this changes WHICH events fetch would surface "
+            "(and `rank` would consume). Three modes: `confidence` / "
+            "`ev` / `tail`. Same fallback semantics: "
+            f"`KALSHI_DEFAULT_TRADE_MODE` ({cfg.KALSHI_DEFAULT_TRADE_MODE}) "
+            "when omitted."
+        ),
     )
 
     p_backtest = sub.add_parser(
@@ -972,17 +1039,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_execute.add_argument(
         "--mode",
-        choices=("confidence", "ev"),
+        choices=("confidence", "ev", "tail"),
         default=None,
         metavar="MODE",
         help=(
             "Bucket-dimension filter at trade time. `confidence` (default) "
-            "uses the risk-bucket classifier (`--risk-bucket`); `ev` swaps "
-            "to the EV-bucket classifier (`--ev-bucket`). Other filters "
+            "uses the risk-bucket classifier (`--risk-bucket`); `ev` and "
+            "`tail` swap to the EV-bucket classifier (`--ev-bucket`). The "
+            "ev/tail distinction lives in the SELECTOR (different event "
+            "pool), not the trader (same ev_bucket filter). For tail mode "
+            "pair with `--min-market-implied 0.0 --min-ev 0.30 "
+            "--bet-size-cents 100` to allow directional disagreement, "
+            "require Prime-bucket EV, and cap variance per bet. BEFORE "
+            "running any non-confidence mode `--live`, run the "
+            "calibration suite: `uv run python scripts/run_calibration"
+            "_suite.py` (full pre-flight check across all modes; see "
+            "`playbooks/calibration.md` for the decision matrix). Other "
+            "filters "
             "(confidence tier, defensibility, sport, market-implied) "
-            "stay active in both modes. Falls through to "
+            "stay active in all modes. Falls through to "
             f"`KALSHI_DEFAULT_TRADE_MODE` ({cfg.KALSHI_DEFAULT_TRADE_MODE}) "
-            "in config.py when omitted."
+            "when omitted."
         ),
     )
     p_execute.add_argument(
@@ -1269,9 +1346,13 @@ def main() -> int:
 
     # Interactive header. `print_banner` is TTY-gated, so it self-suppresses
     # when output is piped or captured; `positions` opts out because its
-    # stdout is parsed by scheduled routines.
+    # stdout is parsed by scheduled routines. Pass `args.mode` when present
+    # (rank / fetch / execute have it) so the status pill reflects the
+    # per-call override rather than the cfg default — without this, running
+    # `skims rank --mode tail` would still show "mode confidence" in the
+    # banner. `getattr` covers commands without a `--mode` flag.
     if args.command != "positions":
-        print_banner(_CONSOLE, args.command)
+        print_banner(_CONSOLE, args.command, mode=getattr(args, "mode", None))
 
     return asyncio.run(_DISPATCH[args.command](args))
 

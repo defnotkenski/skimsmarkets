@@ -1,0 +1,65 @@
+{
+  "scorer_name": "baseline_rank_points_ratio",
+  "slate_cap": 5,
+  "train_cutoff": "2024-12-31",
+  "n_total_matches": 163209,
+  "n_slates_seen": 956,
+  "n_slates_evaluable": 911,
+  "n_dropped_cold_start": 3269,
+  "n_dropped_other": 0,
+  "train": {
+    "n_slates": 0,
+    "n_picks": 0,
+    "n_labelable": 0,
+    "precision_at_k_lock": NaN,
+    "precision_at_k_lock_or_lean": NaN,
+    "base_rate_lock": NaN,
+    "base_rate_lock_or_lean": NaN,
+    "n_ev_labelable": 0,
+    "precision_at_k_ev_prime": NaN,
+    "precision_at_k_ev_edge_or_better": NaN,
+    "mean_ev_at_k": NaN,
+    "mean_realized_return_at_k": NaN,
+    "base_rate_ev_prime": NaN,
+    "base_rate_ev_edge_or_better": NaN,
+    "base_mean_realized_return": NaN,
+    "per_tour": {}
+  },
+  "holdout": {
+    "n_slates": 911,
+    "n_picks": 4555,
+    "n_labelable": 3796,
+    "precision_at_k_lock": 0.36267837541163556,
+    "precision_at_k_lock_or_lean": 0.5870472008781559,
+    "base_rate_lock": 0.19451301615798922,
+    "base_rate_lock_or_lean": 0.4789048473967684,
+    "n_ev_labelable": 3796,
+    "precision_at_k_ev_prime": 0.052950474183350894,
+    "precision_at_k_ev_edge_or_better": 0.07507903055848261,
+    "mean_ev_at_k": 0.06059092144637304,
+    "mean_realized_return_at_k": 0.07455744256823847,
+    "base_rate_ev_prime": 0.12948184781386984,
+    "base_rate_ev_edge_or_better": 0.2539620096661796,
+    "base_mean_realized_return": 0.07468629284970703,
+    "per_tour": {
+      "wta": {
+        "n_picks": 2245,
+        "precision_lock": 0.39020044543429844,
+        "precision_lock_or_lean": 0.5902004454342984,
+        "n_ev_labelable": 1850,
+        "mean_realized_return": 0.032015305576760904,
+        "mean_ev_per_dollar": 0.03870190537598077,
+        "precision_ev_prime": 0.04432432432432432
+      },
+      "atp": {
+        "n_picks": 2310,
+        "precision_lock": 0.3359307359307359,
+        "precision_lock_or_lean": 0.5839826839826839,
+        "n_ev_labelable": 1946,
+        "mean_realized_return": 0.11500089243166778,
+        "mean_ev_per_dollar": 0.08140010938585182,
+        "precision_ev_prime": 0.06115107913669065
+      }
+    }
+  }
+}

@@ -42,6 +42,7 @@ async def fetch_gamma_slate(
     *,
     sports: list[str] | None = None,
     max_implied_probability: float = cfg.MAX_IMPLIED_PROBABILITY,
+    min_favorite_probability: float | None = cfg.MIN_FAVORITE_PROBABILITY,
     min_open_interest_dollars: float = cfg.MIN_OPEN_INTEREST_DOLLARS,
 ) -> list[PolymarketEvent]:
     """Fetch the Polymarket sports slate from gamma-api.
@@ -79,7 +80,13 @@ async def fetch_gamma_slate(
        label-less futures placeholders.
     6. **Blowout filter.** Drop events whose favorite (highest YES mid
        across markets) sits at or above `max_implied_probability`.
-    7. **Min OI filter.** Optional — when `min_open_interest_dollars > 0`,
+    7. **Floor filter.** Optional — when `min_favorite_probability` is
+       set, drop events whose favorite is priced BELOW the floor.
+       Inverse-shaped counterpart of the blowout filter. Default None
+       (disabled). Primary use case: tail mode wants to LLM-evaluate
+       only events that can produce Prime EV through the asymmetric-
+       payoff path (favorite ≥ ~0.75, underdog ≤ ~0.25).
+    8. **Min OI filter.** Optional — when `min_open_interest_dollars > 0`,
        drop events where the MIN OI across markets is below the floor.
        Default is OFF (0.0); see config docs for the rationale.
 
@@ -134,6 +141,7 @@ async def fetch_gamma_slate(
 
     kept: list[PolymarketEvent] = []
     dropped_blowout = 0
+    dropped_too_competitive = 0
     dropped_thin_oi = 0
     for payload in payloads:
         slug = payload.get("slug")
@@ -175,6 +183,18 @@ async def fetch_gamma_slate(
         if favorite_mid >= max_implied_probability:
             dropped_blowout += 1
             continue
+        # Floor filter — drop events whose favorite is priced BELOW
+        # `min_favorite_probability` (i.e. too competitive for tail mode's
+        # asymmetric-payoff strategy to fire on). None = disabled, which is
+        # the default for confidence / ev modes. Tail mode sets ~0.75 so
+        # the LLM doesn't burn tokens on 0.55/0.45 coin-flips that can't
+        # produce Prime EV through the asymmetric-payoff path.
+        if (
+            min_favorite_probability is not None
+            and favorite_mid < min_favorite_probability
+        ):
+            dropped_too_competitive += 1
+            continue
         # Min OI floor — same posture as the Kalshi adapter: drop events
         # where ANY side has thin resting interest. Off by default
         # (MIN_OPEN_INTEREST_DOLLARS = 0.0) because Polymarket's CLOB book
@@ -191,14 +211,20 @@ async def fetch_gamma_slate(
             ev = ev.model_copy(update={"markets": live_markets})
         kept.append(ev)
 
+    floor_desc = (
+        f" + floor (>={min_favorite_probability:.2f})"
+        if min_favorite_probability is not None else ""
+    )
     log.info(
         "kept %d gamma events after league + horizon + tradability + "
-        "blowout (>=%.2f) + min_oi (>=$%.0f) filters; dropped blowouts=%d, "
-        "thin-oi=%d",
+        "blowout (>=%.2f)%s + min_oi (>=$%.0f) filters; dropped blowouts=%d, "
+        "too-competitive=%d, thin-oi=%d",
         len(kept),
         max_implied_probability,
+        floor_desc,
         min_open_interest_dollars,
         dropped_blowout,
+        dropped_too_competitive,
         dropped_thin_oi,
     )
 

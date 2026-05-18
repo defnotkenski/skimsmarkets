@@ -342,6 +342,20 @@ class TennisStatsProvider(Protocol):
         """
         ...
 
+    def lookup_player_id(self, tour: str, name: str) -> int | None:
+        """Resolve `name` to the vendor-internal player_id from the warm
+        rankings index. Returns None when the player isn't covered by
+        the index.
+
+        Used by the EV-mode selector (`_tennis_imbalance_ev_v1`) to
+        bridge a slate-time player name → the GBT bundle's
+        `HistoryStore` for Elo lookup. The GBT parquet keys on the
+        same MatchStat player_id, so a hit here is a guaranteed key in
+        `bundle.history`. None falls through to skipping the Elo
+        tiers — the EV scorer degrades gracefully on missing data.
+        """
+        ...
+
     async def warm_form_for_selection(
         self, identities: Iterable[TennisMatchIdentity]
     ) -> None:
@@ -625,6 +639,9 @@ class StubTennisStatsProvider:
     def lookup_player_rank(
         self, tour: str, name: str
     ) -> tuple[int, int] | None:
+        return None
+
+    def lookup_player_id(self, tour: str, name: str) -> int | None:
         return None
 
     async def warm_form_for_selection(

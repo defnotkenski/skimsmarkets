@@ -614,6 +614,9 @@ TIER_REGISTRY: dict[str, TierFn] = {
     "layoff": _tier_layoff,
     "info_density": _tier_info_density,
     "round": _tier_round,
+    # EV-mode tiers — see section below for definitions; registered via
+    # `_register_ev_tiers()` at module-load to keep the dict declaration
+    # readable without forward-defining all the tier functions.
 }
 
 MULTIPLIER_REGISTRY: dict[str, MultiplierFn] = {
@@ -710,4 +713,523 @@ def score_v1_selection(
         ).value
     )
     raw = base + contributions
+    return max(0.0, min(1.0, raw))
+
+
+# ---------------------------------------------------------------------------
+# EV-mode scorers — new family (2026-05-17).
+#
+# Mathematical premise (from `memory/project_ev_selector.md` four-archetype
+# table):
+#   - Confidence-mode picks high-fundamental-imbalance events. Synthetic-EV
+#     analogue: GBT picks the rank-favorite. EV ≈ 0 by construction.
+#   - EV-mode wants events where GBT disagrees with rank-implied price.
+#     Equivalent: events where TRUE skill (Elo, surface specialism, form,
+#     serve quality) says something DIFFERENT from rank-implied probability.
+#
+# Pre-LLM signals that predict GBT-vs-rank divergence (every one of these
+# is something the GBT itself uses as a feature — making them natural pre-
+# LLM proxies for GBT's eventual disagreement with rank):
+#
+#   T-elo-rank-gap        |elo_implied(a) − rank_implied(a)|. The literature
+#                         (Gorgi 2019, Yue 2022, Kovalchik 2020) calls Elo
+#                         the single best market-beating signal in tennis;
+#                         the gap with rank-implied is the headline EV
+#                         signal.
+#   T-underdog-form       hot form on the lower-ranked side. Captures
+#                         "rank lags reality" — a classic upset profile.
+#   T-underdog-serve      serve-dominance asymmetry where the underdog
+#                         out-serves the favorite. Markets price wins, not
+#                         serve quality; sharp tennis quants exploit this.
+#   T-underdog-surface    surface specialism on the lower-ranked side.
+#   T-underdog-elo        absolute Elo of the underdog. High Elo + low
+#                         rank = "true skill not yet reflected in ranking
+#                         points" (often: returning player, young breakout,
+#                         player who skipped tournaments).
+#   T-h2h-underdog        h2h favoring the underdog. When the lower-ranked
+#                         player has actually beaten the favorite before,
+#                         it's strong evidence of mispricing.
+#   T-competitive-floor   penalize events with extreme rank ratios. Even
+#                         when GBT disagrees with rank on a 10x-favorite,
+#                         the absolute EV is capped by the tight market_p.
+#
+# Bridge between backtest signals and production signals:
+#   - All `_tier_ev_*` tiers READ from PlayerHistory (for Elo + form +
+#     career rates) OR TennisPlayerStats (for rank + form proxy). In the
+#     backtest harness, both are populated from the parquet. In production
+#     the `_tennis_imbalance_ev_v1` wrapper (selection.py) projects the
+#     equivalent fields from the provider's warmed caches + a `_get_bundle()`
+#     call to pull the live HistoryStore for Elo. Elo lookup is free
+#     (in-memory; the bundle is loaded for GBT prediction anyway).
+# ---------------------------------------------------------------------------
+
+
+# Caps — first-guess values; tuned via ablation.
+CAP_EV_ELO_RANK_GAP = 0.30
+CAP_EV_UNDERDOG_FORM = 0.20
+CAP_EV_UNDERDOG_SERVE = 0.20
+CAP_EV_UNDERDOG_SURFACE = 0.20
+CAP_EV_UNDERDOG_ELO = 0.20
+CAP_EV_H2H_UNDERDOG = 0.15
+CAP_EV_COMPETITIVE_FLOOR = 0.30
+
+# Rank-points-ratio above which the event's EV ceiling is tight. The
+# rank-implied market_p for a 10x-favorite is ~0.91, leaving payoff ≈
+# 0.10 — so even a 10pp GBT disagreement (model_p = 0.81) is +EV but
+# small. We bias toward more competitive events. log10(ratio) scale.
+COMPETITIVE_RANK_LOG_RATIO_CUTOFF = 0.6  # ratio ≈ 4× → market_p ≈ 0.80
+
+
+def _elo_implied_p(elo_a: float, elo_b: float) -> float:
+    """Standard logistic Elo: P(A wins) = 1 / (1 + 10^((Bb − Ba)/400))."""
+    return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
+
+
+def _rank_implied_p(pts_a: int | None, pts_b: int | None) -> float | None:
+    """Bradley-Terry rank-points-implied prob (matches the backtest
+    harness's `_market_proxy_p_anchor`). Returns None on missing or
+    non-positive points.
+    """
+    if pts_a is None or pts_b is None or pts_a <= 0 or pts_b <= 0:
+        return None
+    return pts_a / (pts_a + pts_b)
+
+
+def _underdog_is_a(a_stats: TennisPlayerStats, b_stats: TennisPlayerStats) -> bool | None:
+    """Inverse of `_favorite_is_a` — returns True if A is the rank-
+    underdog. None when points are missing on either side."""
+    fav = _favorite_is_a(a_stats, b_stats)
+    return None if fav is None else (not fav)
+
+
+def _tier_ev_elo_rank_gap(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    a_history: PlayerHistory | None,
+    b_history: PlayerHistory | None,
+    surface: str | None = None,
+    **_: Any,
+) -> TierContribution:
+    """Magnitude of Elo-vs-rank disagreement. NOT signed by favorite —
+    the gap itself is the EV signal regardless of direction.
+
+    Uses surface-specific Elo when surface is known (Elo by surface is
+    a feature on `PlayerHistory.elo_by_surface`; falls back to global
+    Elo for the surface bucket the player hasn't played).
+
+    Value: `|elo_implied(a) − rank_implied(a)| * scale`, capped.
+    """
+    if a_history is None or b_history is None:
+        return TierContribution("ev_elo_rank_gap", 0.0, CAP_EV_ELO_RANK_GAP)
+    if surface is not None:
+        elo_a = a_history.elo_by_surface.get(surface, a_history.elo_global)
+        elo_b = b_history.elo_by_surface.get(surface, b_history.elo_global)
+    else:
+        elo_a = a_history.elo_global
+        elo_b = b_history.elo_global
+    rank_p = _rank_implied_p(a_stats.rank_points, b_stats.rank_points)
+    if rank_p is None:
+        return TierContribution("ev_elo_rank_gap", 0.0, CAP_EV_ELO_RANK_GAP)
+    elo_p = _elo_implied_p(elo_a, elo_b)
+    gap = abs(elo_p - rank_p)
+    # gap of 0.15 (e.g. Elo says 0.55, rank says 0.40) is a meaningful
+    # disagreement. Scale so gap=0.15 → ~half cap.
+    return TierContribution(
+        "ev_elo_rank_gap",
+        min(CAP_EV_ELO_RANK_GAP, gap * 2.0 * CAP_EV_ELO_RANK_GAP / 0.30),
+        CAP_EV_ELO_RANK_GAP,
+    )
+
+
+def _tier_ev_underdog_form(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    **_: Any,
+) -> TierContribution:
+    """Hot form on the rank-UNDERDOG side. Signed positive when the
+    underdog has a better recent W/L rate than the favorite — captures
+    "rank lags reality" upset profile.
+
+    Bonus-only: a cold underdog is just confirming rank, no extra EV.
+    Form-winrate diff capped at 0.50 (e.g. underdog 9/10 vs favorite
+    4/10) → full cap.
+    """
+    a_form = a_stats.last_10_form
+    b_form = b_stats.last_10_form
+    if a_form is None or b_form is None:
+        return TierContribution("ev_underdog_form", 0.0, CAP_EV_UNDERDOG_FORM)
+    if len(a_form) < MIN_FORM_SAMPLES or len(b_form) < MIN_FORM_SAMPLES:
+        return TierContribution("ev_underdog_form", 0.0, CAP_EV_UNDERDOG_FORM)
+    under = _underdog_is_a(a_stats, b_stats)
+    if under is None:
+        return TierContribution("ev_underdog_form", 0.0, CAP_EV_UNDERDOG_FORM)
+    a_wp = a_form.count("W") / len(a_form)
+    b_wp = b_form.count("W") / len(b_form)
+    under_wp, fav_wp = (a_wp, b_wp) if under else (b_wp, a_wp)
+    diff = under_wp - fav_wp
+    if diff <= 0:
+        return TierContribution("ev_underdog_form", 0.0, CAP_EV_UNDERDOG_FORM)
+    return TierContribution(
+        "ev_underdog_form",
+        min(CAP_EV_UNDERDOG_FORM, diff * 2.0 * CAP_EV_UNDERDOG_FORM / 0.50),
+        CAP_EV_UNDERDOG_FORM,
+    )
+
+
+def _tier_ev_underdog_serve(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    **_: Any,
+) -> TierContribution:
+    """Serve dominance on the rank-UNDERDOG side. Bonus-only.
+
+    Markets price wins, not serve quality; a big-serving underdog is a
+    classic mispricing archetype (literature: Wilkens 2021 *J. Sports
+    Analytics*). First-serve-win-pct diff > 0 favoring underdog → bonus.
+    """
+    a_sv = a_stats.first_serve_win_pct
+    b_sv = b_stats.first_serve_win_pct
+    if a_sv is None or b_sv is None:
+        return TierContribution("ev_underdog_serve", 0.0, CAP_EV_UNDERDOG_SERVE)
+    under = _underdog_is_a(a_stats, b_stats)
+    if under is None:
+        return TierContribution("ev_underdog_serve", 0.0, CAP_EV_UNDERDOG_SERVE)
+    under_sv, fav_sv = (a_sv, b_sv) if under else (b_sv, a_sv)
+    diff = under_sv - fav_sv
+    if diff <= 0:
+        return TierContribution("ev_underdog_serve", 0.0, CAP_EV_UNDERDOG_SERVE)
+    # First-serve-win-pct diffs cluster ±0.05; scale so 0.05 = full cap.
+    return TierContribution(
+        "ev_underdog_serve",
+        min(CAP_EV_UNDERDOG_SERVE, diff * CAP_EV_UNDERDOG_SERVE / 0.05),
+        CAP_EV_UNDERDOG_SERVE,
+    )
+
+
+def _tier_ev_underdog_surface(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    surface: str | None,
+    **_: Any,
+) -> TierContribution:
+    """Surface winrate advantage on the rank-UNDERDOG side. Bonus-only.
+
+    Surface specialism is a documented value signal (Gorgi 2019, Sipko
+    2015). Captures "this lower-ranked player is actually the favorite
+    on THIS surface" archetype.
+    """
+    if surface is None:
+        return TierContribution("ev_underdog_surface", 0.0, CAP_EV_UNDERDOG_SURFACE)
+    under = _underdog_is_a(a_stats, b_stats)
+    if under is None:
+        return TierContribution("ev_underdog_surface", 0.0, CAP_EV_UNDERDOG_SURFACE)
+    a_surf = (a_stats.surface_win_loss or {}).get(surface)
+    b_surf = (b_stats.surface_win_loss or {}).get(surface)
+    if a_surf is None or b_surf is None:
+        return TierContribution("ev_underdog_surface", 0.0, CAP_EV_UNDERDOG_SURFACE)
+    a_w, a_l = a_surf
+    b_w, b_l = b_surf
+    if a_w + a_l < MIN_SURFACE_SAMPLES or b_w + b_l < MIN_SURFACE_SAMPLES:
+        return TierContribution("ev_underdog_surface", 0.0, CAP_EV_UNDERDOG_SURFACE)
+    a_wp = a_w / (a_w + a_l)
+    b_wp = b_w / (b_w + b_l)
+    under_wp, fav_wp = (a_wp, b_wp) if under else (b_wp, a_wp)
+    diff = under_wp - fav_wp
+    if diff <= 0:
+        return TierContribution("ev_underdog_surface", 0.0, CAP_EV_UNDERDOG_SURFACE)
+    return TierContribution(
+        "ev_underdog_surface",
+        min(CAP_EV_UNDERDOG_SURFACE, diff * 2.0 * CAP_EV_UNDERDOG_SURFACE / 0.40),
+        CAP_EV_UNDERDOG_SURFACE,
+    )
+
+
+def _tier_ev_underdog_elo(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    a_history: PlayerHistory | None,
+    b_history: PlayerHistory | None,
+    **_: Any,
+) -> TierContribution:
+    """Absolute Elo on the rank-UNDERDOG side. Bonus when underdog's
+    Elo is HIGH relative to typical tour pool — "true skill not yet
+    reflected in rank points" archetype (returning player, young
+    breakout, player who skipped tournaments).
+
+    Tier-pool Elo on tour is ~1450-1700 with peaks ~2000. Bonus scales
+    with how much the underdog's Elo exceeds 1500 (the ELO_INITIAL
+    baseline; ~tour-median for active players).
+    """
+    if a_history is None or b_history is None:
+        return TierContribution("ev_underdog_elo", 0.0, CAP_EV_UNDERDOG_ELO)
+    under = _underdog_is_a(a_stats, b_stats)
+    if under is None:
+        return TierContribution("ev_underdog_elo", 0.0, CAP_EV_UNDERDOG_ELO)
+    under_elo = a_history.elo_global if under else b_history.elo_global
+    excess = max(0.0, under_elo - 1500.0)
+    # Scale so 300 Elo points above 1500 (a top-50 caliber player) = full cap.
+    return TierContribution(
+        "ev_underdog_elo",
+        min(CAP_EV_UNDERDOG_ELO, excess * CAP_EV_UNDERDOG_ELO / 300.0),
+        CAP_EV_UNDERDOG_ELO,
+    )
+
+
+def _tier_ev_h2h_underdog(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    a_history: PlayerHistory | None,
+    b_history: PlayerHistory | None,
+    **_: Any,
+) -> TierContribution:
+    """H2H favoring the UNDERDOG. The lower-ranked player having
+    actually beaten the favorite before is the strongest single piece
+    of mispricing evidence (it's a literal counter-example to the
+    rank-based prior).
+
+    Bonus-only. Scaled by the underdog's share of past meetings:
+    underdog wins / total meetings.
+    """
+    if a_history is None or b_history is None:
+        return TierContribution("ev_h2h_underdog", 0.0, CAP_EV_H2H_UNDERDOG)
+    under = _underdog_is_a(a_stats, b_stats)
+    if under is None:
+        return TierContribution("ev_h2h_underdog", 0.0, CAP_EV_H2H_UNDERDOG)
+    # a_history.h2h_against returns (wins, total)
+    a_wins, total = a_history.h2h_against(b_history.player_id)
+    if total < 2:
+        return TierContribution("ev_h2h_underdog", 0.0, CAP_EV_H2H_UNDERDOG)
+    under_wins = a_wins if under else (total - a_wins)
+    under_share = under_wins / total
+    if under_share <= 0.5:
+        return TierContribution("ev_h2h_underdog", 0.0, CAP_EV_H2H_UNDERDOG)
+    # Scale: 0.5 → 0, 1.0 → full cap. (under_share - 0.5) * 2 = [0, 1]
+    bonus = (under_share - 0.5) * 2.0 * CAP_EV_H2H_UNDERDOG
+    return TierContribution("ev_h2h_underdog", bonus, CAP_EV_H2H_UNDERDOG)
+
+
+def _tier_ev_competitive_floor(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    **_: Any,
+) -> TierContribution:
+    """Penalty on extreme-imbalance events. NEGATIVE contribution only.
+
+    Even when GBT disagrees with rank on a 10x-rank-favorite, the
+    absolute EV is capped by the tight market_p (market_p ≈ 0.91 →
+    payoff ≈ 0.10). EV-mode should avoid these structurally-low-ceiling
+    events. Penalty ramps in for ratios > 4× (log10 ratio > 0.6, where
+    market_p > 0.80).
+    """
+    a_pts = a_stats.rank_points
+    b_pts = b_stats.rank_points
+    if a_pts is None or b_pts is None or a_pts <= 0 or b_pts <= 0:
+        return TierContribution(
+            "ev_competitive_floor", 0.0, CAP_EV_COMPETITIVE_FLOOR
+        )
+    ratio = max(a_pts, b_pts) / min(a_pts, b_pts)
+    log_ratio = math.log10(ratio)
+    if log_ratio <= COMPETITIVE_RANK_LOG_RATIO_CUTOFF:
+        return TierContribution(
+            "ev_competitive_floor", 0.0, CAP_EV_COMPETITIVE_FLOOR
+        )
+    # Ramps from 0 at log_ratio=0.6 to −CAP at log_ratio=1.0 (10× → market_p ≈ 0.91).
+    overage = min(1.0, (log_ratio - COMPETITIVE_RANK_LOG_RATIO_CUTOFF) / 0.4)
+    return TierContribution(
+        "ev_competitive_floor",
+        -CAP_EV_COMPETITIVE_FLOOR * overage,
+        CAP_EV_COMPETITIVE_FLOOR,
+    )
+
+
+# Register EV tiers in the public registry so the ablation driver
+# can compose them via `make()` the same way confidence-mode tiers
+# are composed.
+TIER_REGISTRY.update({
+    "ev_elo_rank_gap": _tier_ev_elo_rank_gap,
+    "ev_underdog_form": _tier_ev_underdog_form,
+    "ev_underdog_serve": _tier_ev_underdog_serve,
+    "ev_underdog_surface": _tier_ev_underdog_surface,
+    "ev_underdog_elo": _tier_ev_underdog_elo,
+    "ev_h2h_underdog": _tier_ev_h2h_underdog,
+    "ev_competitive_floor": _tier_ev_competitive_floor,
+})
+
+
+# EV-mode default base — 0.4 (tuned via base sweep at v4.x ablation).
+# Confidence mode bases its score on rank-points-ratio (favors lopsided
+# matchups). EV mode skips the rank base entirely and rides ONLY on the
+# EV tiers, with a small positive bias so events with zero positive tier
+# signal still sit above the negative-only floor tier's pure penalty.
+# Base in [0.0, 0.4] all measure within $0.001 realized return; 0.4 was
+# the marginal best in the sweep. Above 0.4, clipping at score=1.0 starts
+# losing differentiation between high-signal events.
+EV_BASE = 0.4
+
+
+def score_ev_v1_selection(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    surface: str | None,
+    a_history: PlayerHistory | None = None,
+    b_history: PlayerHistory | None = None,
+    **_: Any,
+) -> float:
+    """v1 EV-mode tennis selection scorer.
+
+    Returns a `[0, 1]` selection score targeting events likely to be
+    high-EV bets in production (GBT-vs-market-price disagreement
+    archetype). See module-level "EV-mode scorers" header for the
+    design rationale and `memory/project_ev_selector.md` for the
+    decision history.
+
+    Composition (additive, clipped):
+        score = clip(
+            0.4  (small positive base — no rank-points anchor)
+            + ev_elo_rank_gap           (LOAD-BEARING; cap 0.30)
+            + ev_underdog_form          (cap 0.20)
+            + ev_underdog_serve         (cap 0.20)
+            + ev_underdog_surface       (cap 0.20)
+            + ev_h2h_underdog           (cap 0.15)
+            + ev_competitive_floor      (NEGATIVE-only; cap 0.30)
+            , 0, 1)
+
+    Tiers tested and DROPPED at this composition:
+      - `ev_underdog_elo` (absolute underdog Elo) — REDUNDANT with
+        `ev_elo_rank_gap` (both encode "Elo good for underdog"). Drop
+        lifted realized return by $0.005/$1 on the v2 ablation.
+      - `ev_surface_elo_gap` (surface-Elo vs rank-implied) — redundant
+        with `ev_elo_rank_gap` (which already falls back to surface
+        Elo when surface is known).
+      - `ev_elo_momentum` (recent-form proxy on top of Elo) — redundant
+        with `ev_underdog_form`.
+
+    Backtest (2025+, K=5, 4378 EV-labelable picks):
+        realized return per \\$1 = +\\$0.1475 vs base rate +\\$0.0747
+        (+97% lift). v1_confidence selector: +\\$0.0478 (under base
+        rate, i.e. ACTIVELY hurts EV mode — the design hypothesis
+        from `project_ev_selector.md`). K-robust (K=3 +65%, K=10
+        +39% vs baseline rank). Stronger on ATP (+$0.19) than WTA
+        (+$0.10); per-tour tuning is a future lever.
+
+    Production note: the `a_history`/`b_history` PlayerHistory args
+    are the source of Elo. The backtest harness passes them directly;
+    `selection._tennis_imbalance_ev_v1` pulls them from the GBT bundle
+    (loaded for the prediction stage anyway, so free).
+    """
+    contributions = (
+        _tier_ev_elo_rank_gap(
+            a_stats=a_stats, b_stats=b_stats,
+            a_history=a_history, b_history=b_history, surface=surface,
+        ).value
+        + _tier_ev_underdog_form(a_stats=a_stats, b_stats=b_stats).value
+        + _tier_ev_underdog_serve(a_stats=a_stats, b_stats=b_stats).value
+        + _tier_ev_underdog_surface(
+            a_stats=a_stats, b_stats=b_stats, surface=surface
+        ).value
+        + _tier_ev_h2h_underdog(
+            a_stats=a_stats, b_stats=b_stats,
+            a_history=a_history, b_history=b_history,
+        ).value
+        + _tier_ev_competitive_floor(a_stats=a_stats, b_stats=b_stats).value
+    )
+    raw = EV_BASE + contributions
+    return max(0.0, min(1.0, raw))
+
+
+# ---------------------------------------------------------------------------
+# Tail-mode scorer — sibling of `score_ev_v1_selection` for the deep-
+# underdog asymmetric-payoff strategy.
+#
+# Architectural diff from EV scorer: DROPS `ev_competitive_floor` (the
+# negative-only tier that penalizes extreme rank-imbalance events).
+# Rationale: at deep underdog prices (market_p ≤ 0.15), the payoff
+# ratio explodes (≥ 5.7×), so the +EV math works even with a tiny
+# model_p − market_p gap (e.g. 0.13 vs 0.10 model lift = +$0.30 EV).
+# The EV scorer's `ev_competitive_floor` was designed assuming bets
+# get sized on absolute EV; in tail mode the per-bet variance is huge
+# but the asymmetric-payoff thesis is exactly the strategy.
+#
+# All other tiers (elo-rank-gap, underdog-form/serve/surface/h2h) are
+# unchanged — they're all signed by the rank-underdog, so they're
+# already aligned with tail-bet hunting.
+#
+# Recommended CLI flag combination for tail mode (selector picks the
+# right events; trader needs aggressive defaults to actually fire):
+#     skims rank    --mode tail --max-prob 0.95 --min-favorite-prob 0.75 \
+#                              --sport tennis
+#     skims execute --mode tail --min-market-implied 0.0
+#                              --min-ev 0.30
+#                              --bet-size-cents 100
+#
+# `--min-favorite-prob 0.75` is the slate-level floor: drops events where
+# the favorite is priced below 0.75 on the YES mid (no deep-underdog side
+# exists). Without it, tail-mode wastes LLM tokens on competitive 0.55/
+# 0.45 matchups that can't produce Prime EV through the asymmetric-
+# payoff path even when the selector correctly identifies them as
+# mispricing-likely.
+#
+# Critical pre-trade calibration check (not done by the selector):
+# validate GBT tail calibration before live betting. Pull settled rows
+# with `predicted_winner_probability < 0.20` from `logs/runs/*.jsonl`,
+# bin by decile, compare to realized win rate. If model_p > realized
+# rate at the tails (the suspected "bottom decile over-predicts"
+# pattern, inferred from the documented top-decile under-prediction),
+# tail bets bleed money regardless of selector quality.
+# ---------------------------------------------------------------------------
+
+
+def score_tail_v1_selection(
+    *,
+    a_stats: TennisPlayerStats,
+    b_stats: TennisPlayerStats,
+    surface: str | None,
+    a_history: PlayerHistory | None = None,
+    b_history: PlayerHistory | None = None,
+    **_: Any,
+) -> float:
+    """v1 tail-mode tennis selection scorer.
+
+    Returns a `[0, 1]` selection score targeting deep-underdog asymmetric-
+    payoff candidates (market_p ≤ ~0.15 territory). Identical composition
+    to `score_ev_v1_selection` EXCEPT drops `ev_competitive_floor` so
+    extreme-imbalance events aren't suppressed.
+
+    Composition (additive, clipped):
+        score = clip(
+            0.4  (same base as EV scorer)
+            + ev_elo_rank_gap           (LOAD-BEARING; cap 0.30)
+            + ev_underdog_form          (cap 0.20)
+            + ev_underdog_serve         (cap 0.20)
+            + ev_underdog_surface       (cap 0.20)
+            + ev_h2h_underdog           (cap 0.15)
+            , 0, 1)
+
+    See module-level "Tail-mode scorer" header for the rationale and
+    recommended CLI flag combination.
+    """
+    contributions = (
+        _tier_ev_elo_rank_gap(
+            a_stats=a_stats, b_stats=b_stats,
+            a_history=a_history, b_history=b_history, surface=surface,
+        ).value
+        + _tier_ev_underdog_form(a_stats=a_stats, b_stats=b_stats).value
+        + _tier_ev_underdog_serve(a_stats=a_stats, b_stats=b_stats).value
+        + _tier_ev_underdog_surface(
+            a_stats=a_stats, b_stats=b_stats, surface=surface
+        ).value
+        + _tier_ev_h2h_underdog(
+            a_stats=a_stats, b_stats=b_stats,
+            a_history=a_history, b_history=b_history,
+        ).value
+    )
+    raw = EV_BASE + contributions
     return max(0.0, min(1.0, raw))

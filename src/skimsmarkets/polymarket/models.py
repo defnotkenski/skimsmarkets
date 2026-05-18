@@ -322,7 +322,9 @@ class PolymarketMarket(BaseModel):
     # `marketSides[].team.record`. Empty for futures-style "team" entries
     # (player MVP candidates). Surfaced in the leaderboard side label so
     # the user sees season form at a glance and specialists don't have to
-    # web-search for it.
+    # web-search for it. For tennis matches gamma returns "0-0" because
+    # individual players have no season W/L — callers should prefer
+    # `meaningful_team_record` to suppress those placeholders.
     team_record: str | None = None
     # Raw external-provider ID list (sportradar / draftkings / etc.) for
     # this side's team. Currently unconsumed; carried forward so future
@@ -577,6 +579,24 @@ class PolymarketMarket(BaseModel):
         if self.yes_bid_dollars is None or self.yes_ask_dollars is None:
             return None
         return (self.yes_bid_dollars + self.yes_ask_dollars) / 2
+
+    @property
+    def meaningful_team_record(self) -> str | None:
+        """`team_record` with placeholder values filtered out.
+
+        Returns None when the record is missing OR is one of gamma's
+        empty-placeholder values (`"0-0"` for two-outcome sports, `"0-0-0"`
+        for three-way sports like soccer with draws). Tennis matches
+        always trip the placeholder because individual players don't
+        carry a season W/L on the gamma payload; renderers should call
+        this instead of `team_record` to avoid showing `(0-0)` next to
+        every player name.
+        """
+        if not self.team_record:
+            return None
+        if self.team_record in ("0-0", "0-0-0"):
+            return None
+        return self.team_record
 
 
 class PolymarketEvent(BaseModel):

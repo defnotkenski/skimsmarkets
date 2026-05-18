@@ -85,18 +85,24 @@ _RIGHT_STARS: tuple[str, ...] = (
 )
 
 # Mode-themed status accent for live status values (run id, mode tag).
-# Confidence mode = frost blue; EV mode = ember gold. Picked at render
-# time via `_status_accent_for_mode` so the same banner code serves both.
-# The wordmark stays on the neutral DAWN gradient regardless — only the
-# status pill carries the mode color, keeping mode visualization where it
-# matters (current-state at-a-glance) without flipping the brand identity.
+# Confidence mode = frost blue; EV mode = ember gold; tail mode = vermillion
+# (warmer than gold, signals "higher-variance strategy"). Picked at render
+# time via `_status_accent_for_mode` so the same banner code serves all
+# three. The wordmark stays on the neutral DAWN gradient regardless — only
+# the status pill carries the mode color, keeping mode visualization where
+# it matters (current-state at-a-glance) without flipping the brand identity.
 _STATUS_ACCENT_CONFIDENCE = "#7fa1ce"   # frost blue
 _STATUS_ACCENT_EV = "#e8b563"           # ember gold
+_STATUS_ACCENT_TAIL = "#d96a4f"         # vermillion
 
 
 def _status_accent_for_mode(mode: str) -> str:
     """Resolve the status-pill accent color from the configured trade mode."""
-    return _STATUS_ACCENT_EV if mode == "ev" else _STATUS_ACCENT_CONFIDENCE
+    if mode == "tail":
+        return _STATUS_ACCENT_TAIL
+    if mode == "ev":
+        return _STATUS_ACCENT_EV
+    return _STATUS_ACCENT_CONFIDENCE
 
 # Indent for body text (subtitle + status branch) so it left-aligns with the
 # first glyph of the wordmark rather than with the outer star constellation.
@@ -109,7 +115,9 @@ def _status_accent_for_mode(mode: str) -> str:
 _WORDMARK_INDENT = "       "  # 7 spaces
 
 
-def print_banner(console: Console, command: str) -> None:
+def print_banner(
+    console: Console, command: str, mode: str | None = None,
+) -> None:
     """Print the NOCTA banner through `console`, padded with a blank line
     above and below so it stands clear of the surrounding output.
 
@@ -117,6 +125,11 @@ def print_banner(console: Console, command: str) -> None:
     out of piped stdout and captured scheduled-routine logs. Callers still
     decide *which* commands get a banner (the parseable `positions` command
     opts out at the call site).
+
+    `mode` is the per-call CLI override (from `args.mode` on rank / fetch /
+    execute). When None, the status pill falls through to
+    `cfg.KALSHI_DEFAULT_TRADE_MODE` so commands without a `--mode` flag
+    (e.g. `retro`) still get a sensible mode display.
     """
     if not console.is_terminal:
         return
@@ -134,7 +147,7 @@ def print_banner(console: Console, command: str) -> None:
         markup=False,
         highlight=False,
     )
-    status = _status_line()
+    status = _status_line(mode_override=mode)
     if status is not None:
         # Hanging branch: a `│` riser drops from the subtitle, then `╰─`
         # elbows out to the status. Skipped entirely when no runs exist on
@@ -151,7 +164,7 @@ def print_banner(console: Console, command: str) -> None:
     console.print()
 
 
-def _status_line() -> str | None:
+def _status_line(mode_override: str | None = None) -> str | None:
     """Build the status content shown under the hanging branch.
 
     Reads `logs/runs/` + `config.KALSHI_DEFAULT_TRADE_MODE` only — no
@@ -161,9 +174,14 @@ def _status_line() -> str | None:
 
     Pill shape: `latest run <id> (<age>)   ·   mode <X>`. Accent color
     is picked from the mode — frost blue for confidence, ember gold for
-    ev — so the operator's first glance at the banner answers "which
-    mode is the cron set up for today?" through color alone. Bucket
-    breakdown was dropped 2026-05-17; mode tag is the load-bearing fact.
+    ev, vermillion for tail — so the operator's first glance at the
+    banner answers "which mode is this run using?" through color alone.
+
+    `mode_override` is the per-call `--mode` arg from the active command
+    (rank / fetch / execute). When provided it wins; when None the
+    status falls through to `cfg.KALSHI_DEFAULT_TRADE_MODE`. This keeps
+    the banner accurate for a one-off `skims rank --mode tail` invocation
+    even though the cron default stays "confidence".
     """
     try:
         # Lazy imports: keep the banner-module import path light and
@@ -176,7 +194,7 @@ def _status_line() -> str | None:
             return None
         latest = runs[0]
         age = _format_age(latest)
-        mode = cfg.KALSHI_DEFAULT_TRADE_MODE
+        mode = mode_override or cfg.KALSHI_DEFAULT_TRADE_MODE
         accent = _status_accent_for_mode(mode)
 
         return (

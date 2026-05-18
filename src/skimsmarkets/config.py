@@ -49,6 +49,19 @@ HORIZON_BACKSTOP_HOURS = 6
 # filter — explicit slug fetches are user-driven.
 MAX_IMPLIED_PROBABILITY = 0.60
 
+# Minimum favorite-side implied probability for inclusion. Inverse-shaped
+# filter to MAX_IMPLIED_PROBABILITY: events whose favorite is priced BELOW
+# this on the YES mid are dropped before the LLM path. Default None
+# (disabled) — the use case is `--mode tail`, where the asymmetric-payoff
+# strategy only fires when the underdog is priced cheap (favorite ≥ ~0.80,
+# underdog ≤ ~0.20). Without this filter, tail mode LLM-evaluates
+# competitive 0.55/0.45 events that can't produce Prime EV through the
+# asymmetric-payoff path, wasting tokens. Recommended override for tail
+# mode: `--min-favorite-prob 0.75` (catches the 0.75-0.95 favorite range
+# where real tail bets live). `--slug X` requests bypass this filter,
+# same as MAX_IMPLIED_PROBABILITY.
+MIN_FAVORITE_PROBABILITY: float | None = None
+
 # Minimum gamma `liquidity` (resting CLOB book depth, in dollars) for
 # BOTH sides of an event to survive the slate filter. Threshold compares
 # against the MIN value across markets in the event — both sides must

@@ -68,8 +68,9 @@ def _render_event_context_block(event: PolymarketEvent) -> str:
             extras.append(f"state={m.market_state.removeprefix('MARKET_STATE_')}")
         if m.gamma_liquidity_dollars is not None:
             extras.append(f"liq=${m.gamma_liquidity_dollars:,.0f}")
-        if m.team_record:
-            extras.append(f"record={m.team_record}")
+        record = m.meaningful_team_record
+        if record:
+            extras.append(f"record={record}")
         extras_str = f" {' '.join(extras)}" if extras else ""
         lines.append(
             f"  - slug={m.slug}{side_tag} yes='{m.yes_sub_title or '(no label)'}'"

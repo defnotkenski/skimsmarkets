@@ -63,7 +63,11 @@ from skimsmarkets.tennis.identity import (
     tennis_match_identity,
 )
 from skimsmarkets.tennis.models import TennisHeadToHead, TennisPlayerStats
-from skimsmarkets.tennis.selection_scorers import score_v1_selection
+from skimsmarkets.tennis.selection_scorers import (
+    score_ev_v1_selection,
+    score_tail_v1_selection,
+    score_v1_selection,
+)
 from skimsmarkets.tennis.provider import MatchHistoryRow, TennisStatsProvider
 
 log = logging.getLogger(__name__)
@@ -1206,8 +1210,228 @@ def _tennis_imbalance_v1(
     )
 
 
+def _tennis_imbalance_ev_v1(
+    event: PolymarketEvent, provider: TennisStatsProvider
+) -> float | None:
+    """v1 EV-mode tennis selector — picks events likely to be high-EV
+    bets (model_p − market_p disagreement), parallel to the confidence-
+    mode `_tennis_imbalance_v1`.
+
+    Composition rationale lives in
+    `tennis/selection_scorers.py:score_ev_v1_selection` (load-bearing
+    tier: Elo-vs-rank-implied gap; secondary: underdog form, serve,
+    surface specialism, h2h; penalty: extreme rank ratios where EV
+    ceiling is capped by market_p≈1). Backtest realized return on
+    the 2025+ holdout (K=5, 4378 EV-labelable picks):
+    +\\$0.1475/$1 vs base rate +\\$0.0747/$1 (+97% lift).
+
+    Two surfaces of additional data vs the v1 confidence path:
+      1. Live Elo per side via `provider.lookup_player_id` →
+         `bundle.history.get(pid).elo_global`. Elo lives on the GBT
+         bundle's HistoryStore, which is loaded once at startup for
+         the GBT prediction stage — the lookup is in-memory and free.
+         Falls back to None (skipping Elo tiers gracefully) if the
+         bundle isn't available or the player isn't in it.
+      2. The rest of the inputs (rank-points, last-10 form, career
+         first-serve-win-pct, surface W/L, h2h count, match history)
+         are the SAME caches the confidence-mode wrapper warms.
+
+    Returns None when the event isn't a recognizable tennis singles
+    matchup (cascades to `_team_record_imbalance` then 0 — same
+    posture as the confidence path).
+    """
+    identity = tennis_match_identity(event)
+    if identity is None:
+        return None
+    a_rank_hit = provider.lookup_player_rank(identity.tour, identity.player_a)
+    b_rank_hit = provider.lookup_player_rank(identity.tour, identity.player_b)
+    if a_rank_hit is None or b_rank_hit is None:
+        return None
+    _, a_pts = a_rank_hit
+    _, b_pts = b_rank_hit
+    if a_pts <= 0 or b_pts <= 0:
+        return None
+
+    # Form, match-stats, surface, h2h, match-history — the same
+    # warmed caches the confidence wrapper reads.
+    a_form = provider.lookup_player_form(identity.tour, identity.player_a)
+    b_form = provider.lookup_player_form(identity.tour, identity.player_b)
+    a_form_str = a_form[0] if a_form is not None else None
+    b_form_str = b_form[0] if b_form is not None else None
+
+    a_ms = provider.lookup_player_match_stats(identity.tour, identity.player_a)
+    b_ms = provider.lookup_player_match_stats(identity.tour, identity.player_b)
+    a_fsw = a_ms.get("first_serve_win_pct") if a_ms is not None else None
+    b_fsw = b_ms.get("first_serve_win_pct") if b_ms is not None else None
+
+    a_sr = provider.lookup_player_surface_record(
+        identity.tour, identity.player_a
+    )
+    b_sr = provider.lookup_player_surface_record(
+        identity.tour, identity.player_b
+    )
+    a_surface_dict = a_sr[1] if a_sr is not None else None
+    b_surface_dict = b_sr[1] if b_sr is not None else None
+
+    event_surface = _resolve_event_surface(identity, event.slug or "", provider)
+
+    # Pull PlayerHistory from the GBT bundle for Elo + h2h_against.
+    # The bundle is loaded for the GBT prediction stage anyway; the
+    # selector's lookup is in-memory and free. Bundle missing or
+    # player_id not in the index → None histories → EV tiers requiring
+    # Elo / h2h degrade to 0 contribution.
+    a_history = None
+    b_history = None
+    try:
+        # Import locally to avoid pulling the catboost/numpy chain
+        # into modules that only need the dispatch above. Same import
+        # posture as `pipeline.py`'s tennis_gbt enricher.
+        from skimsmarkets.tennis.gbt import _get_bundle  # noqa: PLC0415
+        bundle = _get_bundle()
+        if bundle is not None and bundle.history is not None:
+            a_pid = provider.lookup_player_id(identity.tour, identity.player_a)
+            b_pid = provider.lookup_player_id(identity.tour, identity.player_b)
+            if a_pid is not None:
+                a_history = bundle.history.get(a_pid)
+            if b_pid is not None:
+                b_history = bundle.history.get(b_pid)
+    except Exception:  # noqa: BLE001
+        # Bundle load failures / index resolution issues shouldn't
+        # break the selector. Log once and continue with None histories
+        # — the EV scorer's Elo/h2h tiers contribute 0 in that case.
+        log.debug("ev selector: GBT bundle access failed", exc_info=True)
+
+    a_stats = TennisPlayerStats(
+        name=identity.player_a,
+        rank_points=a_pts,
+        last_10_form=a_form_str,
+        first_serve_win_pct=a_fsw,
+        surface_win_loss=a_surface_dict,
+    )
+    b_stats = TennisPlayerStats(
+        name=identity.player_b,
+        rank_points=b_pts,
+        last_10_form=b_form_str,
+        first_serve_win_pct=b_fsw,
+        surface_win_loss=b_surface_dict,
+    )
+
+    return score_ev_v1_selection(
+        a_stats=a_stats,
+        b_stats=b_stats,
+        surface=event_surface,
+        a_history=a_history,
+        b_history=b_history,
+    )
+
+
+def _tennis_imbalance_tail_v1(
+    event: PolymarketEvent, provider: TennisStatsProvider
+) -> float | None:
+    """v1 tail-mode tennis selector — picks deep-underdog asymmetric-
+    payoff candidates. Parallel to `_tennis_imbalance_ev_v1`; the only
+    diff is the scorer call (drops `ev_competitive_floor` so extreme-
+    imbalance events aren't suppressed).
+
+    The data projection is identical to the EV wrapper (rank, form,
+    serve stats, surface record, GBT-bundle Elo lookup). Same warmup
+    caches, same player_id resolution path, same graceful degradation
+    when the GBT bundle isn't available.
+
+    Recommended CLI flag combination at trade time (selector alone
+    doesn't enable tail bets — needs aggressive fetch + executor
+    flags to fire):
+        skims rank    --mode tail --max-prob 0.95 --min-favorite-prob 0.75
+        skims execute --mode tail --min-market-implied 0.0
+                                 --min-ev 0.30
+                                 --bet-size-cents 100
+
+    `--min-favorite-prob 0.75` is the new (2026-05-17) floor flag that
+    prevents the selector from surfacing competitive 0.55/0.45 events
+    that can't produce Prime EV through the asymmetric-payoff path.
+    Without it, tail-mode wastes LLM tokens on events where no real
+    tail bet exists.
+
+    Returns None when the event isn't a recognizable tennis singles
+    matchup — same posture as the EV / confidence paths.
+    """
+    identity = tennis_match_identity(event)
+    if identity is None:
+        return None
+    a_rank_hit = provider.lookup_player_rank(identity.tour, identity.player_a)
+    b_rank_hit = provider.lookup_player_rank(identity.tour, identity.player_b)
+    if a_rank_hit is None or b_rank_hit is None:
+        return None
+    _, a_pts = a_rank_hit
+    _, b_pts = b_rank_hit
+    if a_pts <= 0 or b_pts <= 0:
+        return None
+
+    a_form = provider.lookup_player_form(identity.tour, identity.player_a)
+    b_form = provider.lookup_player_form(identity.tour, identity.player_b)
+    a_form_str = a_form[0] if a_form is not None else None
+    b_form_str = b_form[0] if b_form is not None else None
+
+    a_ms = provider.lookup_player_match_stats(identity.tour, identity.player_a)
+    b_ms = provider.lookup_player_match_stats(identity.tour, identity.player_b)
+    a_fsw = a_ms.get("first_serve_win_pct") if a_ms is not None else None
+    b_fsw = b_ms.get("first_serve_win_pct") if b_ms is not None else None
+
+    a_sr = provider.lookup_player_surface_record(
+        identity.tour, identity.player_a
+    )
+    b_sr = provider.lookup_player_surface_record(
+        identity.tour, identity.player_b
+    )
+    a_surface_dict = a_sr[1] if a_sr is not None else None
+    b_surface_dict = b_sr[1] if b_sr is not None else None
+
+    event_surface = _resolve_event_surface(identity, event.slug or "", provider)
+
+    a_history = None
+    b_history = None
+    try:
+        from skimsmarkets.tennis.gbt import _get_bundle  # noqa: PLC0415
+        bundle = _get_bundle()
+        if bundle is not None and bundle.history is not None:
+            a_pid = provider.lookup_player_id(identity.tour, identity.player_a)
+            b_pid = provider.lookup_player_id(identity.tour, identity.player_b)
+            if a_pid is not None:
+                a_history = bundle.history.get(a_pid)
+            if b_pid is not None:
+                b_history = bundle.history.get(b_pid)
+    except Exception:  # noqa: BLE001
+        log.debug("tail selector: GBT bundle access failed", exc_info=True)
+
+    a_stats = TennisPlayerStats(
+        name=identity.player_a,
+        rank_points=a_pts,
+        last_10_form=a_form_str,
+        first_serve_win_pct=a_fsw,
+        surface_win_loss=a_surface_dict,
+    )
+    b_stats = TennisPlayerStats(
+        name=identity.player_b,
+        rank_points=b_pts,
+        last_10_form=b_form_str,
+        first_serve_win_pct=b_fsw,
+        surface_win_loss=b_surface_dict,
+    )
+
+    return score_tail_v1_selection(
+        a_stats=a_stats,
+        b_stats=b_stats,
+        surface=event_surface,
+        a_history=a_history,
+        b_history=b_history,
+    )
+
+
 def imbalance_score(
-    event: PolymarketEvent, tennis_provider: TennisStatsProvider
+    event: PolymarketEvent,
+    tennis_provider: TennisStatsProvider,
+    *,
+    mode: str | None = None,
 ) -> float:
     """Composite per-event imbalance in `[0, 1]` (higher = more lopsided).
 
@@ -1218,24 +1442,51 @@ def imbalance_score(
     signal — we don't try to combine tennis + team-record on the same
     event because they're never both populated.
 
-    Tennis path dispatches between v0 (legacy 10-tier in this module)
-    and v1 (the empirically tuned `_tennis_imbalance_v1` calling
-    `score_v1_selection`) via `cfg.TENNIS_SELECTION_V1_ENABLED`. v1
-    is the default; flip the flag to False for emergency rollback.
-    Backtested holdout Lock precision: v1 = 0.2487, baseline rank-
-    points = 0.1928 (+29%). v0 was never measured against the same
-    harness (Phase 0.5 deferred).
+    Two dispatch dimensions for tennis:
+      1. `cfg.TENNIS_SELECTION_V1_ENABLED` — emergency rollback path.
+         False forces the legacy 10-tier `_tennis_imbalance` regardless
+         of mode. Default True.
+      2. Mode resolution: the caller-supplied `mode` arg wins; when
+         None, falls through to `cfg.KALSHI_DEFAULT_TRADE_MODE`. Three
+         modes supported:
+           - `"tail"`       → `_tennis_imbalance_tail_v1` (deep-underdog
+                              asymmetric-payoff strategy; drops the
+                              competitive-floor penalty)
+           - `"ev"`         → `_tennis_imbalance_ev_v1` (moderate-EV;
+                              model-vs-market disagreement archetype)
+           - anything else  → `_tennis_imbalance_v1` (confidence-mode
+                              Lock-bucket precision)
+
+    The per-call `mode` lets `skims rank --mode {ev,tail}` flip the
+    selector for a single run without mutating the global cfg constant
+    (mirrors the executor's `--mode` handling in `cli.py:_cmd_execute`).
+    Both layers share the same arg semantics so the operator can run a
+    one-off non-confidence-mode pipeline end-to-end without touching
+    config.py.
+
+    Backtested holdout (2025+, K=5):
+      - v1 (confidence): +29% Lock precision over rank baseline.
+      - v1_ev          : +97% realized $-return per $1 over rank-implied
+                          market baseline; v1 confidence selector lands
+                          BELOW the base rate on the same EV metric
+                          (active anti-edge), validating the dual-mode
+                          dispatch design.
+      - v1_tail        : same scorer minus the competitive-floor tier.
+                          See ablation in `models/selection_backtest/`.
 
     `tennis_provider` is the same provider used for full enrichment;
-    the rank lookup against its warm index is free (no HTTP). The stub
-    provider's `lookup_player_rank` always returns None, so under the
-    no-key configuration tennis events fall through to score 0 and
-    the tipoff tiebreaker decides.
+    the rank/Elo lookups against its warm caches + the GBT bundle are
+    free (no HTTP). Stub provider falls through to 0 in any mode.
     """
-    if cfg.TENNIS_SELECTION_V1_ENABLED:
-        s = _tennis_imbalance_v1(event, tennis_provider)
-    else:
+    effective_mode = mode if mode is not None else cfg.KALSHI_DEFAULT_TRADE_MODE
+    if not cfg.TENNIS_SELECTION_V1_ENABLED:
         s = _tennis_imbalance(event, tennis_provider)
+    elif effective_mode == "tail":
+        s = _tennis_imbalance_tail_v1(event, tennis_provider)
+    elif effective_mode == "ev":
+        s = _tennis_imbalance_ev_v1(event, tennis_provider)
+    else:
+        s = _tennis_imbalance_v1(event, tennis_provider)
     if s is not None:
         return s
     s = _team_record_imbalance(event)
@@ -1264,6 +1515,7 @@ async def select_top_events(
     *,
     max_events: int,
     tennis_provider: TennisStatsProvider,
+    mode: str | None = None,
 ) -> list[PolymarketEvent]:
     """Apply imbalance scoring and cap the slate to `max_events`.
 
@@ -1286,6 +1538,11 @@ async def select_top_events(
     with no stat-based signal): they all share the bottom of the
     ranking and tipoff order picks among them, preserving the
     "soonest first" intuition for the fallback layer.
+
+    `mode` is forwarded to `imbalance_score` per event — `None` (the
+    default) falls through to `cfg.KALSHI_DEFAULT_TRADE_MODE`; passing
+    `"ev"` or `"confidence"` overrides the global for this slate. The
+    CLI plumbs `--mode` from `skims rank` / `skims fetch` to here.
     """
     if max_events <= 0 or len(events) <= max_events:
         return events
@@ -1349,7 +1606,7 @@ async def select_top_events(
                 )
 
     scored = [
-        (ev, imbalance_score(ev, tennis_provider), _earliest_tipoff(ev))
+        (ev, imbalance_score(ev, tennis_provider, mode=mode), _earliest_tipoff(ev))
         for ev in events
     ]
     # Sort key: descending score, ascending tipoff. Negate score so

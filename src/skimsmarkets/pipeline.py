@@ -231,6 +231,13 @@ class SlateOptions:
     # constant; CLI surfaces `--max-prob` for ad-hoc overrides without
     # editing config.py.
     max_implied_probability: float = cfg.MAX_IMPLIED_PROBABILITY
+    # Inverse-shaped filter to `max_implied_probability`: drops events
+    # whose favorite is priced BELOW this on the YES mid. Default None
+    # (disabled). Primary use case: tail mode, where competitive events
+    # (favorite < 0.75) can never produce Prime EV via the asymmetric-
+    # payoff path and just waste LLM tokens. CLI surfaces this as
+    # `--min-favorite-prob`.
+    min_favorite_probability: float | None = cfg.MIN_FAVORITE_PROBABILITY
     # Minimum open interest (dollars at par) for at least one side of
     # an event. Defaults to the config constant; CLI surfaces `--min-oi`
     # for ad-hoc overrides. Set to 0 to disable.
@@ -278,6 +285,7 @@ async def fetch_slate(
             opts.horizon_hours,
             sports=opts.sports,
             max_implied_probability=opts.max_implied_probability,
+            min_favorite_probability=opts.min_favorite_probability,
             min_open_interest_dollars=opts.min_open_interest_dollars,
         )
 
@@ -1988,12 +1996,14 @@ async def run_pipeline(
     leagues: list[str] | None = None,
     horizon_hours: int = cfg.DEFAULT_HORIZON_HOURS,
     max_implied_probability: float = cfg.MAX_IMPLIED_PROBABILITY,
+    min_favorite_probability: float | None = cfg.MIN_FAVORITE_PROBABILITY,
     min_open_interest_dollars: float = cfg.MIN_OPEN_INTEREST_DOLLARS,
     slugs: list[str] | None = None,
     sports: list[str] | None = None,
     tennis_stats_disabled: bool = False,
     require_rich_stats: bool = False,
     progress: ProgressReporter | None = None,
+    mode: str | None = None,
 ) -> RunResult:
     """End-to-end: fetch the Polymarket sports slate inside the horizon,
     enrich with CLOB book + price history, then run 4 specialists + director
@@ -2100,6 +2110,7 @@ async def run_pipeline(
             sports=sports or [],
             horizon_hours=horizon_hours,
             max_implied_probability=max_implied_probability,
+            min_favorite_probability=min_favorite_probability,
             min_open_interest_dollars=min_open_interest_dollars,
         )
         if progress is not None:
@@ -2156,6 +2167,7 @@ async def run_pipeline(
                 events,
                 max_events=cfg.MAX_SLATE_EVENTS,
                 tennis_provider=tennis_provider,
+                mode=mode,
             )
 
         result.considered_events = len(events)

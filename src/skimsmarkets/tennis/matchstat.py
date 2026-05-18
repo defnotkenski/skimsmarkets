@@ -909,6 +909,20 @@ class MatchStatTennisProvider:
             return None
         return position, points
 
+    def lookup_player_id(self, tour: str, name: str) -> int | None:
+        """Vendor-internal player_id from the warm rankings index.
+
+        Returns None when the player isn't covered by the index. The
+        EV-mode selector bridges this id → GBT bundle's HistoryStore
+        for Elo lookup (the GBT parquet keys on the same MatchStat
+        player_id, so any hit here is guaranteed to map to a
+        PlayerHistory entry when that player has prior matches).
+        """
+        hit = self._resolve(tour, name)
+        if hit is None:
+            return None
+        return hit[0]
+
     async def warm_form_for_selection(
         self, identities: Iterable["TennisMatchIdentity"]
     ) -> None:
